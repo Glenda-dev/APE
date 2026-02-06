@@ -1,4 +1,4 @@
-use crate::ApeService;
+use crate::ApeManager;
 use crate::log;
 use glenda::cap::{CapPtr, Endpoint, Reply};
 use glenda::error::Error;
@@ -6,10 +6,17 @@ use glenda::interface::SystemService;
 use glenda::ipc::{Badge, MsgArgs, MsgFlags, MsgTag, UTCB};
 use glenda::protocol;
 
-impl SystemService for ApeService {
+impl SystemService for ApeManager {
     fn init(&mut self) -> Result<(), Error> {
         log!("Mounting root filesystem with UUID: {}", self.rootfs_uuid);
+        // Logic to mount FS would go here (interacting with VFS service)
+
         log!("Loading init...");
+        // Logic to spawn 'init' process would go here
+        // For now, we manually register PID 1 representing 'init'
+        // In a real flow, we would load the ELF, create thread/vspace, and then register.
+        self.register_process(0, 0, 0); 
+
         Ok(())
     }
     fn listen(&mut self, ep: Endpoint, reply: CapPtr) -> Result<(), Error> {

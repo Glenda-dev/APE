@@ -7,3 +7,4 @@ edition = "2024"
 [dependencies]
 libglenda-rs = { path = "../../lib/libglenda-rs", features = ["rt-service"] }
 libape = { path = "../../lib/libape" }
+spin = "0.10.0"
