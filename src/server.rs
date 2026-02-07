@@ -3,7 +3,7 @@ use crate::log;
 use glenda::cap::{CapPtr, Endpoint, Reply};
 use glenda::error::Error;
 use glenda::interface::SystemService;
-use glenda::ipc::{Badge, MsgArgs, MsgFlags, MsgTag, UTCB};
+use glenda::ipc::{Badge, MsgTag, UTCB};
 use glenda::protocol;
 
 impl SystemService for ApeManager {
@@ -15,7 +15,7 @@ impl SystemService for ApeManager {
         // Logic to spawn 'init' process would go here
         // For now, we manually register PID 1 representing 'init'
         // In a real flow, we would load the ELF, create thread/vspace, and then register.
-        self.register_process(0, 0, 0); 
+        self.register_process(0, 0, 0);
 
         Ok(())
     }
@@ -40,64 +40,37 @@ impl SystemService for ApeManager {
             let utcb = unsafe { UTCB::get() };
             let msg_info = utcb.msg_tag;
             let badge = utcb.badge;
-            let label = msg_info.label();
-            let proto = msg_info.proto();
-            let flags = msg_info.flags();
-            let args = utcb.mrs_regs;
 
-            let res = self.dispatch(badge, label, proto, flags, args);
+            let res = self.dispatch(badge, msg_info);
             match res {
-                Ok(ret) => self.reply(
-                    protocol::GENERIC_PROTO,
-                    protocol::generic::REPLY,
-                    MsgFlags::OK,
-                    ret,
-                )?,
-                Err(e) => match e {
-                    Error::Success => {
-                        continue;
-                    }
-                    _ => self.reply(
-                        protocol::GENERIC_PROTO,
-                        protocol::generic::REPLY,
-                        MsgFlags::ERROR,
-                        [e as usize, 0, 0, 0, 0, 0, 0, 0],
-                    )?,
-                },
+                Ok(()) => {}
+                Err(e) => {
+                    log!("Dispatch error: {:?}", e);
+                }
             }
         }
         Ok(())
     }
-    fn dispatch(
-        &mut self,
-        badge: Badge,
-        label: usize,
-        proto: usize,
-        flags: MsgFlags,
-        msg: MsgArgs,
-    ) -> Result<MsgArgs, Error> {
+    fn dispatch(&mut self, badge: Badge, info: MsgTag) -> Result<(), Error> {
+        let label = info.label();
+        let proto = info.proto();
+        let flags = info.flags();
+        let args = unsafe { UTCB::get() }.mrs_regs;
         log!(
-            "Received message: badge={}, label={}, proto={}, flags={}, msg={:?}",
+            "Received message: badge={}, label={}, proto={}, flags={}, args={:?}",
             badge,
             label,
             proto,
             flags,
-            msg
+            args
         );
         if proto != protocol::KERNEL_PROTO {
             return Err(Error::InvalidProtocol);
         }
         Err(Error::NotImplemented)
     }
-    fn reply(
-        &mut self,
-        label: usize,
-        proto: usize,
-        flags: MsgFlags,
-        msg: MsgArgs,
-    ) -> Result<(), Error> {
-        let tag = MsgTag::new(proto, label, flags);
-        self.reply.reply(tag, msg)
+    fn reply(&mut self, info: MsgTag) -> Result<(), Error> {
+        self.reply.reply(info)
     }
     fn stop(&mut self) {
         self.running = false;

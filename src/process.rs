@@ -1,6 +1,4 @@
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
-use spin::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct MemoryMap {
