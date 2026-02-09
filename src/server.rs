@@ -3,7 +3,7 @@ use crate::log;
 use glenda::cap::{CapPtr, Endpoint, Reply};
 use glenda::error::Error;
 use glenda::interface::SystemService;
-use glenda::ipc::{Badge, MsgTag, UTCB};
+use glenda::ipc::{MsgTag, UTCB};
 use glenda::protocol;
 
 impl SystemService for ApeManager {
@@ -30,32 +30,33 @@ impl SystemService for ApeManager {
         }
         self.running = true;
         while self.running {
-            match self.endpoint.recv(self.reply.cap()) {
-                Ok(b) => b,
+            let mut utcb = unsafe { UTCB::new() };
+            utcb.set_reply_window(self.reply.cap());
+            match self.endpoint.recv(&mut utcb) {
+                Ok(_) => {}
                 Err(e) => {
                     log!("Recv error: {:?}", e);
                     continue;
                 }
             };
-            let utcb = unsafe { UTCB::get() };
-            let msg_info = utcb.msg_tag;
-            let badge = utcb.badge;
 
-            let res = self.dispatch(badge, msg_info);
-            match res {
+            match self.dispatch(&mut utcb) {
                 Ok(()) => {}
                 Err(e) => {
                     log!("Dispatch error: {:?}", e);
                 }
             }
+            self.reply(&mut utcb)?;
         }
         Ok(())
     }
-    fn dispatch(&mut self, badge: Badge, info: MsgTag) -> Result<(), Error> {
-        let label = info.label();
-        let proto = info.proto();
-        let flags = info.flags();
-        let args = unsafe { UTCB::get() }.mrs_regs;
+    fn dispatch(&mut self, utcb: &mut UTCB) -> Result<(), Error> {
+        let tag = utcb.get_msg_tag();
+        let badge = utcb.get_badge();
+        let label = tag.label();
+        let proto = tag.proto();
+        let flags = tag.flags();
+        let args = utcb.get_mrs();
         log!(
             "Received message: badge={}, label={}, proto={}, flags={}, args={:?}",
             badge,
@@ -64,13 +65,15 @@ impl SystemService for ApeManager {
             flags,
             args
         );
-        if proto != protocol::KERNEL_PROTO {
-            return Err(Error::InvalidProtocol);
+
+        glenda::ipc_dispatch! {
+            self, utcb,
+            (protocol::KERNEL_PROTO, _) => |_, _| Err(Error::NotImplemented),
+            (_, _) => |_, _| Err(Error::InvalidProtocol),
         }
-        Err(Error::NotImplemented)
     }
-    fn reply(&mut self, info: MsgTag) -> Result<(), Error> {
-        self.reply.reply(info)
+    fn reply(&mut self, utcb: &mut UTCB) -> Result<(), Error> {
+        self.reply.reply(utcb)
     }
     fn stop(&mut self) {
         self.running = false;
