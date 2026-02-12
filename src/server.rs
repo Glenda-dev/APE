@@ -3,7 +3,7 @@ use crate::log;
 use glenda::cap::{CapPtr, Endpoint, Reply};
 use glenda::error::Error;
 use glenda::interface::SystemService;
-use glenda::ipc::{MsgTag, UTCB};
+use glenda::ipc::UTCB;
 use glenda::protocol;
 
 impl SystemService for ApeManager {
@@ -19,9 +19,10 @@ impl SystemService for ApeManager {
 
         Ok(())
     }
-    fn listen(&mut self, ep: Endpoint, reply: CapPtr) -> Result<(), Error> {
+    fn listen(&mut self, ep: Endpoint, reply: CapPtr, recv: CapPtr) -> Result<(), Error> {
         self.endpoint = ep;
         self.reply = Reply::from(reply);
+        self.recv = recv;
         Ok(())
     }
     fn run(&mut self) -> Result<(), Error> {
@@ -32,6 +33,7 @@ impl SystemService for ApeManager {
         while self.running {
             let mut utcb = unsafe { UTCB::new() };
             utcb.set_reply_window(self.reply.cap());
+            utcb.set_recv_window(self.recv);
             match self.endpoint.recv(&mut utcb) {
                 Ok(_) => {}
                 Err(e) => {

@@ -8,6 +8,7 @@ pub struct ApeManager {
     pub rootfs_uuid: String,
     pub endpoint: Endpoint,
     pub reply: Reply,
+    pub recv: CapPtr,
     pub processes: BTreeMap<usize, SubProcess>,
     pub next_pid: usize,
 }
@@ -18,6 +19,7 @@ impl ApeManager {
             running: false,
             rootfs_uuid,
             endpoint: Endpoint::from(CapPtr::null()),
+            recv: CapPtr::null(),
             reply: Reply::from(CapPtr::null()),
             processes: BTreeMap::new(),
             next_pid: 1,
