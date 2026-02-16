@@ -59,14 +59,6 @@ impl SystemService for ApeManager {
         let proto = tag.proto();
         let flags = tag.flags();
         let args = utcb.get_mrs();
-        log!(
-            "Received message: badge={}, label={}, proto={}, flags={}, args={:?}",
-            badge,
-            label,
-            proto,
-            flags,
-            args
-        );
 
         glenda::ipc_dispatch! {
             self, utcb,
