@@ -1,24 +1,19 @@
 #![no_std]
 #![no_main]
 
+#[macro_use]
+extern crate glenda;
+
 extern crate alloc;
-use glenda;
-mod ape;
 mod handler;
 mod process;
 mod server;
 
 pub use ape::ApeManager;
 
-#[macro_export]
-macro_rules! log {
-    ($($arg:tt)*) => ({
-        glenda::println!("APE: {}", format_args!($($arg)*));
-    })
-}
-
 #[unsafe(no_mangle)]
 fn main() -> usize {
+    glenda::console::init_logging("APE");
     log!("Starting ANSI/POSIX Environment (APE) Service...");
     0
 }

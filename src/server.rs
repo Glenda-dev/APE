@@ -1,5 +1,4 @@
 use crate::ApeManager;
-use crate::log;
 use glenda::cap::{CapPtr, Endpoint, Reply};
 use glenda::error::Error;
 use glenda::interface::SystemService;
