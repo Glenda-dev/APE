@@ -33,18 +33,15 @@ impl SystemService for ApeManager {
             let mut utcb = unsafe { UTCB::new() };
             utcb.set_reply_window(self.reply.cap());
             utcb.set_recv_window(self.recv);
-            match self.endpoint.recv(&mut utcb) {
-                Ok(_) => {}
-                Err(e) => {
-                    log!("Recv error: {:?}", e);
-                    continue;
-                }
-            };
+            if let Err(e) = self.endpoint.recv(&mut utcb) {
+                error!("Recv error: {:?}", e);
+                continue;
+            }
 
             match self.dispatch(&mut utcb) {
                 Ok(()) => {}
                 Err(e) => {
-                    log!("Dispatch error: {:?}", e);
+                    error!("Dispatch error: {:?}", e);
                 }
             }
             self.reply(&mut utcb)?;
