@@ -1,7 +1,11 @@
-use crate::process::SubProcess;
+mod handler;
+mod process;
+mod server;
+
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use glenda::cap::{CapPtr, Endpoint, Reply};
+use process::SubProcess;
 
 pub struct ApeManager {
     pub running: bool,

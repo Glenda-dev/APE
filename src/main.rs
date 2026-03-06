@@ -5,9 +5,8 @@
 extern crate glenda;
 
 extern crate alloc;
-mod handler;
-mod process;
-mod server;
+mod ape;
+mod config;
 
 pub use ape::ApeManager;
 

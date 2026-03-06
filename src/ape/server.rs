@@ -49,13 +49,6 @@ impl SystemService for ApeManager {
         Ok(())
     }
     fn dispatch(&mut self, utcb: &mut UTCB) -> Result<(), Error> {
-        let tag = utcb.get_msg_tag();
-        let badge = utcb.get_badge();
-        let label = tag.label();
-        let proto = tag.proto();
-        let flags = tag.flags();
-        let args = utcb.get_mrs();
-
         glenda::ipc_dispatch! {
             self, utcb,
             (protocol::KERNEL_PROTO, _) => |_, _| Err(Error::NotImplemented),
