@@ -1,22 +1,16 @@
 use crate::ApeManager;
 use glenda::cap::{CapPtr, Endpoint, Reply};
 use glenda::error::Error;
-use glenda::interface::SystemService;
-use glenda::ipc::UTCB;
+use glenda::interface::FaultService;
+use glenda::interface::{
+    CSpaceService, InitService, ResourceService, SystemService, VSpaceService,
+};
+use glenda::ipc::{Badge, UTCB};
 use glenda::protocol;
 
-impl SystemService for ApeManager {
+impl<'a> SystemService for ApeManager<'a> {
     fn init(&mut self) -> Result<(), Error> {
-        log!("Mounting root filesystem with UUID: {}", self.rootfs_uuid);
-        // Logic to mount FS would go here (interacting with VFS service)
-
-        log!("Loading init...");
-        // Logic to spawn 'init' process would go here
-        // For now, we manually register PID 1 representing 'init'
-        // In a real flow, we would load the ELF, create thread/vspace, and then register.
-        self.register_process(0, 0, 0);
-
-        Ok(())
+        self.bootstrap()
     }
     fn listen(&mut self, ep: Endpoint, reply: CapPtr, recv: CapPtr) -> Result<(), Error> {
         self.endpoint = ep;
@@ -28,6 +22,7 @@ impl SystemService for ApeManager {
         if self.endpoint.cap().is_null() || self.reply.cap().is_null() {
             return Err(Error::NotInitialized);
         }
+        self.init_client.report_service(Badge::null(), protocol::init::ServiceState::Running)?;
         self.running = true;
         while self.running {
             let mut utcb = unsafe { UTCB::new() };
@@ -49,10 +44,22 @@ impl SystemService for ApeManager {
         Ok(())
     }
     fn dispatch(&mut self, utcb: &mut UTCB) -> Result<(), Error> {
+        let badge = utcb.get_badge();
         glenda::ipc_dispatch! {
             self, utcb,
-            (protocol::KERNEL_PROTO, _) => |_, _| Err(Error::NotImplemented),
-            (_, _) => |_, _| Err(Error::InvalidProtocol),
+            (protocol::KERNEL_PROTO, protocol::kernel::SYSCALL) => |s: &mut ApeManager, utcb: &mut UTCB| {
+                let mut args = [0usize; 8];
+                for i in 0..8 {
+                    args[i] = utcb.get_mr(i);
+                }
+                s.handle_syscall(badge.bits(), args)
+            },
+            (protocol::KERNEL_PROTO, protocol::kernel::PAGE_FAULT) => |s: &mut ApeManager, utcb: &mut UTCB| s.page_fault(badge, utcb.get_mr(0), utcb.get_mr(1), utcb.get_mr(2)),
+            (protocol::KERNEL_PROTO, protocol::kernel::ILLEGAL_INSTRUCTION) => |s: &mut ApeManager, utcb: &mut UTCB| s.illegal_instruction(badge, utcb.get_mr(0), utcb.get_mr(1)),
+            (protocol::KERNEL_PROTO, protocol::kernel::BREAKPOINT) => |s: &mut ApeManager, utcb: &mut UTCB| s.breakpoint(badge, utcb.get_mr(0)),
+            (protocol::KERNEL_PROTO, protocol::kernel::ACCESS_FAULT) => |s: &mut ApeManager, utcb: &mut UTCB| s.access_fault(badge, utcb.get_mr(0), utcb.get_mr(1)),
+            (protocol::KERNEL_PROTO, protocol::kernel::UNKNOWN_FAULT) => |s: &mut ApeManager, utcb: &mut UTCB| s.unknown_fault(badge, utcb.get_mr(0), utcb.get_mr(1), utcb.get_mr(2)),
+            (_, _) => |_: &mut ApeManager, _: &mut UTCB| Err(Error::InvalidProtocol),
         }
     }
     fn reply(&mut self, utcb: &mut UTCB) -> Result<(), Error> {
@@ -61,7 +68,7 @@ impl SystemService for ApeManager {
     fn stop(&mut self) {
         self.running = false;
         log!("Shutting down...");
-        // Shutdown /init
-        log!("Unmounting root filesystem with UUID: {}", self.rootfs_uuid);
+        let _ =
+            self.init_client.report_service(Badge::null(), protocol::init::ServiceState::Stopped);
     }
 }
