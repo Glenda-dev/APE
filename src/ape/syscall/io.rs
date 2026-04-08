@@ -2,6 +2,7 @@ use crate::ApeManager;
 use crate::ape::process::FileType;
 use glenda::error::Error;
 use glenda::log;
+use linux_raw_sys::errno::ENOSYS;
 
 pub fn sys_read<'a>(
     mgr: &mut ApeManager<'a>,
@@ -12,7 +13,8 @@ pub fn sys_read<'a>(
 ) -> Result<isize, Error> {
     log!("sys_read: pid {} fd {} buf {:#x} len {}", pid, fd, buf_ptr, len);
     let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    let file = process.fds.get_mut(&fd).ok_or(Error::NotFound)?;
+    let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
+    let file = process.fds.get_mut(&fd).ok_or(Error::InvalidSlot)?;
 
     match &mut file.file_type {
         FileType::Terminal(term) => {
@@ -46,7 +48,8 @@ pub fn sys_write<'a>(
 ) -> Result<isize, Error> {
     log!("sys_write: pid {} fd {} buf {:#x} len {}", pid, fd, buf_ptr, len);
     let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    let file = process.fds.get_mut(&fd).ok_or(Error::NotFound)?;
+    let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
+    let file = process.fds.get_mut(&fd).ok_or(Error::InvalidSlot)?;
 
     match &mut file.file_type {
         FileType::Terminal(term) => {
@@ -70,13 +73,16 @@ pub fn sys_openat<'a>(
     mode: usize,
 ) -> Result<isize, Error> {
     log!("sys_openat: pid {} dirfd {} path {:#x}", pid, dirfd, pathname);
-    let process = mgr.get_process_mut(pid).ok_or(Error::Unknown)?;
+    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
     let fd = process.next_fd;
     process.next_fd += 1;
     process.fds.insert(
         fd,
         crate::ape::process::FileHandle {
-            file_type: crate::ape::process::FileType::Normal { cap: glenda::cap::CapPtr::null(), offset: 0 },
+            file_type: crate::ape::process::FileType::Normal {
+                cap: glenda::cap::CapPtr::null(),
+                offset: 0,
+            },
         },
     );
     Ok(fd as isize)
@@ -84,7 +90,20 @@ pub fn sys_openat<'a>(
 
 pub fn sys_close<'a>(mgr: &mut ApeManager<'a>, pid: usize, fd: usize) -> Result<isize, Error> {
     log!("sys_close: pid {} fd {}", pid, fd);
-    let process = mgr.get_process_mut(pid).ok_or(Error::Unknown)?;
-    process.fds.remove(&fd);
+    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+    let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
+    process.fds.remove(&fd).ok_or(Error::InvalidSlot)?;
     Ok(0)
+}
+
+// TODO: Impl
+pub fn sys_ioctl<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    fd: usize,
+    request: usize,
+    argp: usize,
+) -> Result<isize, Error> {
+    log!("sys_ioctl: pid {} fd {} request {:#x} argp {:#x}", pid, fd, request, argp);
+    Ok(ENOSYS as isize)
 }

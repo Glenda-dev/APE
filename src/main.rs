@@ -6,6 +6,7 @@
 extern crate glenda;
 extern crate alloc;
 mod ape;
+mod arch;
 mod elf;
 mod layout;
 
@@ -30,7 +31,7 @@ fn main() -> usize {
     log!("Starting ANSI/POSIX Environment...");
 
     let mut cspace_mgr = CSpaceManager::new(CSPACE_CAP, 16);
-    let mut vspace_mgr = VSpaceManager::new(VSPACE_CAP, 0x7000_0000, 0x8000_0000);
+    let mut vspace_mgr = VSpaceManager::new(VSPACE_CAP, VSPACE_SCRATCH_START, VSPACE_SCRATCH_END);
     let mut res_client = ResourceClient::new(MONITOR_CAP);
     let mut proc_client = ProcessClient::new(MONITOR_CAP);
 

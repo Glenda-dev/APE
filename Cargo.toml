@@ -5,5 +5,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libglenda-rs = { path = "../../lib/libglenda-rs", features = ["rt-service"] }
+libglenda-rs = { path = "../../lib/libglenda-rs", features = [
+    "rt-service",
+    "vspacemgr_check_bypass",
+] }
 libape = { path = "../../lib/libape" }
+linux-raw-sys = { version = "0.12.1", default-features = false, features = [
+    "no_std",
+    "errno",
+    "general",
+] }
