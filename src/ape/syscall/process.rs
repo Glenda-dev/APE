@@ -1,10 +1,14 @@
 use crate::ApeManager;
 use crate::ape::process::{MemoryMap, MemoryType};
+use crate::ape::user::ExecveUserInput;
 use crate::elf::{ElfFile, PF_W, PF_X, PT_LOAD};
+use alloc::string::String;
 use alloc::vec::Vec;
-use core::cmp::min;
+use ape::cap::APE_SLOT;
+use core::cmp::{max, min};
+use core::mem::size_of;
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, CapType, Frame, TCB, VSpace};
+use glenda::cap::{CapPtr, CapType, Endpoint, Frame};
 use glenda::error::Error;
 use glenda::interface::{
     CSpaceService, FileHandleService, FileSystemService, ProcessService, ResourceService,
@@ -12,11 +16,19 @@ use glenda::interface::{
 };
 use glenda::ipc::Badge;
 use glenda::log;
-use glenda::mem::Perms;
+use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
+use glenda::mem::{TRAMPOLINE_VA, get_trapframe_va, get_utcb_va};
 use glenda::protocol::fs::OpenFlags;
 use glenda::utils::align::{align_down, align_up};
-use glenda::utils::manager::{CSpaceManager, VSpaceManager};
+use glenda::utils::manager::VSpaceManager;
 use linux_raw_sys::general::*;
+
+const DEFAULT_ARG0: &str = "init";
+const INITIAL_STACK_ALIGN: usize = 16;
+
+fn use_ipc_syscall_path(program: &str) -> bool {
+    !program.ends_with("-native")
+}
 
 fn prot_to_perms(prot: u32) -> Perms {
     let mut perms = Perms::empty();
@@ -71,54 +83,307 @@ fn range_is_free(process: &crate::ape::process::SubProcess, start: usize, end: u
     true
 }
 
+impl<'a> ApeManager<'a> {
+    fn read_exec_image_from_fs(&mut self, pid: usize, path: &str) -> Result<Vec<u8>, Error> {
+        let stat = self.fs_client.stat_path(Badge::new(pid), path)?;
+        let size = stat.size as usize;
+        if size == 0 {
+            return Err(Error::InvalidArgs);
+        }
+
+        let _fd = self.fs_client.open(Badge::new(pid), path, OpenFlags::O_RDONLY, 0)?;
+
+        let mut elf_data = alloc::vec![0u8; size];
+        let mut offset = 0;
+        while offset < size {
+            let read_len = self.fs_client.read(Badge::new(pid), offset, &mut elf_data[offset..])?;
+            if read_len == 0 {
+                self.fs_client.close(Badge::new(pid))?;
+                return Err(Error::IoError);
+            }
+            offset += read_len;
+        }
+        self.fs_client.close(Badge::new(pid))?;
+        Ok(elf_data)
+    }
+
+    fn setup_initial_stack(
+        &mut self,
+        pid: usize,
+        child_vspace_mgr: &mut VSpaceManager,
+        argv: &[String],
+        envp: &[String],
+    ) -> Result<usize, Error> {
+        let stack_page_vaddr = STACK_BASE - PGSIZE;
+        let perms = Perms::READ | Perms::WRITE;
+
+        let frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
+        self.res_client.alloc(Badge::null(), CapType::Frame, 1, frame_slot)?;
+        let frame = Frame::from(frame_slot);
+
+        child_vspace_mgr.map_frame(
+            frame,
+            stack_page_vaddr,
+            perms,
+            1,
+            &mut *self.res_client,
+            &mut *self.cspace_mgr,
+        )?;
+
+        let scratch_vaddr = self.vspace_mgr.map_scratch(
+            frame,
+            perms,
+            1,
+            &mut *self.res_client,
+            &mut *self.cspace_mgr,
+        )?;
+
+        let stack = unsafe { core::slice::from_raw_parts_mut(scratch_vaddr as *mut u8, PGSIZE) };
+        stack.fill(0);
+
+        let mut sp = PGSIZE;
+
+        let effective_argv: Vec<&str> = if argv.is_empty() {
+            alloc::vec![DEFAULT_ARG0]
+        } else {
+            argv.iter().map(|s| s.as_str()).collect()
+        };
+
+        let mut argv_ptrs = Vec::with_capacity(effective_argv.len());
+        for arg in effective_argv.iter().rev() {
+            let bytes = arg.as_bytes();
+            let need = bytes.len().checked_add(1).ok_or(Error::OutOfMemory)?;
+            if sp < need {
+                return Err(Error::OutOfMemory);
+            }
+            sp -= need;
+            stack[sp..sp + bytes.len()].copy_from_slice(bytes);
+            stack[sp + bytes.len()] = 0;
+            argv_ptrs.push(stack_page_vaddr + sp);
+        }
+        argv_ptrs.reverse();
+
+        let mut envp_ptrs = Vec::with_capacity(envp.len());
+        for env in envp.iter().rev() {
+            let bytes = env.as_bytes();
+            let need = bytes.len().checked_add(1).ok_or(Error::OutOfMemory)?;
+            if sp < need {
+                return Err(Error::OutOfMemory);
+            }
+            sp -= need;
+            stack[sp..sp + bytes.len()].copy_from_slice(bytes);
+            stack[sp + bytes.len()] = 0;
+            envp_ptrs.push(stack_page_vaddr + sp);
+        }
+        envp_ptrs.reverse();
+
+        // Linux/musl 兼容启动栈：
+        // [argc][argv...][NULL][envp...][NULL][AT_NULL][0]
+        let mut words = Vec::new();
+        words.push(argv_ptrs.len());
+        words.extend(argv_ptrs.iter().copied());
+        words.push(0);
+        words.extend(envp_ptrs.iter().copied());
+        words.push(0);
+        words.push(0);
+        words.push(0);
+
+        let words_size = words.len().checked_mul(size_of::<usize>()).ok_or(Error::OutOfMemory)?;
+        if sp < words_size {
+            return Err(Error::OutOfMemory);
+        }
+        sp -= words_size;
+        sp &= !(INITIAL_STACK_ALIGN - 1);
+
+        if sp.checked_add(words_size).ok_or(Error::OutOfMemory)? > PGSIZE {
+            return Err(Error::OutOfMemory);
+        }
+
+        for (idx, word) in words.iter().enumerate() {
+            let start = sp + idx * size_of::<usize>();
+            let end = start + size_of::<usize>();
+            stack[start..end].copy_from_slice(&word.to_ne_bytes());
+        }
+
+        self.vspace_mgr.unmap(scratch_vaddr, 1)?;
+
+        if let Some(process) = self.get_process_mut(pid) {
+            process.add_memory_map(MemoryMap {
+                vaddr: stack_page_vaddr,
+                paddr: 0,
+                size: PGSIZE,
+                flags: perms,
+                mem_type: MemoryType::Stack,
+                cow: false,
+                frame_cap: frame_slot.bits(),
+            });
+            process.stack_size = PGSIZE;
+        }
+
+        Ok(stack_page_vaddr + sp)
+    }
+
+    pub(crate) fn execve_path(
+        &mut self,
+        pid: usize,
+        path: &str,
+        argv: &[String],
+        envp: &[String],
+    ) -> Result<(), Error> {
+        let elf_data = self.read_exec_image_from_fs(pid, path)?;
+        let elf = ElfFile::new(&elf_data).map_err(|_| Error::InvalidArgs)?;
+        let entry_point = elf.entry_point();
+
+        let old_maps: Vec<(usize, usize)> = {
+            let process = self.get_process(pid).ok_or(Error::NotFound)?;
+            process
+                .memory_maps
+                .values()
+                .map(|map| (map.vaddr, align_up(map.size, PGSIZE) / PGSIZE))
+                .collect()
+        };
+
+        let vspace_cap = self.get_process(pid).ok_or(Error::NotFound)?.vspace();
+        let mut child_vspace_mgr = VSpaceManager::new(vspace_cap, 0, 0);
+        for (vaddr, pages) in old_maps {
+            if pages != 0 {
+                let _ = child_vspace_mgr.unmap(vaddr, pages);
+            }
+        }
+
+        if let Some(process) = self.get_process_mut(pid) {
+            process.memory_maps.clear();
+            process.lazy_memory_maps.clear();
+            process.stack_size = 0;
+        }
+
+        child_vspace_mgr.mark_existing(TRAMPOLINE_VA, PGSIZE);
+        child_vspace_mgr.mark_existing(get_utcb_va(0), PGSIZE);
+        child_vspace_mgr.mark_existing(get_trapframe_va(0), PGSIZE);
+
+        let mut max_vaddr = 0usize;
+        for phdr in elf.program_headers() {
+            if phdr.p_type != PT_LOAD {
+                continue;
+            }
+
+            let vaddr = phdr.p_vaddr as usize;
+            let mem_size = phdr.p_memsz as usize;
+            let file_size = phdr.p_filesz as usize;
+            let offset = phdr.p_offset as usize;
+
+            if mem_size == 0 {
+                continue;
+            }
+
+            if vaddr + mem_size > max_vaddr {
+                max_vaddr = vaddr + mem_size;
+            }
+
+            let mut perms = Perms::READ;
+            if phdr.p_flags & PF_W != 0 {
+                perms |= Perms::WRITE;
+            }
+            if phdr.p_flags & PF_X != 0 {
+                perms |= Perms::EXECUTE;
+            }
+
+            let start_page = align_down(vaddr, PGSIZE);
+            let end_page = align_up(vaddr + mem_size, PGSIZE);
+            let num_pages = (end_page - start_page) / PGSIZE;
+
+            let dest_cap = self.cspace_mgr.alloc(&mut *self.res_client)?;
+            self.res_client.alloc(Badge::null(), CapType::Frame, num_pages, dest_cap)?;
+            let frame = Frame::from(dest_cap);
+
+            child_vspace_mgr.map_frame(
+                frame,
+                start_page,
+                perms,
+                num_pages,
+                &mut *self.res_client,
+                &mut *self.cspace_mgr,
+            )?;
+
+            if let Some(process) = self.get_process_mut(pid) {
+                process.add_memory_map(MemoryMap {
+                    vaddr: start_page,
+                    paddr: 0,
+                    size: num_pages * PGSIZE,
+                    flags: perms,
+                    mem_type: MemoryType::Image,
+                    cow: false,
+                    frame_cap: dest_cap.bits(),
+                });
+            }
+
+            let scratch_vaddr = self.vspace_mgr.map_scratch(
+                frame,
+                Perms::READ | Perms::WRITE,
+                num_pages,
+                &mut *self.res_client,
+                &mut *self.cspace_mgr,
+            )?;
+
+            let dest_slice = unsafe {
+                core::slice::from_raw_parts_mut(scratch_vaddr as *mut u8, num_pages * PGSIZE)
+            };
+            dest_slice.fill(0);
+
+            let padding = vaddr - start_page;
+            if padding < dest_slice.len() && offset < elf_data.len() {
+                let max_file_copy = min(file_size, elf_data.len() - offset);
+                let actual_copy = min(max_file_copy, dest_slice.len() - padding);
+                dest_slice[padding..padding + actual_copy]
+                    .copy_from_slice(&elf_data[offset..offset + actual_copy]);
+            }
+
+            self.vspace_mgr.unmap(scratch_vaddr, num_pages)?;
+        }
+
+        if let Some(process) = self.get_process_mut(pid) {
+            let heap_start = align_up(max(max_vaddr, HEAP_VA), PGSIZE);
+            process.heap_start = heap_start;
+            process.heap_brk = heap_start;
+            process.heap_limit = process.mmap_base;
+            process.mmap_next = process.mmap_base;
+            process.stack_bottom = STACK_BASE;
+            process.stack_size = 0;
+        }
+
+        let initial_sp = self.setup_initial_stack(pid, &mut child_vspace_mgr, argv, envp)?;
+        let (tcb_cap, fault_ep) = {
+            let process = self.get_process(pid).ok_or(Error::NotFound)?;
+            let fault_ep = Endpoint::from(CapPtr::concat(process.cspace().cap(), APE_SLOT));
+            (process.tcb(), fault_ep)
+        };
+
+        tcb_cap.set_entrypoint(entry_point, initial_sp, 0)?;
+        tcb_cap.set_fault_handler(fault_ep, use_ipc_syscall_path(path))?;
+        Ok(())
+    }
+}
+
 pub fn sys_execve<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,
     filename_ptr: usize,
-    _argv_ptr: usize,
-    _envp_ptr: usize,
+    argv_ptr: usize,
+    envp_ptr: usize,
 ) -> Result<isize, Error> {
-    log!("execve: pid {} executing from ptr {:#x}", pid, filename_ptr);
+    let exec_input: ExecveUserInput =
+        mgr.parse_execve_user_input(pid, filename_ptr, argv_ptr, envp_ptr)?;
 
-    let path = ""; // TODO: get from filename_ptr
-    let stat = mgr.fs_client.stat_path(Badge::new(pid), path)?;
-    let size = stat.size as usize;
+    log!(
+        "execve: pid {} filename={} argc={} envc={}",
+        pid,
+        exec_input.filename,
+        exec_input.argv.len(),
+        exec_input.envp.len()
+    );
 
-    // Check if we need to open
-    let _fd = mgr.fs_client.open(Badge::new(pid), path, OpenFlags::O_RDONLY, 0)?;
-
-    let num_pages = align_up(size, PGSIZE) / PGSIZE;
-    let dest_cap = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
-    mgr.res_client.alloc(Badge::null(), CapType::Frame, num_pages, dest_cap)?;
-    let frame = Frame::from(dest_cap);
-
-    let scratch_vaddr = mgr.vspace_mgr.map_scratch(
-        frame,
-        Perms::READ | Perms::WRITE,
-        num_pages,
-        &mut *mgr.res_client,
-        &mut *mgr.cspace_mgr,
-    )?;
-
-    let dest_slice =
-        unsafe { core::slice::from_raw_parts_mut(scratch_vaddr as *mut u8, num_pages * PGSIZE) };
-
-    let mut offset = 0;
-    while offset < size {
-        let read_len =
-            mgr.fs_client.read(Badge::new(pid), offset, &mut dest_slice[offset..size])?;
-        if read_len == 0 {
-            break;
-        }
-        offset += read_len;
-    }
-    mgr.fs_client.close(Badge::new(pid))?;
-
-    // In a real execve, unmap current user process image, setup new elf, etc.
-    let elf = ElfFile::new(&dest_slice[..size]).map_err(|_| Error::InvalidArgs)?;
-    let _entry_point = elf.entry_point();
-
-    mgr.vspace_mgr.unmap(scratch_vaddr, num_pages)?;
+    // 保持行为与 Linux 接近：允许 filename 与 argv[0] 不同。
+    mgr.execve_path(pid, &exec_input.filename, &exec_input.argv, &exec_input.envp)?;
 
     Ok(0)
 }

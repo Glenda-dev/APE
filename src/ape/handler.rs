@@ -33,6 +33,7 @@ fn map_error_to_errno(err: Error) -> isize {
         Error::OutOfMemory | Error::CNodeFull => -(ENOMEM as isize),
         Error::InvalidArgs | Error::InvalidConfig => -(EINVAL as isize),
         Error::InvalidAddress => -(EFAULT as isize),
+        Error::MessageTooLong => -(ENAMETOOLONG as isize),
         Error::InvalidSlot => -(EBADF as isize),
         Error::NotFound => -(ENOENT as isize),
         Error::AlreadyExists => -(EEXIST as isize),

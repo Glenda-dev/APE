@@ -1,6 +1,10 @@
 use crate::ApeManager;
 use crate::ape::process::FileType;
+use crate::ape::user::USER_PATH_MAX;
+use alloc::vec;
+use core::cmp::min;
 use glenda::error::Error;
+use glenda::ipc::{MsgFlags, MsgTag, UTCB};
 use glenda::log;
 use linux_raw_sys::errno::ENOSYS;
 
@@ -12,25 +16,31 @@ pub fn sys_read<'a>(
     len: usize,
 ) -> Result<isize, Error> {
     log!("sys_read: pid {} fd {} buf {:#x} len {}", pid, fd, buf_ptr, len);
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+    if len == 0 {
+        return Ok(0);
+    }
     let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
-    let file = process.fds.get_mut(&fd).ok_or(Error::InvalidSlot)?;
+    let file_type = {
+        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        process.fds.get(&fd).ok_or(Error::InvalidSlot)?.file_type.clone()
+    };
 
-    match &mut file.file_type {
+    match file_type {
         FileType::Terminal(term) => {
-            let mut utcb = unsafe { glenda::ipc::UTCB::new() };
-            let tag = glenda::ipc::MsgTag::new(
+            let mut utcb = unsafe { UTCB::new() };
+            let tag = MsgTag::new(
                 glenda::protocol::TERMINAL_PROTO,
                 glenda::protocol::terminal::TERM_GET_STR,
-                glenda::ipc::MsgFlags::HAS_BUFFER,
+                MsgFlags::HAS_BUFFER,
             );
             utcb.set_mr(0, len);
             utcb.set_msg_tag(tag);
             term.endpoint().call(utcb)?;
             utcb.error_check()?;
 
-            let read_len = utcb.get_mr(0);
+            let read_len = min(utcb.get_mr(0), min(len, utcb.buffer().len()));
             if read_len > 0 {
+                mgr.copy_to_user(pid, buf_ptr, &utcb.buffer()[..read_len])?;
                 log!("sys_read: terminal read {} bytes", read_len);
             }
             Ok(read_len as isize)
@@ -47,18 +57,33 @@ pub fn sys_write<'a>(
     len: usize,
 ) -> Result<isize, Error> {
     log!("sys_write: pid {} fd {} buf {:#x} len {}", pid, fd, buf_ptr, len);
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+    if len == 0 {
+        return Ok(0);
+    }
     let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
-    let file = process.fds.get_mut(&fd).ok_or(Error::InvalidSlot)?;
+    let file_type = {
+        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        process.fds.get(&fd).ok_or(Error::InvalidSlot)?.file_type.clone()
+    };
 
-    match &mut file.file_type {
+    match file_type {
         FileType::Terminal(term) => {
-            // 需要从子进程内存中读取字符串数据并发送给终端。
-            // 这里我们需要访问子进程内存的能力。
-            // 简单处理：如果 buf_ptr 在 APE 的当前 vspace 是不可见的，就会出问题。
-            // 但 APE 通常是 Monitor 角色，可以通过 child_vspace 翻译。
-            // 暂时：由于没有好的内存访问抽象，我们先打印并假装成功。
-            Ok(len as isize)
+            let mut kbuf = vec![0u8; len];
+            mgr.copy_from_user(pid, buf_ptr, &mut kbuf)?;
+
+            let mut utcb = unsafe { UTCB::new() };
+            let tag = MsgTag::new(
+                glenda::protocol::TERMINAL_PROTO,
+                glenda::protocol::terminal::TERM_PUT_STR,
+                MsgFlags::HAS_BUFFER,
+            );
+            let copied = utcb.write(&kbuf);
+            utcb.set_msg_tag(tag);
+            term.endpoint().call(utcb)?;
+            utcb.error_check()?;
+
+            let written = if utcb.get_mr(0) > 0 { min(utcb.get_mr(0), copied) } else { copied };
+            Ok(written as isize)
         }
         FileType::Normal { .. } => Ok(len as isize),
     }
@@ -72,7 +97,15 @@ pub fn sys_openat<'a>(
     flags: usize,
     mode: usize,
 ) -> Result<isize, Error> {
-    log!("sys_openat: pid {} dirfd {} path {:#x}", pid, dirfd, pathname);
+    let path = mgr.strncpy_from_user(pid, pathname, USER_PATH_MAX)?;
+    log!(
+        "sys_openat: pid {} dirfd {} path={} flags={:#x} mode={:#x}",
+        pid,
+        dirfd,
+        path,
+        flags,
+        mode
+    );
     let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
     let fd = process.next_fd;
     process.next_fd += 1;

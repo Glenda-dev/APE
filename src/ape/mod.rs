@@ -1,9 +1,11 @@
 pub mod bootstrap;
 pub mod fault;
 pub mod handler;
+pub mod policy;
 pub mod process;
 pub mod server;
 pub mod syscall;
+pub mod user;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
