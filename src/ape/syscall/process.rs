@@ -26,10 +26,6 @@ use linux_raw_sys::general::*;
 const DEFAULT_ARG0: &str = "init";
 const INITIAL_STACK_ALIGN: usize = 16;
 
-fn use_ipc_syscall_path(program: &str) -> bool {
-    !program.ends_with("-native")
-}
-
 fn prot_to_perms(prot: u32) -> Perms {
     let mut perms = Perms::empty();
     if prot & PROT_READ != 0 {
@@ -360,7 +356,7 @@ impl<'a> ApeManager<'a> {
         };
 
         tcb_cap.set_entrypoint(entry_point, initial_sp, 0)?;
-        tcb_cap.set_fault_handler(fault_ep, use_ipc_syscall_path(path))?;
+        tcb_cap.set_fault_handler(fault_ep, false)?;
         Ok(())
     }
 }
