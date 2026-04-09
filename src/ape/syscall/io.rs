@@ -98,11 +98,13 @@ pub fn sys_openat<'a>(
     mode: usize,
 ) -> Result<isize, Error> {
     let path = mgr.strncpy_from_user(pid, pathname, USER_PATH_MAX)?;
+    let translated_path = mgr.resolve_path_for_process(pid, &path)?;
     log!(
-        "sys_openat: pid {} dirfd {} path={} flags={:#x} mode={:#x}",
+        "sys_openat: pid {} dirfd {} path={} translated={} flags={:#x} mode={:#x}",
         pid,
         dirfd,
         path,
+        translated_path,
         flags,
         mode
     );

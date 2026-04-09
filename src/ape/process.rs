@@ -1,4 +1,6 @@
+use crate::layout::DEFAULT_PROCESS_ROOT;
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use ape::sys::constants::{
     DEFAULT_HEAP_LIMIT, DEFAULT_MAX_STACK_SIZE, DEFAULT_MMAP_BASE, DEFAULT_MMAP_LIMIT,
 };
@@ -40,10 +42,12 @@ pub struct FileHandle {
 pub struct SubProcess {
     pub pid: usize,
     pub parent_pid: usize,
-    pub cnode_cap: CNode,                             // Copy of CNode capability
-    pub memory_maps: BTreeMap<usize, MemoryMap>,      // vaddr -> mapping
+    pub cnode_cap: CNode, // Copy of CNode capability
+    pub root_dir: String,
+    pub cwd: String,
+    pub memory_maps: BTreeMap<usize, MemoryMap>, // vaddr -> mapping
     pub lazy_memory_maps: BTreeMap<usize, MemoryMap>, // vaddr(page) -> lazy mapping
-    pub fds: BTreeMap<u32, FileHandle>,               // fd -> handle
+    pub fds: BTreeMap<u32, FileHandle>,          // fd -> handle
     pub next_fd: u32,
     pub stack_bottom: usize,
     pub stack_size: usize,
@@ -63,6 +67,8 @@ impl SubProcess {
             pid,
             parent_pid,
             cnode_cap,
+            root_dir: String::from(DEFAULT_PROCESS_ROOT),
+            cwd: String::from(DEFAULT_PROCESS_ROOT),
             memory_maps: BTreeMap::new(),
             lazy_memory_maps: BTreeMap::new(),
             fds: BTreeMap::new(),

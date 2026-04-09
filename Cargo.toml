@@ -15,3 +15,8 @@ linux-raw-sys = { version = "0.12.1", default-features = false, features = [
     "errno",
     "general",
 ] }
+serde = { version = "1.0", default-features = false, features = [
+    "derive",
+    "alloc",
+] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }

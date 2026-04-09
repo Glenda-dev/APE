@@ -85,13 +85,14 @@ fn range_is_free(process: &crate::ape::process::SubProcess, start: usize, end: u
 
 impl<'a> ApeManager<'a> {
     fn read_exec_image_from_fs(&mut self, pid: usize, path: &str) -> Result<Vec<u8>, Error> {
-        let stat = self.fs_client.stat_path(Badge::new(pid), path)?;
+        let translated_path = self.resolve_path_for_process(pid, path)?;
+        let stat = self.fs_client.stat_path(Badge::new(pid), &translated_path)?;
         let size = stat.size as usize;
         if size == 0 {
             return Err(Error::InvalidArgs);
         }
 
-        let _fd = self.fs_client.open(Badge::new(pid), path, OpenFlags::O_RDONLY, 0)?;
+        let _fd = self.fs_client.open(Badge::new(pid), &translated_path, OpenFlags::O_RDONLY, 0)?;
 
         let mut elf_data = alloc::vec![0u8; size];
         let mut offset = 0;
@@ -373,17 +374,19 @@ pub fn sys_execve<'a>(
 ) -> Result<isize, Error> {
     let exec_input: ExecveUserInput =
         mgr.parse_execve_user_input(pid, filename_ptr, argv_ptr, envp_ptr)?;
+    let translated_filename = mgr.resolve_path_for_process(pid, &exec_input.filename)?;
 
     log!(
-        "execve: pid {} filename={} argc={} envc={}",
+        "execve: pid {} filename={} translated={} argc={} envc={}",
         pid,
         exec_input.filename,
+        translated_filename,
         exec_input.argv.len(),
         exec_input.envp.len()
     );
 
     // 保持行为与 Linux 接近：允许 filename 与 argv[0] 不同。
-    mgr.execve_path(pid, &exec_input.filename, &exec_input.argv, &exec_input.envp)?;
+    mgr.execve_path(pid, &translated_filename, &exec_input.argv, &exec_input.envp)?;
 
     Ok(0)
 }

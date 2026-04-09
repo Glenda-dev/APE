@@ -7,6 +7,7 @@ extern crate glenda;
 extern crate alloc;
 mod ape;
 mod arch;
+mod config;
 mod elf;
 mod layout;
 
@@ -46,6 +47,10 @@ fn main() -> usize {
     let mut fs_client = FsClient::new(FS_CAP);
 
     res_client
+        .get_cap(Badge::null(), ResourceType::Endpoint, VOLUME_ENDPOINT, VOLUME_SLOT)
+        .expect("Failed to get volume endpoint");
+
+    res_client
         .get_cap(Badge::null(), ResourceType::Endpoint, VT_ENDPOINT, VT_SLOT)
         .expect("Failed to get vt endpoint");
     let mut vt_client = VirtualTerminalClient::new(VT_CAP);
@@ -64,6 +69,7 @@ fn main() -> usize {
         &mut proc_client,
         &mut res_client,
         &mut vt_client,
+        VOLUME_CAP,
         &mut fs_client,
         &mut cspace_mgr,
         &mut vspace_mgr,
