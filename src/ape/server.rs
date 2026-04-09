@@ -63,6 +63,7 @@ impl<'a> SystemService for ApeManager<'a> {
             (protocol::KERNEL_PROTO, protocol::kernel::ILLEGAL_INSTRUCTION) => |s: &mut ApeManager, utcb: &mut UTCB| s.illegal_instruction(badge, utcb.get_mr(0), utcb.get_mr(1)),
             (protocol::KERNEL_PROTO, protocol::kernel::BREAKPOINT) => |s: &mut ApeManager, utcb: &mut UTCB| s.breakpoint(badge, utcb.get_mr(0)),
             (protocol::KERNEL_PROTO, protocol::kernel::ACCESS_FAULT) => |s: &mut ApeManager, utcb: &mut UTCB| s.access_fault(badge, utcb.get_mr(0), utcb.get_mr(1)),
+            (protocol::KERNEL_PROTO, protocol::kernel::VIRT_EXIT) => |s: &mut ApeManager, utcb: &mut UTCB| s.virt_exit(badge, utcb.get_mr(0), utcb.get_mr(1), utcb.get_mr(2), utcb.get_mr(3)),
             (protocol::KERNEL_PROTO, protocol::kernel::UNKNOWN_FAULT) => |s: &mut ApeManager, utcb: &mut UTCB| s.unknown_fault(badge, utcb.get_mr(0), utcb.get_mr(1), utcb.get_mr(2)),
             (_, _) => |_: &mut ApeManager, _: &mut UTCB| Err(Error::InvalidProtocol),
         }

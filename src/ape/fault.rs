@@ -228,6 +228,21 @@ impl<'a> FaultService for ApeManager<'a> {
         error!("access_misaligned: pid={} addr={:#x} pc={:#x}", pid, addr, pc);
         self.terminate_faulting_process(pid, SIGSEGV_EXIT_CODE)
     }
+    fn virt_exit(
+        &mut self,
+        badge: Badge,
+        reason: usize,
+        detail0: usize,
+        detail1: usize,
+        detail2: usize,
+    ) -> Result<(), Error> {
+        let pid = badge.bits();
+        error!(
+            "virt_exit: pid={} reason={:#x} detail0={:#x} detail1={:#x} detail2={:#x}",
+            pid, reason, detail0, detail1, detail2
+        );
+        self.terminate_faulting_process(pid, UNKNOWN_FAULT_EXIT_CODE)
+    }
     fn handle_syscall(&mut self, pid: usize, args: MsgArgs) -> Result<(), Error> {
         let sys_num = args[0];
         let sys_args = [args[1], args[2], args[3], args[4], args[5], args[6]];
