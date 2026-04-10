@@ -6,7 +6,7 @@ use ape::sys::constants::{
     SIGILL_EXIT_CODE, SIGSEGV_EXIT_CODE, SIGTRAP_EXIT_CODE, UNKNOWN_FAULT_EXIT_CODE,
 };
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapType, Frame};
+use glenda::cap::{CSPACE_CAP, CapType, Frame};
 use glenda::error::Error;
 use glenda::interface::{
     CSpaceService, FaultService, ProcessService, ResourceService, VSpaceService,
@@ -62,6 +62,31 @@ impl<'a> ApeManager<'a> {
     }
 
     fn terminate_faulting_process(&mut self, pid: usize, code: usize) -> Result<(), Error> {
+        // fault 处理通常处于对目标进程的 CALL 上下文。
+        // 先释放 reply 与子进程 CNode 引用，再发起 kill，避免 Warren 回收失败。
+        if let Err(e) = CSPACE_CAP.delete(self.reply.cap())
+            && e != Error::InvalidCapability
+            && e != Error::InvalidSlot
+        {
+            warn!(
+                "fault: failed to clear ape reply slot {:?}: {:?}",
+                self.reply.cap(),
+                e
+            );
+        }
+
+        if let Some(slot) = self.get_process(pid).map(|p| p.cnode_cap.cap()) {
+            let _ = CSPACE_CAP.revoke(slot);
+            if let Err(e) = CSPACE_CAP.delete(slot)
+                && e != Error::InvalidCapability
+                && e != Error::InvalidSlot
+            {
+                warn!("fault: failed to delete child cnode slot {:?}: {:?}", slot, e);
+            } else {
+                self.cspace_mgr.free(slot);
+            }
+        }
+
         let host_pid = self
             .host_pid_map
             .iter()

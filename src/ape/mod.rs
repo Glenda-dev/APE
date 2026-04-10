@@ -85,8 +85,13 @@ impl<'a> ApeManager<'a> {
         let pid = self.next_pid;
         self.next_pid += 1;
 
-        let ape = CapPtr::concat(proc_cnode.cap(), APE_SLOT);
-        let _ = CSPACE_CAP.mint(self.endpoint.cap(), ape, Badge::new(pid), Rights::ALL);
+        let _ = CSPACE_CAP.mint(
+            self.endpoint.cap(),
+            proc_cnode.cap(),
+            APE_SLOT,
+            Badge::new(pid),
+            Rights::ALL,
+        );
 
         let proc = SubProcess::new(pid, parent_pid, proc_cnode);
         self.processes.insert(pid, proc);

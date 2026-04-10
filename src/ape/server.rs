@@ -40,7 +40,11 @@ impl<'a> SystemService for ApeManager<'a> {
                     panic!();
                 }
             }
-            self.reply(&mut utcb)?;
+            if let Err(e) = self.reply(&mut utcb)
+                && e != Error::InvalidCapability
+            {
+                return Err(e);
+            }
         }
         Ok(())
     }

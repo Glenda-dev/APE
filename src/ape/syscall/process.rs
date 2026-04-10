@@ -8,7 +8,7 @@ use ape::cap::APE_SLOT;
 use core::cmp::{max, min};
 use core::mem::size_of;
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, CapType, Endpoint, Frame};
+use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Endpoint, Frame};
 use glenda::error::Error;
 use glenda::interface::{
     CSpaceService, FileHandleService, FileSystemService, ProcessService, ResourceService,
@@ -410,6 +410,30 @@ pub fn sys_set_tid_address<'a>(
 
 pub fn sys_exit<'a>(mgr: &mut ApeManager<'a>, pid: usize, code: usize) -> Result<isize, Error> {
     log!("exit: pid {} code {}", pid, code as isize);
+
+    // 当前请求来自将要退出的目标线程（CALL 语义）。
+    // 先清空 Ape 的 reply 槽位，避免这枚 Reply Cap 在 Warren 回收目标 TCB 前
+    // 继续持有对目标线程的额外引用。
+    if let Err(e) = CSPACE_CAP.delete(mgr.reply.cap())
+        && e != Error::InvalidCapability
+        && e != Error::InvalidSlot
+    {
+        warn!("exit: failed to clear ape reply slot {:?}: {:?}", mgr.reply.cap(), e);
+    }
+
+    // 提前释放 Ape 持有的子进程 CNode 能力，避免 Warren 回收子进程 CNode 时
+    // 因外部引用残留而 ref_count > 1。
+    if let Some(slot) = mgr.get_process(pid).map(|p| p.cnode_cap.cap()) {
+        let _ = CSPACE_CAP.revoke(slot);
+        if let Err(e) = CSPACE_CAP.delete(slot)
+            && e != Error::InvalidCapability
+            && e != Error::InvalidSlot
+        {
+            warn!("exit: failed to delete child cnode slot {:?}: {:?}", slot, e);
+        } else {
+            mgr.cspace_mgr.free(slot);
+        }
+    }
 
     let host_pid = mgr
         .host_pid_map
