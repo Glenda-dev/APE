@@ -4,8 +4,10 @@ use alloc::string::String;
 use ape::sys::constants::{
     DEFAULT_HEAP_LIMIT, DEFAULT_MAX_STACK_SIZE, DEFAULT_MMAP_BASE, DEFAULT_MMAP_LIMIT,
 };
+use glenda::client::FsClient;
 use glenda::cap::{CNode, CapPtr, TCB, TCB_SLOT, VSPACE_SLOT, VSpace};
 use glenda::client::TerminalClient;
+use glenda::io::uring::IoUringClient;
 use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,9 +29,34 @@ pub struct MemoryMap {
     pub frame_cap: usize, // Required for translate and map_scratch
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
+pub struct AsyncIoRegion {
+    pub id: usize,
+    pub frame_slot: CapPtr,
+    pub vaddr: usize,
+    pub size: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AsyncIoState {
+    pub region_id: usize,
+    pub ring: IoUringClient,
+    pub data_vaddr: usize,
+    pub data_len: usize,
+    pub next_user_data: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NormalFileHandle {
+    pub fs_client: FsClient,
+    pub fs_ep_slot: CapPtr,
+    pub offset: usize,
+    pub async_io: AsyncIoState,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum FileType {
-    Normal { cap: CapPtr, offset: usize },
+    Normal(NormalFileHandle),
     Terminal(TerminalClient),
 }
 

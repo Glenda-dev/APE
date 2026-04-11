@@ -58,7 +58,7 @@ pub fn handler<'a>(
     args: [usize; 6],
 ) -> isize {
     let sys_num_u32 = sys_num as u32;
-    log!("Syscall {}({}) from PID {}", sys_num, syscall_name(sys_num_u32), pid);
+    let name = syscall_name(sys_num_u32);
 
     let result = match sys_num_u32 {
         __NR_read => sys_read(mgr, pid, args[0], args[1], args[2]),
@@ -82,11 +82,26 @@ pub fn handler<'a>(
         _ => Err(Error::NotImplemented), // map ENOSYS later
     };
 
-    match result {
+    let ret = match result {
         Ok(ret) => ret,
         Err(e) => {
-            error!("Syscall {} from PID {} failed with error: {:?}", sys_num, pid, e);
-            map_error_to_errno(e)
+            let errno = map_error_to_errno(e);
+            error!("{}: pid={} err={:?} -> {}", name, pid, e, errno);
+            errno
         }
-    }
+    };
+
+    log!(
+        "[pid {}] {}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) = {}",
+        pid,
+        name,
+        args[0],
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        args[5],
+        ret
+    );
+    ret
 }

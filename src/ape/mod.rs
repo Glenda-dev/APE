@@ -11,13 +11,21 @@ pub mod user;
 use crate::config::ApeConfig;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::vec::Vec;
 use ape::cap::APE_SLOT;
-use glenda::cap::{CNode, CSPACE_CAP, CapPtr, Endpoint, Reply, Rights};
+use glenda::arch::mem::PGSIZE;
+use glenda::cap::{CNode, CSPACE_CAP, CapPtr, CapType, Endpoint, Frame, Reply, Rights};
 use glenda::client::*;
 use glenda::error::Error;
+use glenda::interface::{CSpaceService, ResourceService, VSpaceService};
 use glenda::ipc::Badge;
+use glenda::mem::Perms;
+use glenda::utils::align::align_up;
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
-use process::SubProcess;
+use process::{AsyncIoRegion, SubProcess};
+
+const FS_ASYNC_POOL_BASE_VADDR: usize = 0x5800_0000;
+const FS_ASYNC_POOL_MAX_REGIONS: usize = 64;
 
 pub struct ApeIpc {
     pub running: bool,
@@ -41,6 +49,10 @@ pub struct ApeManager<'a> {
     pub vspace_mgr: &'a mut VSpaceManager,
     pub config: ApeConfig,
     pub stdio_term: Option<glenda::client::TerminalClient>,
+    pub fs_async_regions: Vec<AsyncIoRegion>,
+    pub fs_async_free: Vec<usize>,
+    pub next_fs_async_vaddr: usize,
+    pub next_fs_handle_badge: usize,
 }
 
 impl<'a> ApeManager<'a> {
@@ -74,6 +86,10 @@ impl<'a> ApeManager<'a> {
             vspace_mgr,
             config: ApeConfig::default(),
             stdio_term: None,
+            fs_async_regions: Vec::new(),
+            fs_async_free: Vec::new(),
+            next_fs_async_vaddr: FS_ASYNC_POOL_BASE_VADDR,
+            next_fs_handle_badge: 0x10000,
         }
     }
 
@@ -115,5 +131,60 @@ impl<'a> ApeManager<'a> {
 
     pub fn get_process_mut(&mut self, pid: usize) -> Option<&mut SubProcess> {
         self.processes.get_mut(&pid)
+    }
+
+    pub fn take_next_fs_handle_badge(&mut self) -> usize {
+        let badge = self.next_fs_handle_badge;
+        self.next_fs_handle_badge = self.next_fs_handle_badge.wrapping_add(1);
+        badge
+    }
+
+    pub fn allocate_fs_async_region(&mut self, size: usize) -> Result<AsyncIoRegion, Error> {
+        let size_aligned = align_up(size, PGSIZE);
+
+        if let Some(region_id) = self.fs_async_free.pop() {
+            if let Some(region) = self.fs_async_regions.get(region_id).copied() {
+                return Ok(region);
+            }
+        }
+
+        if self.fs_async_regions.len() >= FS_ASYNC_POOL_MAX_REGIONS {
+            return Err(Error::OutOfMemory);
+        }
+
+        let frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
+        let pages = size_aligned / PGSIZE;
+        self.res_client.alloc(Badge::null(), CapType::Frame, pages, frame_slot)?;
+        let frame = Frame::from(frame_slot);
+
+        let vaddr = self.next_fs_async_vaddr;
+        self.next_fs_async_vaddr = self
+            .next_fs_async_vaddr
+            .checked_add(size_aligned)
+            .ok_or(Error::OutOfMemory)?;
+
+        self.vspace_mgr.map_frame(
+            frame,
+            vaddr,
+            Perms::READ | Perms::WRITE,
+            pages,
+            &mut *self.res_client,
+            &mut *self.cspace_mgr,
+        )?;
+
+        let region = AsyncIoRegion {
+            id: self.fs_async_regions.len(),
+            frame_slot,
+            vaddr,
+            size: size_aligned,
+        };
+        self.fs_async_regions.push(region);
+        Ok(region)
+    }
+
+    pub fn recycle_fs_async_region(&mut self, region_id: usize) {
+        if region_id < self.fs_async_regions.len() && !self.fs_async_free.contains(&region_id) {
+            self.fs_async_free.push(region_id);
+        }
     }
 }

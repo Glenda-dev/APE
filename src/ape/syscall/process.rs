@@ -612,6 +612,7 @@ pub fn sys_exit_group<'a>(
 }
 
 pub fn sys_brk<'a>(mgr: &mut ApeManager<'a>, pid: usize, addr: usize) -> Result<isize, Error> {
+    log!("brk: pid {} addr {:#x}", pid, addr);
     let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
 
     if addr == 0 {
@@ -633,9 +634,19 @@ pub fn sys_mmap<'a>(
     len: usize,
     prot: u32,
     flags: u32,
-    _fd: usize,
-    _offset: usize,
+    fd: usize,
+    offset: usize,
 ) -> Result<isize, Error> {
+    log!(
+        "mmap: pid {} addr {:#x} len {:#x} prot {:#x} flags {:#x} fd {} offset {:#x}",
+        pid,
+        addr,
+        len,
+        prot,
+        flags,
+        fd,
+        offset
+    );
     if len == 0 {
         return Err(Error::InvalidArgs);
     }
