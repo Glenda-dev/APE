@@ -35,7 +35,13 @@ pub struct Elf64Phdr {
 }
 
 pub const PT_LOAD: u32 = 1;
+pub const PT_INTERP: u32 = 3;
+pub const PT_PHDR: u32 = 6;
 pub const PT_TLS: u32 = 7;
+
+pub const ET_EXEC: u16 = 2;
+pub const ET_DYN: u16 = 3;
+
 pub const PF_X: u32 = 1;
 pub const PF_W: u32 = 2;
 pub const PF_R: u32 = 4;
@@ -59,6 +65,41 @@ impl<'a> ElfFile<'a> {
 
     pub fn entry_point(&self) -> usize {
         self.header.e_entry as usize
+    }
+
+    pub fn file_type(&self) -> u16 {
+        self.header.e_type
+    }
+
+    pub fn ph_offset(&self) -> usize {
+        self.header.e_phoff as usize
+    }
+
+    pub fn ph_entry_size(&self) -> usize {
+        self.header.e_phentsize as usize
+    }
+
+    pub fn ph_num(&self) -> usize {
+        self.header.e_phnum as usize
+    }
+
+    pub fn interpreter_path(&self) -> Option<&'a str> {
+        for phdr in self.program_headers() {
+            if phdr.p_type != PT_INTERP {
+                continue;
+            }
+
+            let start = phdr.p_offset as usize;
+            let end = start.checked_add(phdr.p_filesz as usize)?;
+            if end > self.data.len() || start >= end {
+                return None;
+            }
+
+            let bytes = &self.data[start..end];
+            let nul_pos = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+            return core::str::from_utf8(&bytes[..nul_pos]).ok();
+        }
+        None
     }
 
     pub fn program_headers(&self) -> ProgramHeaders<'a> {

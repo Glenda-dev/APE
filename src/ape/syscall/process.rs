@@ -1,7 +1,7 @@
 use crate::ApeManager;
 use crate::ape::process::{MemoryMap, MemoryType};
 use crate::ape::user::ExecveUserInput;
-use crate::elf::{ElfFile, PF_W, PF_X, PT_LOAD};
+use crate::elf::{ET_DYN, ET_EXEC, ElfFile, PF_W, PF_X, PT_LOAD, PT_PHDR};
 use alloc::string::String;
 use alloc::vec::Vec;
 use ape::cap::APE_SLOT;
@@ -25,6 +25,23 @@ use linux_raw_sys::general::*;
 
 const DEFAULT_ARG0: &str = "init";
 const INITIAL_STACK_ALIGN: usize = 16;
+const PIE_LOAD_BIAS: usize = 0x1_0000;
+const INTERP_LOAD_GAP: usize = 0x10_0000;
+const INITIAL_TLS_PAGES: usize = 4;
+const INITIAL_TLS_GAP_PAGES: usize = 8;
+
+const AUXV_AT_PHDR: usize = 3;
+const AUXV_AT_PHENT: usize = 4;
+const AUXV_AT_PHNUM: usize = 5;
+const AUXV_AT_PAGESZ: usize = 6;
+const AUXV_AT_BASE: usize = 7;
+const AUXV_AT_ENTRY: usize = 9;
+
+struct LoadedElfInfo {
+    entry: usize,
+    load_end: usize,
+    phdr_vaddr: Option<usize>,
+}
 
 fn prot_to_perms(prot: u32) -> Perms {
     let mut perms = Perms::empty();
@@ -121,6 +138,7 @@ impl<'a> ApeManager<'a> {
         child_vspace_mgr: &mut VSpaceManager,
         argv: &[String],
         envp: &[String],
+        auxv: &[(usize, usize)],
     ) -> Result<usize, Error> {
         let stack_page_vaddr = STACK_BASE - PGSIZE;
         let perms = Perms::READ | Perms::WRITE;
@@ -186,14 +204,18 @@ impl<'a> ApeManager<'a> {
         envp_ptrs.reverse();
 
         // Linux/musl 兼容启动栈：
-        // [argc][argv...][NULL][envp...][NULL][AT_NULL][0]
+        // [argc][argv...][NULL][envp...][NULL][auxv...][AT_NULL][0]
         let mut words = Vec::new();
         words.push(argv_ptrs.len());
         words.extend(argv_ptrs.iter().copied());
         words.push(0);
         words.extend(envp_ptrs.iter().copied());
         words.push(0);
-        words.push(0);
+        for (k, v) in auxv {
+            words.push(*k);
+            words.push(*v);
+        }
+        words.push(0); // AT_NULL
         words.push(0);
 
         let words_size = words.len().checked_mul(size_of::<usize>()).ok_or(Error::OutOfMemory)?;
@@ -231,48 +253,75 @@ impl<'a> ApeManager<'a> {
         Ok(stack_page_vaddr + sp)
     }
 
-    pub(crate) fn execve_path(
+    fn setup_initial_tls(
         &mut self,
         pid: usize,
-        path: &str,
-        argv: &[String],
-        envp: &[String],
-    ) -> Result<(), Error> {
-        let elf_data = self.read_exec_image_from_fs(pid, path)?;
-        let elf = ElfFile::new(&elf_data)
-            .map_err(|e| error!("Failed to parse ELF file: {}", e))
-            .map_err(|_| Error::InvalidArgs)?;
-        let entry_point = elf.entry_point();
+        child_vspace_mgr: &mut VSpaceManager,
+    ) -> Result<usize, Error> {
+        let tls_start = get_utcb_va(0)
+            .saturating_sub(INITIAL_TLS_GAP_PAGES * PGSIZE)
+            .saturating_sub(INITIAL_TLS_PAGES * PGSIZE);
+        let tls_size = INITIAL_TLS_PAGES * PGSIZE;
 
-        let old_maps: Vec<(usize, usize)> = {
-            let process = self.get_process(pid).ok_or(Error::NotFound)?;
-            process
-                .memory_maps
-                .values()
-                .map(|map| (map.vaddr, align_up(map.size, PGSIZE) / PGSIZE))
-                .collect()
-        };
+        let frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
+        self.res_client.alloc(Badge::null(), CapType::Frame, INITIAL_TLS_PAGES, frame_slot)?;
+        let frame = Frame::from(frame_slot);
 
-        let vspace_cap = self.get_process(pid).ok_or(Error::NotFound)?.vspace();
-        let mut child_vspace_mgr = VSpaceManager::new(vspace_cap, 0, 0);
-        for (vaddr, pages) in old_maps {
-            if pages != 0 {
-                let _ = child_vspace_mgr.unmap(vaddr, pages);
-            }
-        }
+        child_vspace_mgr.map_frame(
+            frame,
+            tls_start,
+            Perms::READ | Perms::WRITE,
+            INITIAL_TLS_PAGES,
+            &mut *self.res_client,
+            &mut *self.cspace_mgr,
+        )?;
+
+        let scratch_vaddr = self.vspace_mgr.map_scratch(
+            frame,
+            Perms::READ | Perms::WRITE,
+            INITIAL_TLS_PAGES,
+            &mut *self.res_client,
+            &mut *self.cspace_mgr,
+        )?;
+        let tls_slice =
+            unsafe { core::slice::from_raw_parts_mut(scratch_vaddr as *mut u8, tls_size) };
+        tls_slice.fill(0);
+        self.vspace_mgr.unmap(scratch_vaddr, INITIAL_TLS_PAGES)?;
 
         if let Some(process) = self.get_process_mut(pid) {
-            process.memory_maps.clear();
-            process.lazy_memory_maps.clear();
-            process.stack_size = 0;
+            process.add_memory_map(MemoryMap {
+                vaddr: tls_start,
+                paddr: 0,
+                size: tls_size,
+                flags: Perms::READ | Perms::WRITE,
+                mem_type: MemoryType::Anonymous,
+                cow: false,
+                frame_cap: frame_slot.bits(),
+            });
         }
 
-        child_vspace_mgr.mark_existing(TRAMPOLINE_VA, PGSIZE);
-        child_vspace_mgr.mark_existing(get_utcb_va(0), PGSIZE);
-        child_vspace_mgr.mark_existing(get_trapframe_va(0), PGSIZE);
+        // 将 tp 放在 TLS 区中间，兼容动态加载器早期的正负偏移访问。
+        Ok(tls_start + tls_size / 2)
+    }
 
-        let mut max_vaddr = 0usize;
+    fn load_elf_into_process(
+        &mut self,
+        pid: usize,
+        child_vspace_mgr: &mut VSpaceManager,
+        elf_data: &[u8],
+        load_bias: usize,
+    ) -> Result<LoadedElfInfo, Error> {
+        let elf = ElfFile::new(elf_data)
+            .map_err(|e| error!("Failed to parse ELF file: {}", e))
+            .map_err(|_| Error::InvalidArgs)?;
+
+        let mut load_end = 0usize;
+        let mut phdr_vaddr = None;
+
         for phdr in elf.program_headers() {
+            if phdr.p_type == PT_PHDR {
+                phdr_vaddr = Some(load_bias + phdr.p_vaddr as usize);
+            }
             if phdr.p_type != PT_LOAD {
                 continue;
             }
@@ -285,8 +334,11 @@ impl<'a> ApeManager<'a> {
             if mem_size == 0 {
                 continue;
             }
-            if vaddr + mem_size > max_vaddr {
-                max_vaddr = vaddr + mem_size;
+
+            let seg_start = load_bias + vaddr;
+            let seg_end = seg_start + mem_size;
+            if seg_end > load_end {
+                load_end = seg_end;
             }
 
             let mut perms = Perms::READ;
@@ -296,16 +348,9 @@ impl<'a> ApeManager<'a> {
             if phdr.p_flags & PF_X != 0 {
                 perms |= Perms::EXECUTE;
             }
-            log!(
-                "Mapping segment: vaddr={:#x} mem_size={:#x} file_size={:#x} offset={:#x} perms={:?}",
-                vaddr,
-                mem_size,
-                file_size,
-                offset,
-                perms
-            );
-            let start_page = align_down(vaddr, PGSIZE);
-            let end_page = align_up(vaddr + mem_size, PGSIZE);
+
+            let start_page = align_down(seg_start, PGSIZE);
+            let end_page = align_up(seg_end, PGSIZE);
             let num_pages = (end_page - start_page) / PGSIZE;
 
             let dest_cap = self.cspace_mgr.alloc(&mut *self.res_client)?;
@@ -346,7 +391,7 @@ impl<'a> ApeManager<'a> {
             };
             dest_slice.fill(0);
 
-            let padding = vaddr - start_page;
+            let padding = seg_start - start_page;
             if padding < dest_slice.len() && offset < elf_data.len() {
                 let max_file_copy = min(file_size, elf_data.len() - offset);
                 let actual_copy = min(max_file_copy, dest_slice.len() - padding);
@@ -357,8 +402,82 @@ impl<'a> ApeManager<'a> {
             self.vspace_mgr.unmap(scratch_vaddr, num_pages)?;
         }
 
+        let fallback_phdr = load_bias + elf.ph_offset();
+        Ok(LoadedElfInfo {
+            entry: load_bias + elf.entry_point(),
+            load_end,
+            phdr_vaddr: phdr_vaddr.or(Some(fallback_phdr)),
+        })
+    }
+
+    pub(crate) fn execve_path(
+        &mut self,
+        pid: usize,
+        path: &str,
+        argv: &[String],
+        envp: &[String],
+    ) -> Result<(), Error> {
+        let main_elf_data = self.read_exec_image_from_fs(pid, path)?;
+        let main_elf = ElfFile::new(&main_elf_data)
+            .map_err(|e| error!("Failed to parse ELF file: {}", e))
+            .map_err(|_| Error::InvalidArgs)?;
+
+        let main_file_type = main_elf.file_type();
+        if main_file_type != ET_EXEC && main_file_type != ET_DYN {
+            error!("execve_path: unsupported ELF type {} for {}", main_file_type, path);
+            return Err(Error::InvalidArgs);
+        }
+
+        let main_load_bias = if main_file_type == ET_DYN { PIE_LOAD_BIAS } else { 0 };
+        let interp_path = main_elf.interpreter_path().map(String::from);
+        let old_maps: Vec<(usize, usize)> = {
+            let process = self.get_process(pid).ok_or(Error::NotFound)?;
+            process
+                .memory_maps
+                .values()
+                .map(|map| (map.vaddr, align_up(map.size, PGSIZE) / PGSIZE))
+                .collect()
+        };
+
+        let vspace_cap = self.get_process(pid).ok_or(Error::NotFound)?.vspace();
+        let mut child_vspace_mgr = VSpaceManager::new(vspace_cap, 0, 0);
+        for (vaddr, pages) in old_maps {
+            if pages != 0 {
+                let _ = child_vspace_mgr.unmap(vaddr, pages);
+            }
+        }
+
         if let Some(process) = self.get_process_mut(pid) {
-            let heap_start = align_up(max(max_vaddr, HEAP_VA), PGSIZE);
+            process.memory_maps.clear();
+            process.lazy_memory_maps.clear();
+            process.stack_size = 0;
+        }
+
+        child_vspace_mgr.mark_existing(TRAMPOLINE_VA, PGSIZE);
+        child_vspace_mgr.mark_existing(get_utcb_va(0), PGSIZE);
+        child_vspace_mgr.mark_existing(get_trapframe_va(0), PGSIZE);
+
+        let main_info =
+            self.load_elf_into_process(pid, &mut child_vspace_mgr, &main_elf_data, main_load_bias)?;
+
+        let mut entry_point = main_info.entry;
+        let mut aux_at_base = 0usize;
+
+        if let Some(interp) = interp_path {
+            let interp_elf_data = self.read_exec_image_from_fs(pid, &interp)?;
+            let interp_base = align_up(main_info.load_end + INTERP_LOAD_GAP, PGSIZE);
+            let interp_info = self.load_elf_into_process(
+                pid,
+                &mut child_vspace_mgr,
+                &interp_elf_data,
+                interp_base,
+            )?;
+            aux_at_base = interp_base;
+            entry_point = interp_info.entry;
+        }
+
+        if let Some(process) = self.get_process_mut(pid) {
+            let heap_start = align_up(max(main_info.load_end, HEAP_VA), PGSIZE);
             process.heap_start = heap_start;
             process.heap_brk = heap_start;
             process.heap_limit = process.mmap_base;
@@ -367,14 +486,30 @@ impl<'a> ApeManager<'a> {
             process.stack_size = 0;
         }
 
-        let initial_sp = self.setup_initial_stack(pid, &mut child_vspace_mgr, argv, envp)?;
+        let main_phdr = main_info.phdr_vaddr.unwrap_or(main_load_bias + main_elf.ph_offset());
+        let auxv = [
+            (AUXV_AT_PHDR, main_phdr),
+            (AUXV_AT_PHENT, main_elf.ph_entry_size()),
+            (AUXV_AT_PHNUM, main_elf.ph_num()),
+            (AUXV_AT_PAGESZ, PGSIZE),
+            (AUXV_AT_BASE, aux_at_base),
+            (AUXV_AT_ENTRY, main_info.entry),
+        ];
+
+        let initial_sp = self.setup_initial_stack(pid, &mut child_vspace_mgr, argv, envp, &auxv)?;
+        let initial_tp = self.setup_initial_tls(pid, &mut child_vspace_mgr)?;
         let (tcb_cap, fault_ep) = {
             let process = self.get_process(pid).ok_or(Error::NotFound)?;
             let fault_ep = Endpoint::from(CapPtr::concat(process.cspace().cap(), APE_SLOT));
             (process.tcb(), fault_ep)
         };
-
-        tcb_cap.set_entrypoint(entry_point, initial_sp, 0)?;
+        log!(
+            "Setting entry point {:#x}, initial SP {:#x}, initial TP {:#x}",
+            entry_point,
+            initial_sp,
+            initial_tp
+        );
+        tcb_cap.set_entrypoint(entry_point, initial_sp, initial_tp)?;
         tcb_cap.set_fault_handler(fault_ep, false)?;
         Ok(())
     }
@@ -513,7 +648,7 @@ pub fn sys_mmap<'a>(
     let perms = prot_to_perms(prot);
 
     if flags & MAP_FIXED != 0 {
-        if addr == 0 || addr % PGSIZE != 0 {
+        if addr % PGSIZE != 0 {
             return Err(Error::InvalidArgs);
         }
         let start = addr;
@@ -526,7 +661,7 @@ pub fn sys_mmap<'a>(
         {
             let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
 
-            if end > process.mmap_limit || start < process.mmap_base {
+            if end > process.mmap_limit {
                 return Err(Error::OutOfMemory);
             }
 

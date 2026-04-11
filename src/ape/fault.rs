@@ -9,7 +9,7 @@ use glenda::arch::mem::PGSIZE;
 use glenda::cap::{CSPACE_CAP, CapType, Frame};
 use glenda::error::Error;
 use glenda::interface::{
-    CSpaceService, FaultService, ProcessService, ResourceService, VSpaceService,
+    CSpaceService, FaultService, ProcessService, ResourceService, SystemService, VSpaceService,
 };
 use glenda::ipc::{Badge, MsgArgs, UTCB};
 use glenda::mem::Perms;
@@ -68,11 +68,7 @@ impl<'a> ApeManager<'a> {
             && e != Error::InvalidCapability
             && e != Error::InvalidSlot
         {
-            warn!(
-                "fault: failed to clear ape reply slot {:?}: {:?}",
-                self.ipc.reply.cap(),
-                e
-            );
+            warn!("fault: failed to clear ape reply slot {:?}: {:?}", self.ipc.reply.cap(), e);
         }
 
         if let Some(slot) = self.get_process(pid).map(|p| p.cnode_cap.cap()) {
@@ -97,8 +93,9 @@ impl<'a> ApeManager<'a> {
             self.host_pid_map.remove(&host_pid);
         }
         self.processes.remove(&pid);
-
-        log!("fault: killed process pid={} with code={}", pid, code);
+        if pid == 1 {
+            panic!("Init process faulted, shutting down Ape service");
+        }
         Ok(())
     }
 }

@@ -71,7 +71,6 @@ impl<'a> SystemService for ApeManager<'a> {
                 for i in 0..8 {
                     args[i] = utcb.get_mr(i);
                 }
-                debug!("Dispatching syscall with args: {:?}", args);
                 s.handle_syscall(badge.bits(), args)
             },
             (protocol::KERNEL_PROTO, protocol::kernel::PAGE_FAULT) => |s: &mut ApeManager, utcb: &mut UTCB| s.page_fault(badge, utcb.get_mr(0), utcb.get_mr(1), utcb.get_mr(2)),
