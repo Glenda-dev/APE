@@ -36,10 +36,10 @@ fn main() -> usize {
     let mut res_client = ResourceClient::new(MONITOR_CAP);
     let mut proc_client = ProcessClient::new(MONITOR_CAP);
 
-    let stat = res_client.status(Badge::null()).expect("Failed to get warren status");
+    let stat = res_client.status(Badge::null()).expect("Failed to get system status");
     let mem = stat.memory;
     log!(
-        "Warren status: memory: {}/{} MB",
+        "System status: memory: {}/{} MB",
         mem.available_bytes / 1024 / 1024,
         mem.total_bytes / 1024 / 1024
     );
