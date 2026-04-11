@@ -1,5 +1,5 @@
 use crate::ApeManager;
-use glenda::cap::{CapPtr, Endpoint, Reply};
+use glenda::cap::{CSPACE_CAP, CapPtr, Endpoint, Reply};
 use glenda::error::Error;
 use glenda::interface::FaultService;
 use glenda::interface::{
@@ -34,16 +34,27 @@ impl<'a> SystemService for ApeManager<'a> {
             }
 
             match self.dispatch(&mut utcb) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if let Err(e) = self.reply(&mut utcb)
+                        && e != Error::InvalidCapability
+                    {
+                        return Err(e);
+                    }
+                }
+                Err(Error::Success) => {
+                    // Proxied/tail-call path; no direct reply from APE is needed.
+                    let _ = CSPACE_CAP.delete(self.ipc.reply.cap());
+                }
                 Err(e) => {
                     error!("Dispatch error: {:?}", e);
-                    panic!();
+                    utcb.set_msg_tag(glenda::ipc::MsgTag::err());
+                    utcb.set_mr(0, e as usize);
+                    if let Err(reply_err) = self.reply(&mut utcb)
+                        && reply_err != Error::InvalidCapability
+                    {
+                        return Err(reply_err);
+                    }
                 }
-            }
-            if let Err(e) = self.reply(&mut utcb)
-                && e != Error::InvalidCapability
-            {
-                return Err(e);
             }
         }
         Ok(())

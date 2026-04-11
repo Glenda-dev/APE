@@ -17,7 +17,9 @@ use glenda::cap::{
     CSPACE_CAP, CapPtr, CapType, ENDPOINT_CAP, ENDPOINT_SLOT, MONITOR_CAP, RECV_SLOT, REPLY_SLOT,
     VSPACE_CAP,
 };
-use glenda::client::{FsClient, InitClient, ProcessClient, ResourceClient, VirtualTerminalClient};
+use glenda::client::{
+    FsClient, InitClient, ProcessClient, ResourceClient, VirtualTerminalClient, VolumeClient,
+};
 use glenda::interface::{ResourceService, SystemService};
 use glenda::ipc::Badge;
 use glenda::protocol::resource::{
@@ -57,6 +59,7 @@ fn main() -> usize {
     res_client
         .get_cap(Badge::null(), ResourceType::Endpoint, VOLUME_ENDPOINT, VOLUME_SLOT)
         .expect("Failed to get volume endpoint");
+    let mut vol_client = VolumeClient::new_simple(VOLUME_CAP, &res_client);
 
     res_client
         .get_cap(Badge::null(), ResourceType::Endpoint, VT_ENDPOINT, VT_SLOT)
@@ -66,7 +69,6 @@ fn main() -> usize {
     res_client
         .alloc(Badge::null(), CapType::Endpoint, 0, ENDPOINT_SLOT)
         .expect("Failed to alloc endpoint");
-
     // Register APE endpoint to monitor
     res_client
         .register_cap(Badge::null(), ResourceType::Endpoint, APE_ENDPOINT, ENDPOINT_SLOT)
@@ -77,7 +79,7 @@ fn main() -> usize {
         &mut proc_client,
         &mut res_client,
         &mut vt_client,
-        VOLUME_CAP,
+        &mut vol_client,
         &mut fs_client,
         &mut cspace_mgr,
         &mut vspace_mgr,

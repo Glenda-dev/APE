@@ -81,26 +81,37 @@ fn range_is_free(process: &crate::ape::process::SubProcess, start: usize, end: u
 
 impl<'a> ApeManager<'a> {
     fn read_exec_image_from_fs(&mut self, pid: usize, path: &str) -> Result<Vec<u8>, Error> {
-        let translated_path = self.resolve_path_for_process(pid, path)?;
-        let stat = self.fs_client.stat_path(Badge::new(pid), &translated_path)?;
+        let mut translated_path = self.resolve_path_for_process(pid, path)?;
+        let mut stat = self.fs_client.stat_path(Badge::null(), &translated_path)?;
+        const S_IFMT: u32 = 0o170000;
+        const S_IFLNK: u32 = 0o120000;
+        if (stat.mode & S_IFMT) == S_IFLNK {
+            if translated_path.ends_with("/sbin/init") {
+                let fallback = translated_path.replace("/sbin/init", "/bin/busybox");
+                translated_path = fallback;
+                stat = self.fs_client.stat_path(Badge::null(), &translated_path)?;
+            }
+        }
         let size = stat.size as usize;
         if size == 0 {
+            error!("read_exec_image_from_fs: exec image has zero size");
             return Err(Error::InvalidArgs);
         }
-
-        let _fd = self.fs_client.open(Badge::new(pid), &translated_path, OpenFlags::O_RDONLY, 0)?;
+        let fd = self.fs_client.open(Badge::null(), &translated_path, OpenFlags::O_RDONLY, 0)?;
 
         let mut elf_data = alloc::vec![0u8; size];
         let mut offset = 0;
         while offset < size {
-            let read_len = self.fs_client.read(Badge::new(pid), offset, &mut elf_data[offset..])?;
+            let read_len = self.fs_client.read(Badge::null(), offset, &mut elf_data[offset..])?;
             if read_len == 0 {
-                self.fs_client.close(Badge::new(pid))?;
+                error!("read_exec_image_from_fs: unexpected EOF while reading exec image");
+                self.fs_client.close(Badge::null())?;
                 return Err(Error::IoError);
             }
             offset += read_len;
         }
-        self.fs_client.close(Badge::new(pid))?;
+        self.fs_client.close(Badge::null())?;
+        let _ = fd;
         Ok(elf_data)
     }
 
@@ -228,7 +239,9 @@ impl<'a> ApeManager<'a> {
         envp: &[String],
     ) -> Result<(), Error> {
         let elf_data = self.read_exec_image_from_fs(pid, path)?;
-        let elf = ElfFile::new(&elf_data).map_err(|_| Error::InvalidArgs)?;
+        let elf = ElfFile::new(&elf_data)
+            .map_err(|e| error!("Failed to parse ELF file: {}", e))
+            .map_err(|_| Error::InvalidArgs)?;
         let entry_point = elf.entry_point();
 
         let old_maps: Vec<(usize, usize)> = {
@@ -272,7 +285,6 @@ impl<'a> ApeManager<'a> {
             if mem_size == 0 {
                 continue;
             }
-
             if vaddr + mem_size > max_vaddr {
                 max_vaddr = vaddr + mem_size;
             }
@@ -284,7 +296,14 @@ impl<'a> ApeManager<'a> {
             if phdr.p_flags & PF_X != 0 {
                 perms |= Perms::EXECUTE;
             }
-
+            log!(
+                "Mapping segment: vaddr={:#x} mem_size={:#x} file_size={:#x} offset={:#x} perms={:?}",
+                vaddr,
+                mem_size,
+                file_size,
+                offset,
+                perms
+            );
             let start_page = align_down(vaddr, PGSIZE);
             let end_page = align_up(vaddr + mem_size, PGSIZE);
             let num_pages = (end_page - start_page) / PGSIZE;
@@ -418,11 +437,7 @@ pub fn sys_exit<'a>(mgr: &mut ApeManager<'a>, pid: usize, code: usize) -> Result
         && e != Error::InvalidCapability
         && e != Error::InvalidSlot
     {
-        warn!(
-            "exit: failed to clear ape reply slot {:?}: {:?}",
-            mgr.ipc.reply.cap(),
-            e
-        );
+        warn!("exit: failed to clear ape reply slot {:?}: {:?}", mgr.ipc.reply.cap(), e);
     }
 
     // 提前释放 Ape 持有的子进程 CNode 能力，避免 Warren 回收子进程 CNode 时

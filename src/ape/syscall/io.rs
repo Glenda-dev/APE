@@ -45,7 +45,13 @@ pub fn sys_read<'a>(
             }
             Ok(read_len as isize)
         }
-        FileType::Normal { .. } => Ok(0),
+        FileType::Normal { cap, offset } => {
+            warn!(
+                "sys_read: pid {} fd {} normal file path is placeholder (cap={:?}, offset={})",
+                pid, fd, cap, offset
+            );
+            Ok(0)
+        }
     }
 }
 
@@ -85,7 +91,13 @@ pub fn sys_write<'a>(
             let written = if utcb.get_mr(0) > 0 { min(utcb.get_mr(0), copied) } else { copied };
             Ok(written as isize)
         }
-        FileType::Normal { .. } => Ok(len as isize),
+        FileType::Normal { cap, offset } => {
+            warn!(
+                "sys_write: pid {} fd {} normal file path is placeholder (cap={:?}, offset={}, len={})",
+                pid, fd, cap, offset, len
+            );
+            Ok(len as isize)
+        }
     }
 }
 
@@ -107,6 +119,10 @@ pub fn sys_openat<'a>(
         translated_path,
         flags,
         mode
+    );
+    warn!(
+        "sys_openat: creating placeholder normal fd without real FS handle bind (pid={}, path={})",
+        pid, translated_path
     );
     let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
     let fd = process.next_fd;
