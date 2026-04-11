@@ -414,11 +414,15 @@ pub fn sys_exit<'a>(mgr: &mut ApeManager<'a>, pid: usize, code: usize) -> Result
     // 当前请求来自将要退出的目标线程（CALL 语义）。
     // 先清空 Ape 的 reply 槽位，避免这枚 Reply Cap 在 Warren 回收目标 TCB 前
     // 继续持有对目标线程的额外引用。
-    if let Err(e) = CSPACE_CAP.delete(mgr.reply.cap())
+    if let Err(e) = CSPACE_CAP.delete(mgr.ipc.reply.cap())
         && e != Error::InvalidCapability
         && e != Error::InvalidSlot
     {
-        warn!("exit: failed to clear ape reply slot {:?}: {:?}", mgr.reply.cap(), e);
+        warn!(
+            "exit: failed to clear ape reply slot {:?}: {:?}",
+            mgr.ipc.reply.cap(),
+            e
+        );
     }
 
     // 提前释放 Ape 持有的子进程 CNode 能力，避免 Warren 回收子进程 CNode 时

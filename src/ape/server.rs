@@ -13,22 +13,22 @@ impl<'a> SystemService for ApeManager<'a> {
         self.bootstrap()
     }
     fn listen(&mut self, ep: Endpoint, reply: CapPtr, recv: CapPtr) -> Result<(), Error> {
-        self.endpoint = ep;
-        self.reply = Reply::from(reply);
-        self.recv = recv;
+        self.ipc.endpoint = ep;
+        self.ipc.reply = Reply::from(reply);
+        self.ipc.recv = recv;
         Ok(())
     }
     fn run(&mut self) -> Result<(), Error> {
-        if self.endpoint.cap().is_null() || self.reply.cap().is_null() {
+        if self.ipc.endpoint.cap().is_null() || self.ipc.reply.cap().is_null() {
             return Err(Error::NotInitialized);
         }
         self.init_client.report_service(Badge::null(), protocol::init::ServiceState::Running)?;
-        self.running = true;
-        while self.running {
+        self.ipc.running = true;
+        while self.ipc.running {
             let mut utcb = unsafe { UTCB::new() };
-            utcb.set_reply_window(self.reply.cap());
-            utcb.set_recv_window(self.recv);
-            if let Err(e) = self.endpoint.recv(&mut utcb) {
+            utcb.set_reply_window(self.ipc.reply.cap());
+            utcb.set_recv_window(self.ipc.recv);
+            if let Err(e) = self.ipc.endpoint.recv(&mut utcb) {
                 error!("Recv error: {:?}", e);
                 continue;
             }
@@ -73,10 +73,10 @@ impl<'a> SystemService for ApeManager<'a> {
         }
     }
     fn reply(&mut self, utcb: &mut UTCB) -> Result<(), Error> {
-        self.reply.reply(utcb)
+        self.ipc.reply.reply(utcb)
     }
     fn stop(&mut self) {
-        self.running = false;
+        self.ipc.running = false;
         log!("Shutting down...");
         let _ =
             self.init_client.report_service(Badge::null(), protocol::init::ServiceState::Stopped);

@@ -19,11 +19,15 @@ use glenda::ipc::Badge;
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
 use process::SubProcess;
 
-pub struct ApeManager<'a> {
+pub struct ApeIpc {
     pub running: bool,
     pub endpoint: Endpoint,
     pub reply: Reply,
     pub recv: CapPtr,
+}
+
+pub struct ApeManager<'a> {
+    pub ipc: ApeIpc,
     pub processes: BTreeMap<usize, SubProcess>,
     pub host_pid_map: BTreeMap<usize, usize>, // host_pid -> pid
     pub next_pid: usize,
@@ -51,10 +55,12 @@ impl<'a> ApeManager<'a> {
         vspace_mgr: &'a mut VSpaceManager,
     ) -> Self {
         Self {
-            running: false,
-            endpoint: Endpoint::from(CapPtr::null()),
-            recv: CapPtr::null(),
-            reply: Reply::from(CapPtr::null()),
+            ipc: ApeIpc {
+                running: false,
+                endpoint: Endpoint::from(CapPtr::null()),
+                recv: CapPtr::null(),
+                reply: Reply::from(CapPtr::null()),
+            },
             processes: BTreeMap::new(),
             host_pid_map: BTreeMap::new(),
             next_pid: 1,
@@ -86,7 +92,7 @@ impl<'a> ApeManager<'a> {
         self.next_pid += 1;
 
         let _ = CSPACE_CAP.mint(
-            self.endpoint.cap(),
+            self.ipc.endpoint.cap(),
             proc_cnode.cap(),
             APE_SLOT,
             Badge::new(pid),
