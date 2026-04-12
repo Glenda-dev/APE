@@ -13,13 +13,13 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use ape::cap::APE_SLOT;
-use glenda::arch::mem::PGSIZE;
+use glenda::arch::mem::{PGSIZE, SHIFTS};
 use glenda::cap::{CNode, CSPACE_CAP, CapPtr, CapType, Endpoint, Frame, Reply, Rights};
 use glenda::client::*;
 use glenda::error::Error;
 use glenda::interface::{CSpaceService, ResourceService, VSpaceService};
 use glenda::ipc::Badge;
-use glenda::mem::Perms;
+use glenda::mem::{Perms, TRAMPOLINE_VA, get_trapframe_va, get_utcb_va};
 use glenda::utils::align::align_up;
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
 use process::{AsyncIoRegion, SubProcess};
@@ -56,6 +56,17 @@ pub struct ApeManager<'a> {
 }
 
 impl<'a> ApeManager<'a> {
+    fn seed_initial_pagetable_paths(proc: &mut SubProcess) {
+        for vaddr in [TRAMPOLINE_VA, get_utcb_va(0), get_trapframe_va(0)] {
+            for level in (1..SHIFTS.len()).rev() {
+                let prefix = vaddr >> SHIFTS[level];
+                proc.intermediate_page_tables
+                    .entry((level, prefix))
+                    .or_insert(CapPtr::null());
+            }
+        }
+    }
+
     pub fn new(
         init_client: &'a mut InitClient,
         proc_client: &'a mut ProcessClient,
@@ -115,7 +126,8 @@ impl<'a> ApeManager<'a> {
             Rights::ALL,
         );
 
-        let proc = SubProcess::new(pid, parent_pid, proc_cnode);
+        let mut proc = SubProcess::new(pid, parent_pid, proc_cnode);
+        Self::seed_initial_pagetable_paths(&mut proc);
         self.processes.insert(pid, proc);
         self.host_pid_map.insert(host_pid, pid);
         pid

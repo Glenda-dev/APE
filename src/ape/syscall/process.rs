@@ -16,10 +16,9 @@ use glenda::interface::{
 };
 use glenda::ipc::Badge;
 use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
-use glenda::mem::{TRAMPOLINE_VA, get_trapframe_va, get_utcb_va};
+use glenda::mem::get_utcb_va;
 use glenda::protocol::fs::OpenFlags;
 use glenda::utils::align::{align_down, align_up};
-use glenda::utils::manager::VSpaceManager;
 use linux_raw_sys::general::*;
 
 const DEFAULT_ARG0: &str = "init";
@@ -134,7 +133,6 @@ impl<'a> ApeManager<'a> {
     fn setup_initial_stack(
         &mut self,
         pid: usize,
-        child_vspace_mgr: &mut VSpaceManager,
         argv: &[String],
         envp: &[String],
         auxv: &[(usize, usize)],
@@ -146,14 +144,7 @@ impl<'a> ApeManager<'a> {
         self.res_client.alloc(Badge::null(), CapType::Frame, 1, frame_slot)?;
         let frame = Frame::from(frame_slot);
 
-        child_vspace_mgr.map_frame(
-            frame,
-            stack_page_vaddr,
-            perms,
-            1,
-            &mut *self.res_client,
-            &mut *self.cspace_mgr,
-        )?;
+        self.map_process_frame(pid, frame, stack_page_vaddr, perms, 1)?;
 
         let scratch_vaddr = self.vspace_mgr.map_scratch(
             frame,
@@ -255,7 +246,6 @@ impl<'a> ApeManager<'a> {
     fn setup_initial_tls(
         &mut self,
         pid: usize,
-        child_vspace_mgr: &mut VSpaceManager,
     ) -> Result<usize, Error> {
         let tls_start = get_utcb_va(0)
             .saturating_sub(INITIAL_TLS_GAP_PAGES * PGSIZE)
@@ -266,13 +256,12 @@ impl<'a> ApeManager<'a> {
         self.res_client.alloc(Badge::null(), CapType::Frame, INITIAL_TLS_PAGES, frame_slot)?;
         let frame = Frame::from(frame_slot);
 
-        child_vspace_mgr.map_frame(
+        self.map_process_frame(
+            pid,
             frame,
             tls_start,
             Perms::READ | Perms::WRITE,
             INITIAL_TLS_PAGES,
-            &mut *self.res_client,
-            &mut *self.cspace_mgr,
         )?;
 
         let scratch_vaddr = self.vspace_mgr.map_scratch(
@@ -306,7 +295,6 @@ impl<'a> ApeManager<'a> {
     fn load_elf_into_process(
         &mut self,
         pid: usize,
-        child_vspace_mgr: &mut VSpaceManager,
         elf_data: &[u8],
         load_bias: usize,
     ) -> Result<LoadedElfInfo, Error> {
@@ -359,14 +347,7 @@ impl<'a> ApeManager<'a> {
                 self.res_client.alloc(Badge::null(), CapType::Frame, 1, frame_cap)?;
                 let frame = Frame::from(frame_cap);
 
-                child_vspace_mgr.map_frame(
-                    frame,
-                    page_vaddr,
-                    perms,
-                    1,
-                    &mut *self.res_client,
-                    &mut *self.cspace_mgr,
-                )?;
+                self.map_process_frame(pid, frame, page_vaddr, perms, 1)?;
 
                 if let Some(process) = self.get_process_mut(pid) {
                     process.add_memory_map(MemoryMap {
@@ -447,11 +428,9 @@ impl<'a> ApeManager<'a> {
                 .collect()
         };
 
-        let vspace_cap = self.get_process(pid).ok_or(Error::NotFound)?.vspace();
-        let mut child_vspace_mgr = VSpaceManager::new(vspace_cap, 0, 0);
         for (vaddr, pages) in old_maps {
             if pages != 0 {
-                let _ = child_vspace_mgr.unmap(vaddr, pages);
+                let _ = self.unmap_process_pages(pid, vaddr, pages);
             }
         }
 
@@ -461,12 +440,7 @@ impl<'a> ApeManager<'a> {
             process.stack_size = 0;
         }
 
-        child_vspace_mgr.mark_existing(TRAMPOLINE_VA, PGSIZE);
-        child_vspace_mgr.mark_existing(get_utcb_va(0), PGSIZE);
-        child_vspace_mgr.mark_existing(get_trapframe_va(0), PGSIZE);
-
-        let main_info =
-            self.load_elf_into_process(pid, &mut child_vspace_mgr, &main_elf_data, main_load_bias)?;
+        let main_info = self.load_elf_into_process(pid, &main_elf_data, main_load_bias)?;
 
         let mut entry_point = main_info.entry;
         let mut aux_at_base = 0usize;
@@ -474,12 +448,7 @@ impl<'a> ApeManager<'a> {
         if let Some(interp) = interp_path {
             let interp_elf_data = self.read_exec_image_from_fs(pid, &interp)?;
             let interp_base = align_up(main_info.load_end + INTERP_LOAD_GAP, PGSIZE);
-            let interp_info = self.load_elf_into_process(
-                pid,
-                &mut child_vspace_mgr,
-                &interp_elf_data,
-                interp_base,
-            )?;
+            let interp_info = self.load_elf_into_process(pid, &interp_elf_data, interp_base)?;
             aux_at_base = interp_base;
             entry_point = interp_info.entry;
         }
@@ -504,8 +473,8 @@ impl<'a> ApeManager<'a> {
             (AUXV_AT_ENTRY, main_info.entry),
         ];
 
-        let initial_sp = self.setup_initial_stack(pid, &mut child_vspace_mgr, argv, envp, &auxv)?;
-        let initial_tp = self.setup_initial_tls(pid, &mut child_vspace_mgr)?;
+        let initial_sp = self.setup_initial_stack(pid, argv, envp, &auxv)?;
+        let initial_tp = self.setup_initial_tls(pid)?;
         let (tcb_cap, fault_ep) = {
             let process = self.get_process(pid).ok_or(Error::NotFound)?;
             let fault_ep = Endpoint::from(CapPtr::concat(process.cspace().cap(), APE_SLOT));
@@ -586,6 +555,8 @@ pub fn sys_exit<'a>(mgr: &mut ApeManager<'a>, pid: usize, code: usize) -> Result
         let _ = mgr.proc_client.kill(Badge::null(), host_pid);
         mgr.host_pid_map.remove(&host_pid);
     }
+
+    let _ = mgr.release_process_intermediate_page_tables(pid);
 
     mgr.processes.remove(&pid);
     Ok(0)
@@ -691,10 +662,8 @@ pub fn sys_mmap<'a>(
         }
 
         if !mapped_pages_to_unmap.is_empty() {
-            let vspace = mgr.get_process(pid).ok_or(Error::NotFound)?.vspace();
-            let mut vspace_mgr = VSpaceManager::new(vspace, 0, 0);
             for page in mapped_pages_to_unmap {
-                vspace_mgr.unmap(page, 1)?;
+                mgr.unmap_process_pages(pid, page, 1)?;
             }
         }
 
@@ -787,10 +756,8 @@ pub fn sys_munmap<'a>(
     }
 
     if !mapped_pages_to_unmap.is_empty() {
-        let vspace = mgr.get_process(pid).ok_or(Error::NotFound)?.vspace();
-        let mut vspace_mgr = VSpaceManager::new(vspace, 0, 0);
         for page in mapped_pages_to_unmap {
-            vspace_mgr.unmap(page, 1)?;
+            mgr.unmap_process_pages(pid, page, 1)?;
         }
     }
 
@@ -824,10 +791,9 @@ pub fn sys_mprotect<'a>(
         }
     }
 
-    let vspace = mgr.get_process(pid).ok_or(Error::NotFound)?.vspace();
     for (page, frame_cap) in &pages {
-        let _ = vspace.unmap(*page, PGSIZE);
-        vspace.map(Frame::from(CapPtr::from(*frame_cap)), *page, new_perms, 1)?;
+        let _ = mgr.unmap_process_pages(pid, *page, 1);
+        mgr.map_process_frame(pid, Frame::from(CapPtr::from(*frame_cap)), *page, new_perms, 1)?;
     }
 
     if let Some(process) = mgr.get_process_mut(pid) {

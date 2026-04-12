@@ -85,6 +85,7 @@ pub struct SubProcess {
     pub mmap_base: usize,
     pub mmap_next: usize,
     pub mmap_limit: usize,
+    pub intermediate_page_tables: BTreeMap<(usize, usize), CapPtr>, // (level, vaddr-prefix) -> pagetable cap (null means externally managed)
     pub clear_child_tid: usize,
 }
 
@@ -109,6 +110,7 @@ impl SubProcess {
             mmap_base: DEFAULT_MMAP_BASE,
             mmap_next: DEFAULT_MMAP_BASE,
             mmap_limit: DEFAULT_MMAP_LIMIT,
+            intermediate_page_tables: BTreeMap::new(),
             clear_child_tid: 0,
         }
     }
@@ -145,6 +147,19 @@ impl SubProcess {
 
     pub fn cspace(&self) -> CNode {
         self.cnode_cap.clone()
+    }
+
+    pub fn has_intermediate_page_table(&self, level: usize, path_prefix: usize) -> bool {
+        self.intermediate_page_tables.contains_key(&(level, path_prefix))
+    }
+
+    pub fn record_intermediate_page_table(
+        &mut self,
+        level: usize,
+        path_prefix: usize,
+        cap: CapPtr,
+    ) {
+        self.intermediate_page_tables.insert((level, path_prefix), cap);
     }
 
     pub fn vspace(&self) -> VSpace {

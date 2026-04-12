@@ -1,12 +1,13 @@
 use super::handler::handler;
 use crate::ApeManager;
 use crate::ape::process::{MemoryMap, MemoryType};
+use alloc::vec::Vec;
 use crate::arch::constants::{INST_PAGE_FAULT, LOAD_PAGE_FAULT, STORE_PAGE_FAULT};
 use ape::sys::constants::{
     SIGILL_EXIT_CODE, SIGSEGV_EXIT_CODE, SIGTRAP_EXIT_CODE, UNKNOWN_FAULT_EXIT_CODE,
 };
-use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Frame};
+use glenda::arch::mem::{PGSIZE, SHIFTS};
+use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Frame, PageTable};
 use glenda::error::Error;
 use glenda::interface::{
     CSpaceService, FaultService, ProcessService, ResourceService, SystemService, VSpaceService,
@@ -14,9 +15,131 @@ use glenda::interface::{
 use glenda::ipc::{Badge, MsgArgs, UTCB};
 use glenda::mem::Perms;
 use glenda::utils::align::align_down;
-use glenda::utils::manager::VSpaceManager;
 
 impl<'a> ApeManager<'a> {
+    fn pt_path_prefix(vaddr: usize, level: usize) -> usize {
+        vaddr >> SHIFTS[level]
+    }
+
+    pub(crate) fn release_pagetable_slot(&mut self, slot: CapPtr) {
+        let released = match self.res_client.free(Badge::null(), slot) {
+            Ok(()) => true,
+            Err(e) if e == Error::InvalidCapability || e == Error::InvalidSlot => true,
+            Err(e) => {
+                warn!(
+                    "fault: failed to free pagetable cap {:?} via resource service: {:?}",
+                    slot, e
+                );
+                false
+            }
+        };
+
+        if released {
+            let _ = CSPACE_CAP.delete(slot);
+            self.cspace_mgr.free(slot);
+        }
+    }
+
+    pub(crate) fn release_process_intermediate_page_tables(
+        &mut self,
+        pid: usize,
+    ) -> Result<(), Error> {
+        let slots_to_release: Vec<CapPtr> = {
+            let process = self.get_process(pid).ok_or(Error::NotFound)?;
+            process
+                .intermediate_page_tables
+                .values()
+                .copied()
+                .filter(|cap| !cap.is_null())
+                .collect()
+        };
+
+        if let Some(process) = self.get_process_mut(pid) {
+            process.intermediate_page_tables.clear();
+        }
+
+        for slot in slots_to_release {
+            self.release_pagetable_slot(slot);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn ensure_intermediate_page_tables(
+        &mut self,
+        pid: usize,
+        page_addr: usize,
+    ) -> Result<(), Error> {
+        let vspace = self.get_process(pid).ok_or(Error::NotFound)?.vspace();
+
+        let mut missing_paths = Vec::new();
+        {
+            let process = self.get_process(pid).ok_or(Error::NotFound)?;
+            for level in (1..SHIFTS.len()).rev() {
+                let prefix = Self::pt_path_prefix(page_addr, level);
+                if !process.has_intermediate_page_table(level, prefix) {
+                    missing_paths.push((level, prefix));
+                }
+            }
+        }
+
+        for (level, prefix) in missing_paths {
+            let slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
+            if let Err(e) = self.res_client.alloc(Badge::null(), CapType::PageTable, 0, slot) {
+                self.cspace_mgr.free(slot);
+                return Err(e);
+            }
+
+            let pt = PageTable::from(slot);
+            match vspace.map_table(pt, page_addr, level) {
+                Ok(()) => {
+                    if let Some(process) = self.get_process_mut(pid) {
+                        process.record_intermediate_page_table(level, prefix, slot);
+                    }
+                }
+                Err(Error::AlreadyExists) => {
+                    // 页表已存在（可能由其他路径预先建立），记录路径，避免重复探测。
+                    self.release_pagetable_slot(slot);
+                    if let Some(process) = self.get_process_mut(pid) {
+                        process.record_intermediate_page_table(level, prefix, CapPtr::null());
+                    }
+                }
+                Err(e) => {
+                    self.release_pagetable_slot(slot);
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn map_process_frame(
+        &mut self,
+        pid: usize,
+        frame: Frame,
+        vaddr: usize,
+        perms: Perms,
+        pages: usize,
+    ) -> Result<(), Error> {
+        for i in 0..pages {
+            self.ensure_intermediate_page_tables(pid, vaddr + i * PGSIZE)?;
+        }
+
+        let vspace = self.get_process(pid).ok_or(Error::NotFound)?.vspace();
+        vspace.map(frame, vaddr, perms, pages)
+    }
+
+    pub(crate) fn unmap_process_pages(
+        &mut self,
+        pid: usize,
+        vaddr: usize,
+        pages: usize,
+    ) -> Result<(), Error> {
+        let vspace = self.get_process(pid).ok_or(Error::NotFound)?.vspace();
+        vspace.unmap(vaddr, pages * PGSIZE)
+    }
+
     fn fault_access_allowed(cause: usize, perms: Perms) -> bool {
         match cause {
             INST_PAGE_FAULT => perms.contains(Perms::EXECUTE),
@@ -36,17 +159,7 @@ impl<'a> ApeManager<'a> {
         let frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
         self.res_client.alloc(Badge::null(), CapType::Frame, 1, frame_slot)?;
         let frame = Frame::from(frame_slot);
-
-        let vspace = self.get_process(pid).ok_or(Error::NotFound)?.vspace();
-        let mut vspace_mgr = VSpaceManager::new_empty(vspace, 0, 0);
-        vspace_mgr.map_frame(
-            frame,
-            page_addr,
-            perms,
-            1,
-            &mut *self.res_client,
-            &mut *self.cspace_mgr,
-        )?;
+        self.map_process_frame(pid, frame, page_addr, perms, 1)?;
 
         let process = self.get_process_mut(pid).ok_or(Error::NotFound)?;
         process.add_memory_map(MemoryMap {
@@ -69,20 +182,10 @@ impl<'a> ApeManager<'a> {
         perms: Perms,
     ) -> Result<(), Error> {
         let frame = Frame::from(CapPtr::from(frame_cap));
-        let vspace = self.get_process(pid).ok_or(Error::NotFound)?.vspace();
 
-        // 先尝试移除旧映射（若不存在则忽略），随后通过 VSpaceManager 进行重映射，
-        // 以便在中间页表缺失时能够自动补齐页表层级。
-        let _ = vspace.unmap(page_addr, PGSIZE);
-        let mut vspace_mgr = VSpaceManager::new_empty(vspace, 0, 0);
-        vspace_mgr.map_frame(
-            frame,
-            page_addr,
-            perms,
-            1,
-            &mut *self.res_client,
-            &mut *self.cspace_mgr,
-        )?;
+        // 先尝试移除旧映射（若不存在则忽略），随后补齐中间页表并重映射。
+        let _ = self.unmap_process_pages(pid, page_addr, 1);
+        self.map_process_frame(pid, frame, page_addr, perms, 1)?;
 
         if let Some(process) = self.get_process_mut(pid)
             && let Some(map) = process.memory_maps.get_mut(&page_addr)
@@ -123,6 +226,7 @@ impl<'a> ApeManager<'a> {
             let _ = self.proc_client.kill(Badge::null(), host_pid);
             self.host_pid_map.remove(&host_pid);
         }
+        let _ = self.release_process_intermediate_page_tables(pid);
         self.processes.remove(&pid);
         if pid == 1 {
             panic!("Init process faulted, shutting down Ape service");
