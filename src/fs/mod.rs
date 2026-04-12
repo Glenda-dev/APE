@@ -22,11 +22,88 @@ const FS_ASYNC_DATA_OFFSET: usize = FS_ASYNC_RING_SIZE;
 const FS_ASYNC_SQ_ENTRIES: u32 = 16;
 const FS_ASYNC_CQ_ENTRIES: u32 = 16;
 
+fn is_tty_like_path(path: &str) -> bool {
+    debug!("checking tty-like path: {}", path);
+    if path.starts_with("/dev/tty") {
+        return true;
+    }
+    matches!(path, "/dev/console" | "/dev/stdin" | "/dev/stdout" | "/dev/stderr")
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct UserIovec {
     iov_base: usize,
     iov_len: usize,
+}
+
+fn with_fd_handle_mut<'a, T, F>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    fd: usize,
+    f: F,
+) -> Result<T, Error>
+where
+    F: FnOnce(&mut ApeManager<'a>, &mut FileHandle) -> Result<T, Error>,
+{
+    let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
+    let mut handle = {
+        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+        process.fds.remove(&fd).ok_or(Error::InvalidSlot)?
+    };
+
+    let result = f(mgr, &mut handle);
+
+    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+    process.fds.insert(fd, handle);
+    result
+}
+
+fn sys_rw_vector<'a, F>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    fd: usize,
+    iov_ptr: usize,
+    iov_cnt: usize,
+    rw: F,
+) -> Result<isize, Error>
+where
+    F: Fn(&mut ApeManager<'a>, usize, usize, usize, usize) -> Result<isize, Error>,
+{
+    if iov_cnt == 0 {
+        return Ok(0);
+    }
+    if iov_cnt > 1024 {
+        return Err(Error::InvalidArgs);
+    }
+
+    let mut total = 0usize;
+    for i in 0..iov_cnt {
+        let iov_addr = iov_ptr
+            .checked_add(i.checked_mul(size_of::<UserIovec>()).ok_or(Error::InvalidAddress)?)
+            .ok_or(Error::InvalidAddress)?;
+
+        let mut raw = [0u8; size_of::<UserIovec>()];
+        mgr.copy_from_user(pid, iov_addr, &mut raw)?;
+        let iov = unsafe { (raw.as_ptr() as *const UserIovec).read_unaligned() };
+
+        if iov.iov_len == 0 {
+            continue;
+        }
+
+        let n = rw(mgr, pid, fd, iov.iov_base, iov.iov_len)?;
+        if n < 0 {
+            return Ok(n);
+        }
+
+        let n = n as usize;
+        total = total.saturating_add(n);
+        if n < iov.iov_len {
+            break;
+        }
+    }
+
+    Ok(total as isize)
 }
 
 fn async_submit_and_wait(
@@ -79,13 +156,7 @@ pub fn sys_read<'a>(
     if len == 0 {
         return Ok(0);
     }
-    let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
-    let mut handle = {
-        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-        process.fds.remove(&fd).ok_or(Error::InvalidSlot)?
-    };
-
-    let result = match &mut handle.file_type {
+    with_fd_handle_mut(mgr, pid, fd, |mgr, handle| match &mut handle.file_type {
         FileType::Terminal(term) => {
             let mut utcb = unsafe { UTCB::new() };
             let tag = MsgTag::new(
@@ -185,11 +256,7 @@ pub fn sys_read<'a>(
                 Ok(total as isize)
             }
         }
-    };
-
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    process.fds.insert(fd, handle);
-    result
+    })
 }
 
 pub fn sys_write<'a>(
@@ -202,13 +269,7 @@ pub fn sys_write<'a>(
     if len == 0 {
         return Ok(0);
     }
-    let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
-    let mut handle = {
-        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-        process.fds.remove(&fd).ok_or(Error::InvalidSlot)?
-    };
-
-    let result = match &mut handle.file_type {
+    with_fd_handle_mut(mgr, pid, fd, |mgr, handle| match &mut handle.file_type {
         FileType::Terminal(term) => {
             let mut kbuf = vec![0u8; len];
             mgr.copy_from_user(pid, buf_ptr, &mut kbuf)?;
@@ -297,23 +358,28 @@ pub fn sys_write<'a>(
                 Ok(total as isize)
             }
         }
-    };
-
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    process.fds.insert(fd, handle);
-    result
+    })
 }
 
 pub fn sys_openat<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,
-    dirfd: usize,
+    _dirfd: usize,
     pathname: usize,
     flags: usize,
     mode: usize,
 ) -> Result<isize, Error> {
     let path = mgr.strncpy_from_user(pid, pathname, USER_PATH_MAX)?;
     let translated_path = mgr.resolve_path_for_process(pid, &path)?;
+
+    if is_tty_like_path(&path) || is_tty_like_path(&translated_path) {
+        let term = mgr.stdio_term.ok_or(Error::NotFound)?;
+        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+        let fd = process.next_fd;
+        process.next_fd += 1;
+        process.fds.insert(fd, FileHandle { file_type: FileType::Terminal(term) });
+        return Ok(fd as isize);
+    }
 
     let fs_badge = mgr.take_next_fs_handle_badge();
     let fs_ep_slot = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
@@ -426,13 +492,7 @@ pub fn sys_lseek<'a>(
     offset: isize,
     whence: usize,
 ) -> Result<isize, Error> {
-    let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
-    let mut handle = {
-        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-        process.fds.remove(&fd).ok_or(Error::InvalidSlot)?
-    };
-
-    let result = match &mut handle.file_type {
+    with_fd_handle_mut(mgr, pid, fd, |_mgr, handle| match &mut handle.file_type {
         FileType::Terminal(_) => Err(Error::InvalidArgs),
         FileType::Normal(normal) => {
             let base: isize = match whence as u32 {
@@ -453,11 +513,7 @@ pub fn sys_lseek<'a>(
             normal.offset = new_off as usize;
             Ok(new_off)
         }
-    };
-
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    process.fds.insert(fd, handle);
-    result
+    })
 }
 
 pub fn sys_readv<'a>(
@@ -467,38 +523,7 @@ pub fn sys_readv<'a>(
     iov_ptr: usize,
     iov_cnt: usize,
 ) -> Result<isize, Error> {
-    if iov_cnt == 0 {
-        return Ok(0);
-    }
-    if iov_cnt > 1024 {
-        return Err(Error::InvalidArgs);
-    }
-
-    let mut total = 0usize;
-    for i in 0..iov_cnt {
-        let iov_addr = iov_ptr
-            .checked_add(i.checked_mul(size_of::<UserIovec>()).ok_or(Error::InvalidAddress)?)
-            .ok_or(Error::InvalidAddress)?;
-
-        let mut raw = [0u8; size_of::<UserIovec>()];
-        mgr.copy_from_user(pid, iov_addr, &mut raw)?;
-        let iov = unsafe { (raw.as_ptr() as *const UserIovec).read_unaligned() };
-
-        if iov.iov_len == 0 {
-            continue;
-        }
-        let n = sys_read(mgr, pid, fd, iov.iov_base, iov.iov_len)?;
-        if n < 0 {
-            return Ok(n);
-        }
-        let n = n as usize;
-        total = total.saturating_add(n);
-        if n < iov.iov_len {
-            break;
-        }
-    }
-
-    Ok(total as isize)
+    sys_rw_vector(mgr, pid, fd, iov_ptr, iov_cnt, sys_read)
 }
 
 pub fn sys_writev<'a>(
@@ -508,38 +533,7 @@ pub fn sys_writev<'a>(
     iov_ptr: usize,
     iov_cnt: usize,
 ) -> Result<isize, Error> {
-    if iov_cnt == 0 {
-        return Ok(0);
-    }
-    if iov_cnt > 1024 {
-        return Err(Error::InvalidArgs);
-    }
-
-    let mut total = 0usize;
-    for i in 0..iov_cnt {
-        let iov_addr = iov_ptr
-            .checked_add(i.checked_mul(size_of::<UserIovec>()).ok_or(Error::InvalidAddress)?)
-            .ok_or(Error::InvalidAddress)?;
-
-        let mut raw = [0u8; size_of::<UserIovec>()];
-        mgr.copy_from_user(pid, iov_addr, &mut raw)?;
-        let iov = unsafe { (raw.as_ptr() as *const UserIovec).read_unaligned() };
-
-        if iov.iov_len == 0 {
-            continue;
-        }
-        let n = sys_write(mgr, pid, fd, iov.iov_base, iov.iov_len)?;
-        if n < 0 {
-            return Ok(n);
-        }
-        let n = n as usize;
-        total = total.saturating_add(n);
-        if n < iov.iov_len {
-            break;
-        }
-    }
-
-    Ok(total as isize)
+    sys_rw_vector(mgr, pid, fd, iov_ptr, iov_cnt, sys_write)
 }
 
 pub fn sys_ioctl<'a>(
@@ -549,9 +543,24 @@ pub fn sys_ioctl<'a>(
     request: usize,
     argp: usize,
 ) -> Result<isize, Error> {
-    let _ = (request, argp);
     let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
     let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-    let _ = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
-    Ok(0)
+    let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
+
+    match handle.file_type {
+        FileType::Terminal(term) => {
+            let mut utcb = unsafe { UTCB::new() };
+            utcb.clear();
+            utcb.set_msg_tag(MsgTag::new(
+                glenda::protocol::TERMINAL_PROTO,
+                glenda::protocol::terminal::TERM_IOCTL,
+                MsgFlags::NONE,
+            ));
+            utcb.set_mr(0, request);
+            utcb.set_mr(1, argp);
+            term.endpoint().call(utcb)?;
+            Ok(utcb.get_mr(0) as isize)
+        }
+        FileType::Normal(_) => Ok(0),
+    }
 }

@@ -1,0 +1,77 @@
+use crate::ApeManager;
+use crate::syscall::common::{log_syscall_result, map_error_to_errno, syscall_name};
+use crate::syscall::{system, task};
+use crate::{fs, init, mm};
+use glenda::error::Error;
+use linux_raw_sys::general::*;
+
+#[allow(non_upper_case_globals)]
+pub fn dispatch_syscall<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    sys_num: usize,
+    args: [usize; 6],
+) -> isize {
+    let sys_num_u32 = sys_num as u32;
+    let name = syscall_name(sys_num_u32);
+
+    let result = match sys_num_u32 {
+        __NR_read => fs::sys_read(mgr, pid, args[0], args[1], args[2]),
+        __NR_write => fs::sys_write(mgr, pid, args[0], args[1], args[2]),
+        __NR_readv => fs::sys_readv(mgr, pid, args[0], args[1], args[2]),
+        __NR_writev => fs::sys_writev(mgr, pid, args[0], args[1], args[2]),
+        __NR_openat => fs::sys_openat(mgr, pid, args[0], args[1], args[2], args[3]),
+        __NR_close => fs::sys_close(mgr, pid, args[0]),
+        __NR_exit => task::sys_exit(mgr, pid, args[0]),
+        __NR_exit_group => task::sys_exit_group(mgr, pid, args[0]),
+        __NR_uname => system::sys_uname(mgr, pid, args[0]),
+        __NR_getpid => task::sys_getpid(mgr, pid),
+        __NR_gettid => task::sys_gettid(mgr, pid),
+        __NR_getppid => task::sys_getppid(mgr, pid),
+        __NR_set_tid_address => task::sys_set_tid_address(mgr, pid, args[0]),
+        __NR_brk => mm::sys_brk(mgr, pid, args[0]),
+        __NR_mmap => {
+            mm::sys_mmap(
+                mgr,
+                pid,
+                args[0],
+                args[1],
+                args[2] as u32,
+                args[3] as u32,
+                args[4],
+                args[5],
+            )
+        }
+        __NR_mprotect => mm::sys_mprotect(mgr, pid, args[0], args[1], args[2] as u32),
+        __NR_munmap => mm::sys_munmap(mgr, pid, args[0], args[1]),
+        __NR_lseek => fs::sys_lseek(mgr, pid, args[0], args[1] as isize, args[2]),
+        __NR_ioctl => fs::sys_ioctl(mgr, pid, args[0], args[1], args[2]),
+        __NR_execve => init::sys_execve(mgr, pid, args[0], args[1], args[2]),
+        __NR_rt_sigaction => {
+            system::sys_rt_sigaction(mgr, pid, args[0], args[1], args[2], args[3])
+        }
+        __NR_rt_sigprocmask => {
+            system::sys_rt_sigprocmask(mgr, pid, args[0], args[1], args[2], args[3])
+        }
+        __NR_set_robust_list => system::sys_set_robust_list(mgr, pid, args[0], args[1]),
+        __NR_prlimit64 => system::sys_prlimit64(mgr, pid, args[0], args[1], args[2], args[3]),
+        __NR_clock_gettime => system::sys_clock_gettime(mgr, pid, args[0], args[1]),
+        __NR_gettimeofday => system::sys_gettimeofday(mgr, pid, args[0], args[1]),
+        __NR_nanosleep => system::sys_nanosleep(mgr, pid, args[0], args[1]),
+        __NR_getrandom => system::sys_getrandom(mgr, pid, args[0], args[1], args[2]),
+        __NR_getuid => system::sys_getuid(mgr, pid),
+        __NR_geteuid => system::sys_geteuid(mgr, pid),
+        __NR_getgid => system::sys_getgid(mgr, pid),
+        __NR_getegid => system::sys_getegid(mgr, pid),
+        __NR_clone => task::sys_fork(mgr, pid),
+        _ => Err(Error::NotImplemented), // map ENOSYS later
+    };
+
+    let ret = match result {
+        Ok(ret) => ret,
+        Err(e) => map_error_to_errno(e),
+    };
+
+    log_syscall_result(pid, name, sys_num_u32, args, ret);
+    ret
+}

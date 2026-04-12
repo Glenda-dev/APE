@@ -1,8 +1,8 @@
-use super::handler::handler;
 use crate::ApeManager;
 use crate::ape::process::{MemoryMap, MemoryType};
-use alloc::vec::Vec;
 use crate::arch::constants::{INST_PAGE_FAULT, LOAD_PAGE_FAULT, STORE_PAGE_FAULT};
+use crate::syscall::dispatch_syscall;
+use alloc::vec::Vec;
 use ape::sys::constants::{
     SIGILL_EXIT_CODE, SIGSEGV_EXIT_CODE, SIGTRAP_EXIT_CODE, UNKNOWN_FAULT_EXIT_CODE,
 };
@@ -10,7 +10,7 @@ use glenda::arch::mem::{PGSIZE, SHIFTS};
 use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Frame, PageTable};
 use glenda::error::Error;
 use glenda::interface::{
-    CSpaceService, FaultService, ProcessService, ResourceService, SystemService, VSpaceService,
+    CSpaceService, FaultService, ResourceService, SystemService, VSpaceService,
 };
 use glenda::ipc::{Badge, MsgArgs, UTCB};
 use glenda::mem::Perms;
@@ -194,45 +194,6 @@ impl<'a> ApeManager<'a> {
         }
         Ok(())
     }
-
-    fn terminate_faulting_process(&mut self, pid: usize, code: usize) -> Result<(), Error> {
-        // fault 处理通常处于对目标进程的 CALL 上下文。
-        // 先释放 reply 与子进程 CNode 引用，再发起 kill，避免 Warren 回收失败。
-        if let Err(e) = CSPACE_CAP.delete(self.ipc.reply.cap())
-            && e != Error::InvalidCapability
-            && e != Error::InvalidSlot
-        {
-            warn!("fault: failed to clear ape reply slot {:?}: {:?}", self.ipc.reply.cap(), e);
-        }
-
-        if let Some(slot) = self.get_process(pid).map(|p| p.cnode_cap.cap()) {
-            let _ = CSPACE_CAP.revoke(slot);
-            if let Err(e) = CSPACE_CAP.delete(slot)
-                && e != Error::InvalidCapability
-                && e != Error::InvalidSlot
-            {
-                warn!("fault: failed to delete child cnode slot {:?}: {:?}", slot, e);
-            } else {
-                self.cspace_mgr.free(slot);
-            }
-        }
-
-        let host_pid = self
-            .host_pid_map
-            .iter()
-            .find_map(|(host_pid, local_pid)| (*local_pid == pid).then_some(*host_pid));
-
-        if let Some(host_pid) = host_pid {
-            let _ = self.proc_client.kill(Badge::null(), host_pid);
-            self.host_pid_map.remove(&host_pid);
-        }
-        let _ = self.release_process_intermediate_page_tables(pid);
-        self.processes.remove(&pid);
-        if pid == 1 {
-            panic!("Init process faulted, shutting down Ape service");
-        }
-        Ok(())
-    }
 }
 
 impl<'a> FaultService for ApeManager<'a> {
@@ -299,7 +260,7 @@ impl<'a> FaultService for ApeManager<'a> {
                     "page_fault: permission denied pid={} addr={:#x} pc={:#x} cause={:#x} perms={:?}",
                     pid, addr, pc, cause, map.flags
                 );
-                return self.terminate_faulting_process(pid, SIGSEGV_EXIT_CODE);
+                return self.terminate_process(pid, SIGSEGV_EXIT_CODE, true);
             }
 
             // 元数据存在但仍触发 fault：尝试按记录重装该页映射（例如页表项被替换/丢失）。
@@ -337,7 +298,7 @@ impl<'a> FaultService for ApeManager<'a> {
             );
             let perms = Perms::READ | Perms::WRITE;
             if !Self::fault_access_allowed(cause, perms) {
-                return self.terminate_faulting_process(pid, SIGSEGV_EXIT_CODE);
+                return self.terminate_process(pid, SIGSEGV_EXIT_CODE, true);
             }
 
             let pages_to_map = (current_stack_low - page_addr) / PGSIZE;
@@ -362,7 +323,7 @@ impl<'a> FaultService for ApeManager<'a> {
             );
             let perms = Perms::READ | Perms::WRITE;
             if !Self::fault_access_allowed(cause, perms) {
-                return self.terminate_faulting_process(pid, SIGSEGV_EXIT_CODE);
+                return self.terminate_process(pid, SIGSEGV_EXIT_CODE, true);
             }
             self.map_fault_page(pid, page_addr, perms, MemoryType::Heap)?;
             return Ok(());
@@ -382,7 +343,7 @@ impl<'a> FaultService for ApeManager<'a> {
                 cause
             );
             if !Self::fault_access_allowed(cause, map.flags) {
-                return self.terminate_faulting_process(pid, SIGSEGV_EXIT_CODE);
+                return self.terminate_process(pid, SIGSEGV_EXIT_CODE, true);
             }
             if let Some(process) = self.get_process_mut(pid) {
                 process.remove_lazy_memory_map(page_addr);
@@ -395,7 +356,7 @@ impl<'a> FaultService for ApeManager<'a> {
             "page_fault: unmanaged region pid={} addr={:#x} pc={:#x} cause={:#x}",
             pid, addr, pc, cause
         );
-        self.terminate_faulting_process(pid, SIGSEGV_EXIT_CODE)
+        self.terminate_process(pid, SIGSEGV_EXIT_CODE, true)
     }
 
     fn unknown_fault(
@@ -407,27 +368,27 @@ impl<'a> FaultService for ApeManager<'a> {
     ) -> Result<(), Error> {
         let pid = badge.bits();
         error!("unknown_fault: pid={} cause={:#x} value={:#x} pc={:#x}", pid, cause, value, pc);
-        self.terminate_faulting_process(pid, UNKNOWN_FAULT_EXIT_CODE)
+        self.terminate_process(pid, UNKNOWN_FAULT_EXIT_CODE, true)
     }
     fn illegal_instruction(&mut self, badge: Badge, inst: usize, pc: usize) -> Result<(), Error> {
         let pid = badge.bits();
         error!("illegal_instruction: pid={} inst={:#x} pc={:#x}", pid, inst, pc);
-        self.terminate_faulting_process(pid, SIGILL_EXIT_CODE)
+        self.terminate_process(pid, SIGILL_EXIT_CODE, true)
     }
     fn breakpoint(&mut self, badge: Badge, pc: usize) -> Result<(), Error> {
         let pid = badge.bits();
         warn!("breakpoint: pid={} pc={:#x}", pid, pc);
-        self.terminate_faulting_process(pid, SIGTRAP_EXIT_CODE)
+        self.terminate_process(pid, SIGTRAP_EXIT_CODE, true)
     }
     fn access_fault(&mut self, badge: Badge, addr: usize, pc: usize) -> Result<(), Error> {
         let pid = badge.bits();
         error!("access_fault: pid={} addr={:#x} pc={:#x}", pid, addr, pc);
-        self.terminate_faulting_process(pid, SIGSEGV_EXIT_CODE)
+        self.terminate_process(pid, SIGSEGV_EXIT_CODE, true)
     }
     fn access_misaligned(&mut self, badge: Badge, addr: usize, pc: usize) -> Result<(), Error> {
         let pid = badge.bits();
         error!("access_misaligned: pid={} addr={:#x} pc={:#x}", pid, addr, pc);
-        self.terminate_faulting_process(pid, SIGSEGV_EXIT_CODE)
+        self.terminate_process(pid, SIGSEGV_EXIT_CODE, true)
     }
     fn virt_exit(
         &mut self,
@@ -442,13 +403,13 @@ impl<'a> FaultService for ApeManager<'a> {
             "virt_exit: pid={} reason={:#x} detail0={:#x} detail1={:#x} detail2={:#x}",
             pid, reason, detail0, detail1, detail2
         );
-        self.terminate_faulting_process(pid, UNKNOWN_FAULT_EXIT_CODE)
+        self.terminate_process(pid, UNKNOWN_FAULT_EXIT_CODE, true)
     }
     fn handle_syscall(&mut self, pid: usize, args: MsgArgs) -> Result<(), Error> {
         let sys_num = args[0];
         let sys_args = [args[1], args[2], args[3], args[4], args[5], args[6]];
 
-        let ret = handler(&mut *self, pid, sys_num, sys_args);
+        let ret = dispatch_syscall(&mut *self, pid, sys_num, sys_args);
         let utcb = unsafe { UTCB::new() };
         utcb.set_mr(0, ret as usize);
         Ok(())

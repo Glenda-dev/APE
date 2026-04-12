@@ -8,18 +8,17 @@ use ape::cap::APE_SLOT;
 use core::cmp::{max, min};
 use core::mem::size_of;
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Endpoint, Frame};
+use glenda::cap::{CapPtr, CapType, Endpoint, Frame};
 use glenda::error::Error;
 use glenda::interface::{
-    CSpaceService, FileHandleService, FileSystemService, ProcessService, ResourceService,
-    ThreadService, VSpaceService,
+    CSpaceService, FileHandleService, FileSystemService, ResourceService, ThreadService,
+    VSpaceService,
 };
 use glenda::ipc::Badge;
 use glenda::mem::get_utcb_va;
 use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
 use glenda::protocol::fs::OpenFlags;
 use glenda::utils::align::{align_down, align_up};
-use linux_raw_sys::general::*;
 
 const DEFAULT_ARG0: &str = "init";
 const INITIAL_STACK_ALIGN: usize = 16;
@@ -41,89 +40,16 @@ struct LoadedElfInfo {
     phdr_vaddr: Option<usize>,
 }
 
-fn prot_to_perms(prot: u32) -> Perms {
-    let mut perms = Perms::empty();
-    if prot & PROT_READ != 0 {
-        perms |= Perms::READ;
-    }
-    if prot & PROT_WRITE != 0 {
-        perms |= Perms::WRITE;
-    }
-    if prot & PROT_EXEC != 0 {
-        perms |= Perms::EXECUTE;
-    }
-    perms
-}
-
-fn has_overlap(start: usize, end: usize, map_start: usize, map_size: usize) -> bool {
-    let map_end = map_start.saturating_add(map_size);
-    start < map_end && map_start < end
-}
-
-fn range_is_free(process: &crate::ape::process::SubProcess, start: usize, end: usize) -> bool {
-    if end > process.mmap_limit || start < process.mmap_base || start >= end {
-        return false;
-    }
-
-    if has_overlap(
-        start,
-        end,
-        process.heap_start,
-        process.heap_brk.saturating_sub(process.heap_start),
-    ) {
-        return false;
-    }
-
-    let stack_low = process.stack_bottom.saturating_sub(process.max_stack_size);
-    if has_overlap(start, end, stack_low, process.max_stack_size) {
-        return false;
-    }
-
-    for map in process.memory_maps.values() {
-        if has_overlap(start, end, map.vaddr, map.size) {
-            return false;
-        }
-    }
-
-    for map in process.lazy_memory_maps.values() {
-        if has_overlap(start, end, map.vaddr, map.size) {
-            return false;
-        }
-    }
-
-    true
-}
-
 impl<'a> ApeManager<'a> {
     fn read_exec_image_from_fs(&mut self, pid: usize, path: &str) -> Result<Vec<u8>, Error> {
-        log!("execve: read image start pid={} path={}", pid, path);
         let mut translated_path = self.resolve_path_for_process(pid, path)?;
-        log!("execve: translated path={}", translated_path);
         let mut stat = self.fs_client.stat_path(Badge::null(), &translated_path)?;
-        log!("execve: stat ok path={} mode={:#o} size={}", translated_path, stat.mode, stat.size);
-        const S_IFMT: u32 = 0o170000;
-        const S_IFLNK: u32 = 0o120000;
-        if (stat.mode & S_IFMT) == S_IFLNK {
-            if translated_path.ends_with("/sbin/init") {
-                let fallback = translated_path.replace("/sbin/init", "/bin/busybox");
-                translated_path = fallback;
-                stat = self.fs_client.stat_path(Badge::null(), &translated_path)?;
-                log!(
-                    "execve: symlink fallback path={} mode={:#o} size={}",
-                    translated_path,
-                    stat.mode,
-                    stat.size
-                );
-            }
-        }
         let size = stat.size as usize;
         if size == 0 {
             error!("read_exec_image_from_fs: exec image has zero size");
             return Err(Error::InvalidArgs);
         }
-        log!("execve: opening path={}", translated_path);
         let fd = self.fs_client.open(Badge::null(), &translated_path, OpenFlags::O_RDONLY, 0)?;
-        log!("execve: open ok fd={}", fd);
 
         let mut elf_data = alloc::vec![0u8; size];
         let mut offset = 0;
@@ -136,11 +62,8 @@ impl<'a> ApeManager<'a> {
             }
             offset += read_len;
         }
-        log!("execve: read complete bytes={}", offset);
         self.fs_client.close(Badge::null())?;
-        log!("execve: close ok fd={}", fd);
         let _ = fd;
-        log!("execve: image load done path={} size={}", translated_path, size);
         Ok(elf_data)
     }
 
@@ -410,7 +333,7 @@ impl<'a> ApeManager<'a> {
         })
     }
 
-    pub(crate) fn execve_path(
+    pub(crate) fn do_execve_path(
         &mut self,
         pid: usize,
         path: &str,
@@ -495,6 +418,31 @@ impl<'a> ApeManager<'a> {
         tcb_cap.set_fault_handler(fault_ep, false)?;
         Ok(())
     }
+
+    pub(crate) fn execve_path(
+        &mut self,
+        pid: usize,
+        path: &str,
+        argv: &[String],
+        envp: &[String],
+    ) -> Result<(), Error> {
+        self.do_execve_path(pid, path, argv, envp)
+    }
+}
+
+pub(crate) fn do_execve<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    filename_ptr: usize,
+    argv_ptr: usize,
+    envp_ptr: usize,
+) -> Result<(), Error> {
+    let exec_input: ExecveUserInput =
+        mgr.parse_execve_user_input(pid, filename_ptr, argv_ptr, envp_ptr)?;
+    let translated_filename = mgr.resolve_path_for_process(pid, &exec_input.filename)?;
+
+    // 保持行为与 Linux 接近：允许 filename 与 argv[0] 不同。
+    mgr.do_execve_path(pid, &translated_filename, &exec_input.argv, &exec_input.envp)
 }
 
 pub fn sys_execve<'a>(
@@ -504,319 +452,6 @@ pub fn sys_execve<'a>(
     argv_ptr: usize,
     envp_ptr: usize,
 ) -> Result<isize, Error> {
-    let exec_input: ExecveUserInput =
-        mgr.parse_execve_user_input(pid, filename_ptr, argv_ptr, envp_ptr)?;
-    let translated_filename = mgr.resolve_path_for_process(pid, &exec_input.filename)?;
-
-    // 保持行为与 Linux 接近：允许 filename 与 argv[0] 不同。
-    mgr.execve_path(pid, &translated_filename, &exec_input.argv, &exec_input.envp)?;
-
+    do_execve(mgr, pid, filename_ptr, argv_ptr, envp_ptr)?;
     Ok(0)
-}
-
-pub fn sys_getpid<'a>(mgr: &mut ApeManager<'a>, pid: usize) -> Result<isize, Error> {
-    Ok(pid as isize)
-}
-
-pub fn sys_gettid<'a>(mgr: &mut ApeManager<'a>, pid: usize) -> Result<isize, Error> {
-    Ok(pid as isize)
-}
-
-pub fn sys_set_tid_address<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    tidptr: usize,
-) -> Result<isize, Error> {
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    process.clear_child_tid = tidptr;
-    Ok(pid as isize)
-}
-
-pub fn sys_exit<'a>(mgr: &mut ApeManager<'a>, pid: usize, code: usize) -> Result<isize, Error> {
-    mgr.terminate_process(pid, code, false)?;
-    Ok(0)
-}
-
-pub fn sys_exit_group<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    code: usize,
-) -> Result<isize, Error> {
-    sys_exit(mgr, pid, code)
-}
-
-pub fn sys_brk<'a>(mgr: &mut ApeManager<'a>, pid: usize, addr: usize) -> Result<isize, Error> {
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-
-    if addr == 0 {
-        return Ok(process.heap_brk as isize);
-    }
-
-    if addr < process.heap_start || addr > process.heap_limit {
-        return Ok(process.heap_brk as isize);
-    }
-
-    process.heap_brk = addr;
-    Ok(process.heap_brk as isize)
-}
-
-pub fn sys_mmap<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    addr: usize,
-    len: usize,
-    prot: u32,
-    flags: u32,
-    fd: usize,
-    offset: usize,
-) -> Result<isize, Error> {
-    if len == 0 {
-        return Err(Error::InvalidArgs);
-    }
-
-    if flags & MAP_PRIVATE == 0 || flags & MAP_ANONYMOUS == 0 {
-        return Err(Error::InvalidArgs);
-    }
-
-    let len_aligned = align_up(len, PGSIZE);
-    let perms = prot_to_perms(prot);
-
-    if flags & MAP_FIXED != 0 {
-        if addr % PGSIZE != 0 {
-            return Err(Error::InvalidArgs);
-        }
-        let start = addr;
-        let end = match start.checked_add(len_aligned) {
-            Some(v) => v,
-            None => return Err(Error::OutOfMemory),
-        };
-
-        let mut mapped_pages_to_unmap = Vec::new();
-        {
-            let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-
-            if end > process.mmap_limit {
-                return Err(Error::OutOfMemory);
-            }
-
-            // 保守处理：不允许覆盖 brk 堆区和预留栈区。
-            if has_overlap(
-                start,
-                end,
-                process.heap_start,
-                process.heap_brk.saturating_sub(process.heap_start),
-            ) {
-                return Err(Error::InvalidArgs);
-            }
-            let stack_low = process.stack_bottom.saturating_sub(process.max_stack_size);
-            if has_overlap(start, end, stack_low, process.max_stack_size) {
-                return Err(Error::InvalidArgs);
-            }
-
-            // 允许替换匿名映射，但不允许覆盖 Image/Heap/Stack 等关键映射。
-            for map in process.memory_maps.values() {
-                if has_overlap(start, end, map.vaddr, map.size)
-                    && map.mem_type != MemoryType::Anonymous
-                {
-                    return Err(Error::InvalidArgs);
-                }
-            }
-
-            for page in (start..end).step_by(PGSIZE) {
-                process.remove_lazy_memory_map(page);
-                if let Some(map) = process.memory_maps.get(&page)
-                    && map.mem_type == MemoryType::Anonymous
-                    && map.size == PGSIZE
-                {
-                    mapped_pages_to_unmap.push(page);
-                }
-            }
-            for page in &mapped_pages_to_unmap {
-                process.memory_maps.remove(page);
-            }
-        }
-
-        if !mapped_pages_to_unmap.is_empty() {
-            for page in mapped_pages_to_unmap {
-                mgr.unmap_process_pages(pid, page, 1)?;
-            }
-        }
-
-        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-        for page in (start..end).step_by(PGSIZE) {
-            process.add_lazy_memory_map(MemoryMap {
-                vaddr: page,
-                paddr: 0,
-                size: PGSIZE,
-                flags: perms,
-                mem_type: MemoryType::Anonymous,
-                cow: false,
-                frame_cap: 0,
-            });
-        }
-        process.mmap_next = process.mmap_next.max(end);
-        return Ok(start as isize);
-    }
-
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-
-    let mut candidate = if addr != 0 { align_down(addr, PGSIZE) } else { process.mmap_next };
-    if candidate < process.mmap_base {
-        candidate = process.mmap_base;
-    }
-    let mut chosen = None;
-
-    while let Some(end) = candidate.checked_add(len_aligned) {
-        if end > process.mmap_limit {
-            break;
-        }
-        if range_is_free(process, candidate, end) {
-            chosen = Some(candidate);
-            break;
-        }
-        candidate = candidate.saturating_add(PGSIZE);
-    }
-
-    let start = match chosen {
-        Some(v) => v,
-        None => return Err(Error::OutOfMemory),
-    };
-    let end = start + len_aligned;
-
-    for page in (start..end).step_by(PGSIZE) {
-        process.add_lazy_memory_map(MemoryMap {
-            vaddr: page,
-            paddr: 0,
-            size: PGSIZE,
-            flags: perms,
-            mem_type: MemoryType::Anonymous,
-            cow: false,
-            frame_cap: 0,
-        });
-    }
-
-    process.mmap_next = process.mmap_next.max(end);
-    Ok(start as isize)
-}
-
-pub fn sys_munmap<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    addr: usize,
-    len: usize,
-) -> Result<isize, Error> {
-    if len == 0 || addr % PGSIZE != 0 {
-        return Err(Error::InvalidArgs);
-    }
-
-    let len_aligned = align_up(len, PGSIZE);
-    let mut mapped_pages_to_unmap = Vec::new();
-
-    {
-        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-        for page in (addr..addr + len_aligned).step_by(PGSIZE) {
-            process.remove_lazy_memory_map(page);
-
-            if let Some(map) = process.memory_maps.get(&page)
-                && map.mem_type == MemoryType::Anonymous
-                && map.size == PGSIZE
-            {
-                mapped_pages_to_unmap.push(page);
-            }
-        }
-
-        for page in &mapped_pages_to_unmap {
-            process.memory_maps.remove(page);
-        }
-    }
-
-    if !mapped_pages_to_unmap.is_empty() {
-        for page in mapped_pages_to_unmap {
-            mgr.unmap_process_pages(pid, page, 1)?;
-        }
-    }
-
-    Ok(0)
-}
-
-pub fn sys_mprotect<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    addr: usize,
-    len: usize,
-    prot: u32,
-) -> Result<isize, Error> {
-    if len == 0 {
-        return Ok(0);
-    }
-
-    let start = align_down(addr, PGSIZE);
-    let end = align_up(addr.checked_add(len).ok_or(Error::OutOfMemory)?, PGSIZE);
-    let new_perms = prot_to_perms(prot);
-
-    let mut pages = Vec::new();
-    {
-        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-        for page in (start..end).step_by(PGSIZE) {
-            let map = process.lookup_memory_map(page).cloned().ok_or(Error::InvalidAddress)?;
-            if page < map.vaddr || page >= map.vaddr.saturating_add(map.size) {
-                return Err(Error::InvalidAddress);
-            }
-            pages.push((page, map.frame_cap));
-        }
-    }
-
-    for (page, frame_cap) in &pages {
-        let _ = mgr.unmap_process_pages(pid, *page, 1);
-        mgr.map_process_frame(pid, Frame::from(CapPtr::from(*frame_cap)), *page, new_perms, 1)?;
-    }
-
-    if let Some(process) = mgr.get_process_mut(pid) {
-        for (page, _) in pages {
-            if let Some(map) = process.memory_maps.get_mut(&page) {
-                map.flags = new_perms;
-            }
-            if let Some(map) = process.lazy_memory_maps.get_mut(&page) {
-                map.flags = new_perms;
-            }
-        }
-    }
-
-    Ok(0)
-}
-
-pub fn sys_getppid<'a>(mgr: &mut ApeManager<'a>, pid: usize) -> Result<isize, Error> {
-    let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-    Ok(process.parent_pid as isize)
-}
-
-pub fn sys_fork<'a>(mgr: &mut ApeManager<'a>, pid: usize) -> Result<isize, Error> {
-    // 1. 获取父进程信息
-    let name = alloc::format!("fork-{}", pid);
-
-    // 2. 创建新进程
-    let child_pid = mgr.proc_client.create(Badge::null(), &name)?;
-
-    // 3. 获取并注册子进程 CNode
-    let cnode_slot = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
-    let cnode = mgr.proc_client.get_cnode(Badge::null(), child_pid, cnode_slot)?;
-    mgr.register_process(pid, child_pid, cnode);
-
-    // 4. 实现 CoW Fork 逻辑
-    let parent_maps: Vec<MemoryMap> = {
-        let parent = mgr.get_process(pid).ok_or(Error::NotFound)?;
-        parent.memory_maps.values().cloned().collect()
-    };
-
-    for map in parent_maps {
-        // 标记为 CoW
-        let mut child_map = map.clone();
-        child_map.cow = true;
-
-        if let Some(process) = mgr.get_process_mut(child_pid) {
-            process.add_memory_map(child_map);
-        }
-    }
-
-    Ok(child_pid as isize)
 }

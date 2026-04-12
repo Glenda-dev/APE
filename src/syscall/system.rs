@@ -6,6 +6,11 @@ use glenda::error::Error;
 
 const UTS_STR_LEN: usize = 65;
 
+#[inline]
+fn ok_zero() -> Result<isize, Error> {
+    Ok(0)
+}
+
 #[repr(C)]
 struct UtsName {
     sysname: [u8; UTS_STR_LEN],
@@ -209,17 +214,17 @@ pub fn sys_getrandom<'a>(
 }
 
 pub fn sys_getuid<'a>(_mgr: &mut ApeManager<'a>, _pid: usize) -> Result<isize, Error> {
-    Ok(0)
+    ok_zero()
 }
 
 pub fn sys_geteuid<'a>(_mgr: &mut ApeManager<'a>, _pid: usize) -> Result<isize, Error> {
-    Ok(0)
+    ok_zero()
 }
 
 pub fn sys_getgid<'a>(_mgr: &mut ApeManager<'a>, _pid: usize) -> Result<isize, Error> {
-    Ok(0)
+    ok_zero()
 }
 
 pub fn sys_getegid<'a>(_mgr: &mut ApeManager<'a>, _pid: usize) -> Result<isize, Error> {
-    Ok(0)
+    ok_zero()
 }

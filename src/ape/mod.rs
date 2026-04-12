@@ -1,11 +1,9 @@
 pub mod bootstrap;
 pub mod fault;
-pub mod handler;
 pub mod path;
 pub mod policy;
 pub mod process;
 pub mod server;
-pub mod syscall;
 pub mod user;
 
 use crate::config::ApeConfig;
@@ -60,9 +58,7 @@ impl<'a> ApeManager<'a> {
         for vaddr in [TRAMPOLINE_VA, get_utcb_va(0), get_trapframe_va(0)] {
             for level in (1..SHIFTS.len()).rev() {
                 let prefix = vaddr >> SHIFTS[level];
-                proc.intermediate_page_tables
-                    .entry((level, prefix))
-                    .or_insert(CapPtr::null());
+                proc.intermediate_page_tables.entry((level, prefix)).or_insert(CapPtr::null());
             }
         }
     }

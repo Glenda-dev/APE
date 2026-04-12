@@ -63,14 +63,19 @@ impl<'a> ApeManager<'a> {
 
     fn load_init(&mut self) -> Result<(), Error> {
         // 1. Create process
+        log!("load_init: creating init process via Warren");
         let host_pid = self.proc_client.create(Badge::null(), DEFAULT_INIT_PROCESS_NAME)?;
+        log!("load_init: created host init pid={}", host_pid);
 
         // 2. Fetch CNode
         let cnode_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
+        log!("load_init: requesting child cnode at slot {:?}", cnode_slot);
         let cnode = self.proc_client.get_cnode(Badge::null(), host_pid, cnode_slot)?;
+        log!("load_init: received child cnode cap={:?}", cnode.cap());
 
         // 3. Register
         let pid = self.register_process(0, host_pid, cnode);
+        log!("load_init: registered local init pid={}", pid);
 
         // 4. 为 init 进程初始化 stdio fds
         if let Some(term) = self.stdio_term {
@@ -82,9 +87,12 @@ impl<'a> ApeManager<'a> {
         }
 
         let init_path = self.config.init_path.clone();
+        log!("load_init: execve init path={}", init_path);
         self.execve_path(pid, &init_path, &[], &[])?;
+        log!("load_init: execve completed");
         let tcb_cap = self.get_process(pid).ok_or(Error::NotFound)?.tcb();
         tcb_cap.resume()?;
+        log!("load_init: resumed init tcb");
         Ok(())
     }
 }
