@@ -138,7 +138,7 @@ impl<P: SharedPagePoolPolicy> SharedPagePool<P> {
     }
 }
 
-struct UserAccessSession<'m, 'a, P: SharedPagePoolPolicy> {
+pub(crate) struct UserAccessSession<'m, 'a, P: SharedPagePoolPolicy> {
     mgr: &'m mut ApeManager<'a>,
     pid: usize,
     pool: SharedPagePool<P>,
@@ -170,7 +170,7 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
         Ok(map)
     }
 
-    fn copy_from_user(&mut self, user_src: usize, dst: &mut [u8]) -> Result<(), Error> {
+    pub(crate) fn copy_from_user(&mut self, user_src: usize, dst: &mut [u8]) -> Result<(), Error> {
         if dst.is_empty() {
             return Ok(());
         }
@@ -201,7 +201,7 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
         Ok(())
     }
 
-    fn copy_to_user(&mut self, user_dst: usize, src: &[u8]) -> Result<(), Error> {
+    pub(crate) fn copy_to_user(&mut self, user_dst: usize, src: &[u8]) -> Result<(), Error> {
         if src.is_empty() {
             return Ok(());
         }
@@ -233,7 +233,11 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
         Ok(())
     }
 
-    fn strncpy_from_user(&mut self, user_src: usize, max_len: usize) -> Result<String, Error> {
+    pub(crate) fn strncpy_from_user(
+        &mut self,
+        user_src: usize,
+        max_len: usize,
+    ) -> Result<String, Error> {
         if user_src == 0 {
             return Err(Error::InvalidAddress);
         }
@@ -309,7 +313,7 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
         Err(Error::MessageTooLong)
     }
 
-    fn parse_execve_user_input(
+    pub(crate) fn parse_execve_user_input(
         &mut self,
         filename_ptr: usize,
         argv_ptr: usize,
@@ -325,7 +329,7 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
 }
 
 impl<'a> ApeManager<'a> {
-    fn with_user_session<T, F>(&mut self, pid: usize, f: F) -> Result<T, Error>
+    pub(crate) fn with_user_session<T, F>(&mut self, pid: usize, f: F) -> Result<T, Error>
     where
         F: FnOnce(&mut UserAccessSession<'_, 'a, LruPolicy>) -> Result<T, Error>,
     {

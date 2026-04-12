@@ -15,7 +15,6 @@ use glenda::interface::{
     ThreadService, VSpaceService,
 };
 use glenda::ipc::Badge;
-use glenda::log;
 use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
 use glenda::mem::{TRAMPOLINE_VA, get_trapframe_va, get_utcb_va};
 use glenda::protocol::fs::OpenFlags;
@@ -25,7 +24,7 @@ use linux_raw_sys::general::*;
 
 const DEFAULT_ARG0: &str = "init";
 const INITIAL_STACK_ALIGN: usize = 16;
-const PIE_LOAD_BIAS: usize = 0x1_0000;
+const PIE_LOAD_BIAS: usize = 0;
 const INTERP_LOAD_GAP: usize = 0x10_0000;
 const INITIAL_TLS_PAGES: usize = 4;
 const INITIAL_TLS_GAP_PAGES: usize = 8;
@@ -353,53 +352,62 @@ impl<'a> ApeManager<'a> {
             let end_page = align_up(seg_end, PGSIZE);
             let num_pages = (end_page - start_page) / PGSIZE;
 
-            let dest_cap = self.cspace_mgr.alloc(&mut *self.res_client)?;
-            self.res_client.alloc(Badge::null(), CapType::Frame, num_pages, dest_cap)?;
-            let frame = Frame::from(dest_cap);
+            for i in 0..num_pages {
+                let page_vaddr = start_page + i * PGSIZE;
 
-            child_vspace_mgr.map_frame(
-                frame,
-                start_page,
-                perms,
-                num_pages,
-                &mut *self.res_client,
-                &mut *self.cspace_mgr,
-            )?;
+                let frame_cap = self.cspace_mgr.alloc(&mut *self.res_client)?;
+                self.res_client.alloc(Badge::null(), CapType::Frame, 1, frame_cap)?;
+                let frame = Frame::from(frame_cap);
 
-            if let Some(process) = self.get_process_mut(pid) {
-                process.add_memory_map(MemoryMap {
-                    vaddr: start_page,
-                    paddr: 0,
-                    size: num_pages * PGSIZE,
-                    flags: perms,
-                    mem_type: MemoryType::Image,
-                    cow: false,
-                    frame_cap: dest_cap.bits(),
-                });
+                child_vspace_mgr.map_frame(
+                    frame,
+                    page_vaddr,
+                    perms,
+                    1,
+                    &mut *self.res_client,
+                    &mut *self.cspace_mgr,
+                )?;
+
+                if let Some(process) = self.get_process_mut(pid) {
+                    process.add_memory_map(MemoryMap {
+                        vaddr: page_vaddr,
+                        paddr: 0,
+                        size: PGSIZE,
+                        flags: perms,
+                        mem_type: MemoryType::Image,
+                        cow: false,
+                        frame_cap: frame_cap.bits(),
+                    });
+                }
+
+                let scratch_vaddr = self.vspace_mgr.map_scratch(
+                    frame,
+                    Perms::READ | Perms::WRITE,
+                    1,
+                    &mut *self.res_client,
+                    &mut *self.cspace_mgr,
+                )?;
+
+                let page_slice =
+                    unsafe { core::slice::from_raw_parts_mut(scratch_vaddr as *mut u8, PGSIZE) };
+                page_slice.fill(0);
+
+                let file_seg_end = seg_start.saturating_add(file_size);
+                let copy_start = max(page_vaddr, seg_start);
+                let copy_end = min(page_vaddr + PGSIZE, file_seg_end);
+                if copy_end > copy_start && offset < elf_data.len() {
+                    let src_off = offset + (copy_start - seg_start);
+                    let dst_off = copy_start - page_vaddr;
+                    let copy_len = copy_end - copy_start;
+                    if src_off < elf_data.len() {
+                        let actual = min(copy_len, elf_data.len() - src_off);
+                        page_slice[dst_off..dst_off + actual]
+                            .copy_from_slice(&elf_data[src_off..src_off + actual]);
+                    }
+                }
+
+                self.vspace_mgr.unmap(scratch_vaddr, 1)?;
             }
-
-            let scratch_vaddr = self.vspace_mgr.map_scratch(
-                frame,
-                Perms::READ | Perms::WRITE,
-                num_pages,
-                &mut *self.res_client,
-                &mut *self.cspace_mgr,
-            )?;
-
-            let dest_slice = unsafe {
-                core::slice::from_raw_parts_mut(scratch_vaddr as *mut u8, num_pages * PGSIZE)
-            };
-            dest_slice.fill(0);
-
-            let padding = seg_start - start_page;
-            if padding < dest_slice.len() && offset < elf_data.len() {
-                let max_file_copy = min(file_size, elf_data.len() - offset);
-                let actual_copy = min(max_file_copy, dest_slice.len() - padding);
-                dest_slice[padding..padding + actual_copy]
-                    .copy_from_slice(&elf_data[offset..offset + actual_copy]);
-            }
-
-            self.vspace_mgr.unmap(scratch_vaddr, num_pages)?;
         }
 
         let fallback_phdr = load_bias + elf.ph_offset();
@@ -503,12 +511,6 @@ impl<'a> ApeManager<'a> {
             let fault_ep = Endpoint::from(CapPtr::concat(process.cspace().cap(), APE_SLOT));
             (process.tcb(), fault_ep)
         };
-        log!(
-            "Setting entry point {:#x}, initial SP {:#x}, initial TP {:#x}",
-            entry_point,
-            initial_sp,
-            initial_tp
-        );
         tcb_cap.set_entrypoint(entry_point, initial_sp, initial_tp)?;
         tcb_cap.set_fault_handler(fault_ep, false)?;
         Ok(())
@@ -526,15 +528,6 @@ pub fn sys_execve<'a>(
         mgr.parse_execve_user_input(pid, filename_ptr, argv_ptr, envp_ptr)?;
     let translated_filename = mgr.resolve_path_for_process(pid, &exec_input.filename)?;
 
-    log!(
-        "execve: pid {} filename={} translated={} argc={} envc={}",
-        pid,
-        exec_input.filename,
-        translated_filename,
-        exec_input.argv.len(),
-        exec_input.envp.len()
-    );
-
     // 保持行为与 Linux 接近：允许 filename 与 argv[0] 不同。
     mgr.execve_path(pid, &translated_filename, &exec_input.argv, &exec_input.envp)?;
 
@@ -542,12 +535,10 @@ pub fn sys_execve<'a>(
 }
 
 pub fn sys_getpid<'a>(mgr: &mut ApeManager<'a>, pid: usize) -> Result<isize, Error> {
-    log!("getpid:");
     Ok(pid as isize)
 }
 
 pub fn sys_gettid<'a>(mgr: &mut ApeManager<'a>, pid: usize) -> Result<isize, Error> {
-    log!("gettid:");
     Ok(pid as isize)
 }
 
@@ -556,15 +547,12 @@ pub fn sys_set_tid_address<'a>(
     pid: usize,
     tidptr: usize,
 ) -> Result<isize, Error> {
-    log!("set_tid_address: pid {} tidptr {:#x}", pid, tidptr);
     let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
     process.clear_child_tid = tidptr;
     Ok(pid as isize)
 }
 
 pub fn sys_exit<'a>(mgr: &mut ApeManager<'a>, pid: usize, code: usize) -> Result<isize, Error> {
-    log!("exit: pid {} code {}", pid, code as isize);
-
     // 当前请求来自将要退出的目标线程（CALL 语义）。
     // 先清空 Ape 的 reply 槽位，避免这枚 Reply Cap 在 Warren 回收目标 TCB 前
     // 继续持有对目标线程的额外引用。
@@ -612,7 +600,6 @@ pub fn sys_exit_group<'a>(
 }
 
 pub fn sys_brk<'a>(mgr: &mut ApeManager<'a>, pid: usize, addr: usize) -> Result<isize, Error> {
-    log!("brk: pid {} addr {:#x}", pid, addr);
     let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
 
     if addr == 0 {
@@ -637,16 +624,6 @@ pub fn sys_mmap<'a>(
     fd: usize,
     offset: usize,
 ) -> Result<isize, Error> {
-    log!(
-        "mmap: pid {} addr {:#x} len {:#x} prot {:#x} flags {:#x} fd {} offset {:#x}",
-        pid,
-        addr,
-        len,
-        prot,
-        flags,
-        fd,
-        offset
-    );
     if len == 0 {
         return Err(Error::InvalidArgs);
     }
@@ -820,13 +797,59 @@ pub fn sys_munmap<'a>(
     Ok(0)
 }
 
+pub fn sys_mprotect<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    addr: usize,
+    len: usize,
+    prot: u32,
+) -> Result<isize, Error> {
+    if len == 0 {
+        return Ok(0);
+    }
+
+    let start = align_down(addr, PGSIZE);
+    let end = align_up(addr.checked_add(len).ok_or(Error::OutOfMemory)?, PGSIZE);
+    let new_perms = prot_to_perms(prot);
+
+    let mut pages = Vec::new();
+    {
+        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        for page in (start..end).step_by(PGSIZE) {
+            let map = process.lookup_memory_map(page).cloned().ok_or(Error::InvalidAddress)?;
+            if page < map.vaddr || page >= map.vaddr.saturating_add(map.size) {
+                return Err(Error::InvalidAddress);
+            }
+            pages.push((page, map.frame_cap));
+        }
+    }
+
+    let vspace = mgr.get_process(pid).ok_or(Error::NotFound)?.vspace();
+    for (page, frame_cap) in &pages {
+        let _ = vspace.unmap(*page, PGSIZE);
+        vspace.map(Frame::from(CapPtr::from(*frame_cap)), *page, new_perms, 1)?;
+    }
+
+    if let Some(process) = mgr.get_process_mut(pid) {
+        for (page, _) in pages {
+            if let Some(map) = process.memory_maps.get_mut(&page) {
+                map.flags = new_perms;
+            }
+            if let Some(map) = process.lazy_memory_maps.get_mut(&page) {
+                map.flags = new_perms;
+            }
+        }
+    }
+
+    Ok(0)
+}
+
 pub fn sys_getppid<'a>(mgr: &mut ApeManager<'a>, pid: usize) -> Result<isize, Error> {
     let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
     Ok(process.parent_pid as isize)
 }
 
 pub fn sys_fork<'a>(mgr: &mut ApeManager<'a>, pid: usize) -> Result<isize, Error> {
-    log!("fork: process {} is forking", pid);
     // 1. 获取父进程信息
     let name = alloc::format!("fork-{}", pid);
 

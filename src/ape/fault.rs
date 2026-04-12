@@ -6,7 +6,7 @@ use ape::sys::constants::{
     SIGILL_EXIT_CODE, SIGSEGV_EXIT_CODE, SIGTRAP_EXIT_CODE, UNKNOWN_FAULT_EXIT_CODE,
 };
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CSPACE_CAP, CapType, Frame};
+use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Frame};
 use glenda::error::Error;
 use glenda::interface::{
     CSpaceService, FaultService, ProcessService, ResourceService, SystemService, VSpaceService,
@@ -38,7 +38,7 @@ impl<'a> ApeManager<'a> {
         let frame = Frame::from(frame_slot);
 
         let vspace = self.get_process(pid).ok_or(Error::NotFound)?.vspace();
-        let mut vspace_mgr = VSpaceManager::new(vspace, 0, 0);
+        let mut vspace_mgr = VSpaceManager::new_empty(vspace, 0, 0);
         vspace_mgr.map_frame(
             frame,
             page_addr,
@@ -58,6 +58,37 @@ impl<'a> ApeManager<'a> {
             cow: false,
             frame_cap: frame_slot.bits(),
         });
+        Ok(())
+    }
+
+    fn remap_existing_page(
+        &mut self,
+        pid: usize,
+        page_addr: usize,
+        frame_cap: usize,
+        perms: Perms,
+    ) -> Result<(), Error> {
+        let frame = Frame::from(CapPtr::from(frame_cap));
+        let vspace = self.get_process(pid).ok_or(Error::NotFound)?.vspace();
+
+        // 先尝试移除旧映射（若不存在则忽略），随后通过 VSpaceManager 进行重映射，
+        // 以便在中间页表缺失时能够自动补齐页表层级。
+        let _ = vspace.unmap(page_addr, PGSIZE);
+        let mut vspace_mgr = VSpaceManager::new_empty(vspace, 0, 0);
+        vspace_mgr.map_frame(
+            frame,
+            page_addr,
+            perms,
+            1,
+            &mut *self.res_client,
+            &mut *self.cspace_mgr,
+        )?;
+
+        if let Some(process) = self.get_process_mut(pid)
+            && let Some(map) = process.memory_maps.get_mut(&page_addr)
+        {
+            map.flags = perms;
+        }
         Ok(())
     }
 
@@ -118,7 +149,48 @@ impl<'a> FaultService for ApeManager<'a> {
         };
 
         if let Some(map) = mapped {
+            log!(
+                "page_fault: mapped hit pid={} addr={:#x} map_vaddr={:#x} size={:#x} perms={:?} type={:?}",
+                pid,
+                addr,
+                map.vaddr,
+                map.size,
+                map.flags,
+                map.mem_type
+            );
             if !Self::fault_access_allowed(cause, map.flags) {
+                if map.mem_type == MemoryType::Image {
+                    let adjusted = if cause == STORE_PAGE_FAULT
+                        && map.flags.contains(Perms::EXECUTE)
+                        && !map.flags.contains(Perms::WRITE)
+                    {
+                        let mut p = map.flags | Perms::WRITE;
+                        p.remove(Perms::EXECUTE);
+                        Some(p)
+                    } else if cause == INST_PAGE_FAULT
+                        && map.flags.contains(Perms::WRITE)
+                        && !map.flags.contains(Perms::EXECUTE)
+                    {
+                        let mut p = map.flags | Perms::EXECUTE;
+                        p.remove(Perms::WRITE);
+                        Some(p)
+                    } else {
+                        None
+                    };
+
+                    if let Some(new_perms) = adjusted {
+                        log!(
+                            "page_fault: remap image perms pid={} vaddr={:#x} {:?} -> {:?}",
+                            pid,
+                            map.vaddr,
+                            map.flags,
+                            new_perms
+                        );
+                        self.remap_existing_page(pid, map.vaddr, map.frame_cap, new_perms)?;
+                        return Ok(());
+                    }
+                }
+
                 error!(
                     "page_fault: permission denied pid={} addr={:#x} pc={:#x} cause={:#x} perms={:?}",
                     pid, addr, pc, cause, map.flags
@@ -126,12 +198,15 @@ impl<'a> FaultService for ApeManager<'a> {
                 return self.terminate_faulting_process(pid, SIGSEGV_EXIT_CODE);
             }
 
-            // 已有映射却仍触发 page fault，通常说明非法访问/COW 未实现等情况。
-            error!(
-                "page_fault: mapped page fault pid={} addr={:#x} pc={:#x} cause={:#x}",
-                pid, addr, pc, cause
+            // 元数据存在但仍触发 fault：尝试按记录重装该页映射（例如页表项被替换/丢失）。
+            log!(
+                "page_fault: remap existing pid={} vaddr={:#x} perms={:?}",
+                pid,
+                map.vaddr,
+                map.flags
             );
-            return self.terminate_faulting_process(pid, SIGSEGV_EXIT_CODE);
+            self.remap_existing_page(pid, map.vaddr, map.frame_cap, map.flags)?;
+            return Ok(());
         }
 
         let (stack_bottom, stack_size, max_stack_size, heap_start, heap_brk) = {

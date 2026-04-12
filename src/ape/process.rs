@@ -4,8 +4,8 @@ use alloc::string::String;
 use ape::sys::constants::{
     DEFAULT_HEAP_LIMIT, DEFAULT_MAX_STACK_SIZE, DEFAULT_MMAP_BASE, DEFAULT_MMAP_LIMIT,
 };
-use glenda::client::FsClient;
 use glenda::cap::{CNode, CapPtr, TCB, TCB_SLOT, VSPACE_SLOT, VSpace};
+use glenda::client::FsClient;
 use glenda::client::TerminalClient;
 use glenda::io::uring::IoUringClient;
 use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
@@ -51,7 +51,7 @@ pub struct NormalFileHandle {
     pub fs_client: FsClient,
     pub fs_ep_slot: CapPtr,
     pub offset: usize,
-    pub async_io: AsyncIoState,
+    pub async_io: Option<AsyncIoState>,
 }
 
 #[derive(Debug, Clone, Copy)]

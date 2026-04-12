@@ -158,10 +158,8 @@ impl<'a> ApeManager<'a> {
         let frame = Frame::from(frame_slot);
 
         let vaddr = self.next_fs_async_vaddr;
-        self.next_fs_async_vaddr = self
-            .next_fs_async_vaddr
-            .checked_add(size_aligned)
-            .ok_or(Error::OutOfMemory)?;
+        self.next_fs_async_vaddr =
+            self.next_fs_async_vaddr.checked_add(size_aligned).ok_or(Error::OutOfMemory)?;
 
         self.vspace_mgr.map_frame(
             frame,
