@@ -55,9 +55,35 @@ pub struct NormalFileHandle {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct PtyMasterHandle {
+    pub term: TerminalClient,
+    pub vt_id: usize,
+    pub ep_slot: CapPtr,
+    pub locked: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PtySlaveHandle {
+    pub term: TerminalClient,
+    pub vt_id: usize,
+    pub ep_slot: CapPtr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PseudoCharDevice {
+    Null,
+    Zero,
+    Random,
+    URandom,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum FileType {
     Normal(NormalFileHandle),
     Terminal(TerminalClient),
+    PtyMaster(PtyMasterHandle),
+    PtySlave(PtySlaveHandle),
+    PseudoChar(PseudoCharDevice),
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +101,8 @@ pub struct SubProcess {
     pub memory_maps: BTreeMap<usize, MemoryMap>, // vaddr -> mapping
     pub lazy_memory_maps: BTreeMap<usize, MemoryMap>, // vaddr(page) -> lazy mapping
     pub fds: BTreeMap<u32, FileHandle>,          // fd -> handle
+    pub fd_paths: BTreeMap<u32, String>,         // fd -> resolved absolute path (if path-based)
+    pub fd_cloexec: BTreeMap<u32, bool>,         // fd -> close-on-exec
     pub next_fd: u32,
     pub stack_bottom: usize,
     pub stack_size: usize,
@@ -100,6 +128,8 @@ impl SubProcess {
             memory_maps: BTreeMap::new(),
             lazy_memory_maps: BTreeMap::new(),
             fds: BTreeMap::new(),
+            fd_paths: BTreeMap::new(),
+            fd_cloexec: BTreeMap::new(),
             next_fd: 0,
             stack_bottom: STACK_BASE,
             stack_size: 0,

@@ -40,13 +40,16 @@ impl<'a> ApeManager<'a> {
         }
     }
 
-    pub(crate) fn terminate_process(
+    fn terminate_process_impl(
         &mut self,
         pid: usize,
         exit_code: usize,
         panic_if_init: bool,
+        clear_reply: bool,
     ) -> Result<(), Error> {
-        self.clear_reply_cap_for_exit();
+        if clear_reply {
+            self.clear_reply_cap_for_exit();
+        }
         self.release_process_cnode_cap(pid);
         self.kill_host_process_by_local_pid(pid);
 
@@ -58,5 +61,23 @@ impl<'a> ApeManager<'a> {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn terminate_process(
+        &mut self,
+        pid: usize,
+        exit_code: usize,
+        panic_if_init: bool,
+    ) -> Result<(), Error> {
+        self.terminate_process_impl(pid, exit_code, panic_if_init, true)
+    }
+
+    pub(crate) fn terminate_process_preserve_reply(
+        &mut self,
+        pid: usize,
+        exit_code: usize,
+        panic_if_init: bool,
+    ) -> Result<(), Error> {
+        self.terminate_process_impl(pid, exit_code, panic_if_init, false)
     }
 }

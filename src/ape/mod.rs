@@ -100,11 +100,6 @@ impl<'a> ApeManager<'a> {
         }
     }
 
-    pub fn resolve_path_for_process(&self, pid: usize, raw_path: &str) -> Result<String, Error> {
-        let process = self.get_process(pid).ok_or(Error::NotFound)?;
-        Ok(self::path::resolve_path(raw_path, &process.root_dir, &process.cwd))
-    }
-
     pub fn register_process(
         &mut self,
         parent_pid: usize,
@@ -139,6 +134,11 @@ impl<'a> ApeManager<'a> {
 
     pub fn get_process_mut(&mut self, pid: usize) -> Option<&mut SubProcess> {
         self.processes.get_mut(&pid)
+    }
+
+    pub fn resolve_path_for_process(&self, pid: usize, raw_path: &str) -> Result<String, Error> {
+        let process = self.get_process(pid).ok_or(Error::NotFound)?;
+        Ok(self::path::resolve_path(raw_path, &process.root_dir, &process.cwd))
     }
 
     pub fn take_next_fs_handle_badge(&mut self) -> usize {

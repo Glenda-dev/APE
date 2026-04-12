@@ -1,6 +1,6 @@
+use crate::layout::DEFAULT_PROCESS_ROOT;
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::layout::DEFAULT_PROCESS_ROOT;
 
 fn normalize_absolute(path: &str) -> String {
     let mut stack: Vec<&str> = Vec::new();
@@ -104,4 +104,33 @@ pub fn resolve_path(raw_path: &str, root_dir: &str, cwd: &str) -> String {
 
     let abs = normalize_absolute(&joined);
     remap_absolute_into_root(&abs, &root)
+}
+
+pub fn path_inside_root(abs_path: &str, root_dir: &str) -> Option<String> {
+    if !abs_path.starts_with('/') {
+        return None;
+    }
+
+    let root = normalize_root(root_dir);
+    let abs = normalize_absolute(abs_path);
+
+    if root == "/" {
+        return Some(abs);
+    }
+
+    if abs == root {
+        return Some(String::from("/"));
+    }
+
+    let mut prefix = root.clone();
+    prefix.push('/');
+    if abs.starts_with(&prefix) {
+        let rest = &abs[root.len()..];
+        if rest.is_empty() {
+            return Some(String::from("/"));
+        }
+        return Some(String::from(rest));
+    }
+
+    None
 }

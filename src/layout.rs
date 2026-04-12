@@ -16,4 +16,5 @@ pub const DEFAULT_INIT_PROCESS_NAME: &str = "init";
 pub const DEFAULT_INIT_PROGRAM: &str = "/init";
 pub const VSPACE_SCRATCH_START: usize = 0x7000_0000;
 pub const VSPACE_SCRATCH_END: usize = 0x8000_0000;
-pub const DEFAULT_PROCESS_ROOT: &str = "/linux";
+pub const DEFAULT_PROCESS_ROOT: &str = "/";
+pub const DEFAULT_VIEW_ROOT: &str = "/linux";

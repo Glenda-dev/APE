@@ -8,7 +8,7 @@ use ape::cap::APE_SLOT;
 use core::cmp::{max, min};
 use core::mem::size_of;
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, CapType, Endpoint, Frame};
+use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Endpoint, Frame};
 use glenda::error::Error;
 use glenda::interface::{
     CSpaceService, FileHandleService, FileSystemService, ResourceService, ThreadService,
@@ -20,7 +20,6 @@ use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
 use glenda::protocol::fs::OpenFlags;
 use glenda::utils::align::{align_down, align_up};
 
-const DEFAULT_ARG0: &str = "init";
 const INITIAL_STACK_ALIGN: usize = 16;
 const PIE_LOAD_BIAS: usize = 0;
 const INTERP_LOAD_GAP: usize = 0x10_0000;
@@ -41,35 +40,77 @@ struct LoadedElfInfo {
 }
 
 impl<'a> ApeManager<'a> {
+    fn close_cloexec_fds(&mut self, pid: usize) -> Result<(), Error> {
+        let cloexec_fds: Vec<u32> = {
+            let process = self.get_process(pid).ok_or(Error::NotFound)?;
+            process
+                .fd_cloexec
+                .iter()
+                .filter_map(|(fd, cloexec)| if *cloexec { Some(*fd) } else { None })
+                .collect()
+        };
+
+        for fd in cloexec_fds {
+            log!("execve: closing cloexec fd {} for pid {}", fd, pid);
+            let _ = crate::fs::sys_close(self, pid, fd as usize)?;
+        }
+
+        Ok(())
+    }
+
     fn read_exec_image_from_fs(&mut self, pid: usize, path: &str) -> Result<Vec<u8>, Error> {
-        let mut translated_path = self.resolve_path_for_process(pid, path)?;
-        let mut stat = self.fs_client.stat_path(Badge::null(), &translated_path)?;
+        let stat = match self.fs_client.stat_path(Badge::null(), path) {
+            Ok(stat) => stat,
+            Err(e) => {
+                error!(
+                    "execve: stat_path failed pid={} path={} err={:?}",
+                    pid,
+                    path,
+                    e
+                );
+                return Err(e);
+            }
+        };
         let size = stat.size as usize;
         if size == 0 {
             error!("read_exec_image_from_fs: exec image has zero size");
             return Err(Error::InvalidArgs);
         }
-        let fd = self.fs_client.open(Badge::null(), &translated_path, OpenFlags::O_RDONLY, 0)?;
+        let fs_ep_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
+        let mut fs_open_client = glenda::client::FsClient::new(self.fs_client.endpoint());
+        if let Err(e) = fs_open_client.open(Badge::null(), path, OpenFlags::O_RDONLY, 0, fs_ep_slot)
+        {
+            let _ = CSPACE_CAP.delete(fs_ep_slot);
+            self.cspace_mgr.free(fs_ep_slot);
+            error!("execve: open failed pid={} path={} err={:?}", pid, path, e);
+            return Err(e);
+        }
+        let fs_ep = Endpoint::from(fs_ep_slot);
+        let mut handle_client = glenda::client::FsClient::new(fs_ep);
 
         let mut elf_data = alloc::vec![0u8; size];
         let mut offset = 0;
         while offset < size {
-            let read_len = self.fs_client.read(Badge::null(), offset, &mut elf_data[offset..])?;
+            let read_len = handle_client.read(Badge::null(), offset, &mut elf_data[offset..])?;
             if read_len == 0 {
                 error!("read_exec_image_from_fs: unexpected EOF while reading exec image");
-                self.fs_client.close(Badge::null())?;
+                handle_client.close(Badge::null())?;
+                let _ = CSPACE_CAP.delete(fs_ep_slot);
+                self.cspace_mgr.free(fs_ep_slot);
                 return Err(Error::IoError);
             }
             offset += read_len;
         }
-        self.fs_client.close(Badge::null())?;
-        let _ = fd;
+        handle_client.close(Badge::null())?;
+        let _ = CSPACE_CAP.delete(fs_ep_slot);
+        self.cspace_mgr.free(fs_ep_slot);
         Ok(elf_data)
     }
 
     fn setup_initial_stack(
         &mut self,
         pid: usize,
+        fallback_arg0: &str,
         argv: &[String],
         envp: &[String],
         auxv: &[(usize, usize)],
@@ -97,7 +138,7 @@ impl<'a> ApeManager<'a> {
         let mut sp = PGSIZE;
 
         let effective_argv: Vec<&str> = if argv.is_empty() {
-            alloc::vec![DEFAULT_ARG0]
+            alloc::vec![fallback_arg0]
         } else {
             argv.iter().map(|s| s.as_str()).collect()
         };
@@ -407,7 +448,7 @@ impl<'a> ApeManager<'a> {
             (AUXV_AT_ENTRY, main_info.entry),
         ];
 
-        let initial_sp = self.setup_initial_stack(pid, argv, envp, &auxv)?;
+        let initial_sp = self.setup_initial_stack(pid, path, argv, envp, &auxv)?;
         let initial_tp = self.setup_initial_tls(pid)?;
         let (tcb_cap, fault_ep) = {
             let process = self.get_process(pid).ok_or(Error::NotFound)?;
@@ -416,6 +457,7 @@ impl<'a> ApeManager<'a> {
         };
         tcb_cap.set_entrypoint(entry_point, initial_sp, initial_tp)?;
         tcb_cap.set_fault_handler(fault_ep, false)?;
+        self.close_cloexec_fds(pid)?;
         Ok(())
     }
 
@@ -439,10 +481,9 @@ pub(crate) fn do_execve<'a>(
 ) -> Result<(), Error> {
     let exec_input: ExecveUserInput =
         mgr.parse_execve_user_input(pid, filename_ptr, argv_ptr, envp_ptr)?;
-    let translated_filename = mgr.resolve_path_for_process(pid, &exec_input.filename)?;
 
     // 保持行为与 Linux 接近：允许 filename 与 argv[0] 不同。
-    mgr.do_execve_path(pid, &translated_filename, &exec_input.argv, &exec_input.envp)
+    mgr.do_execve_path(pid, &exec_input.filename, &exec_input.argv, &exec_input.envp)
 }
 
 pub fn sys_execve<'a>(

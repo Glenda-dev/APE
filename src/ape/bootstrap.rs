@@ -2,7 +2,7 @@ use crate::ApeManager;
 use crate::ape::process::{FileHandle, FileType};
 use crate::config::ApeConfig;
 use crate::layout::{
-    DEFAULT_INIT_PROCESS_NAME, DEFAULT_PROCESS_ROOT, DEFAULT_VT_NAME, ROOTFS_SLOT, STDIO_SLOT,
+    DEFAULT_INIT_PROCESS_NAME, DEFAULT_VIEW_ROOT, DEFAULT_VT_NAME, ROOTFS_SLOT, STDIO_SLOT,
 };
 use ape::sys::constants::FIRST_USER_FD;
 use glenda::cap::CSPACE_CAP;
@@ -12,9 +12,21 @@ use glenda::interface::{
     CSpaceService, InitService, ProcessService, ResourceService, ThreadService,
     VirtualFileSystemService, VirtualTerminalService, VolumeService,
 };
-use glenda::ipc::Badge;
+use glenda::ipc::{Badge, MsgFlags, MsgTag, UTCB};
 use glenda::protocol;
 use linux_raw_sys::general::*;
+
+fn set_terminal_foreground_pgrp(term: TerminalClient, pgrp: i32) -> Result<(), Error> {
+    let mut utcb = unsafe { UTCB::new() };
+    utcb.clear();
+    utcb.set_msg_tag(MsgTag::new(
+        protocol::TERMINAL_PROTO,
+        protocol::terminal::TERM_SET_PGRP,
+        MsgFlags::NONE,
+    ));
+    utcb.set_mr(0, pgrp as usize);
+    term.endpoint().call(utcb)
+}
 
 impl<'a> ApeManager<'a> {
     pub fn bootstrap(&mut self) -> Result<(), Error> {
@@ -22,6 +34,7 @@ impl<'a> ApeManager<'a> {
 
         self.load_ape_config();
         self.mount_rootfs()?;
+        self.setup_view()?;
         self.init_stdio()?;
         self.load_init()?;
 
@@ -31,6 +44,11 @@ impl<'a> ApeManager<'a> {
     fn load_ape_config(&mut self) {
         match ApeConfig::load(self.res_client, self.cspace_mgr, self.vspace_mgr) {
             Ok(config) => {
+                log!(
+                    "bootstrap: loaded ape config (init_path={}, root_partition={})",
+                    config.init_path,
+                    config.root_partition
+                );
                 self.config = config;
             }
             Err(e) => {
@@ -41,12 +59,29 @@ impl<'a> ApeManager<'a> {
     }
 
     fn mount_rootfs(&mut self) -> Result<(), Error> {
+        log!(
+            "bootstrap: mounting rootfs partition {} -> {}",
+            self.config.root_partition,
+            DEFAULT_VIEW_ROOT
+        );
         let target_ep = self.vol_client.mount_partition(
             Badge::null(),
             &self.config.root_partition,
             ROOTFS_SLOT,
         )?;
-        self.fs_client.mount(Badge::null(), DEFAULT_PROCESS_ROOT, target_ep)?;
+        self.fs_client.mount(Badge::null(), DEFAULT_VIEW_ROOT, target_ep)?;
+        log!("bootstrap: mounted rootfs successfully");
+        Ok(())
+    }
+
+    fn setup_view(&mut self) -> Result<(), Error> {
+        let view_id = self.fs_client.create_view(Badge::null(), DEFAULT_VIEW_ROOT)?;
+        self.fs_client.set_view(Badge::null(), view_id)?;
+        log!(
+            "bootstrap: switched to view {} with root {}",
+            view_id,
+            DEFAULT_VIEW_ROOT
+        );
         Ok(())
     }
 
@@ -79,6 +114,8 @@ impl<'a> ApeManager<'a> {
 
         // 4. 为 init 进程初始化 stdio fds
         if let Some(term) = self.stdio_term {
+            set_terminal_foreground_pgrp(term, pid as i32)?;
+
             let proc = self.get_process_mut(pid).unwrap();
             proc.fds.insert(STDIN_FILENO, FileHandle { file_type: FileType::Terminal(term) });
             proc.fds.insert(STDOUT_FILENO, FileHandle { file_type: FileType::Terminal(term) });

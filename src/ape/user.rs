@@ -221,7 +221,10 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
                 return Err(Error::InvalidAddress);
             }
 
-            let scratch = self.pool.acquire(self.mgr, &map, Perms::WRITE)?;
+            // RISC-V 要求可写页同时具备可读属性（W=1 且 R=0 为无效叶子 PTE）。
+            // 对用户页执行 copy_to_user 时，scratch 映射必须至少是 RW，
+            // 否则在 memcpy 写入路径上可能触发 page fault。
+            let scratch = self.pool.acquire(self.mgr, &map, Perms::READ | Perms::WRITE)?;
             let dst =
                 unsafe { core::slice::from_raw_parts_mut((scratch + start) as *mut u8, chunk) };
             dst.copy_from_slice(&src[copied..copied + chunk]);

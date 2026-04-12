@@ -19,7 +19,7 @@ pub struct ApeConfig {
 
 impl Default for ApeConfig {
     fn default() -> Self {
-        Self { init_path: String::from("/init"), root_partition: String::from("disk0p0") }
+        Self { init_path: String::from("/bin/sh"), root_partition: String::from("disk0p0") }
     }
 }
 
