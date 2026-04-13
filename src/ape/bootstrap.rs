@@ -85,6 +85,12 @@ impl<'a> ApeManager<'a> {
         let (vt_id, vt_ep) =
             self.vt_client.create_vt(Badge::null(), DEFAULT_VT_NAME, STDIO_SLOT)?;
 
+        // 将 stdio VT 绑定到系统默认 Seat(0)，并切换为前台活动 VT。
+        // 否则 Prism 默认仍在 VT0，APE 写入 VT1 的提示符不会被路由到串口，
+        // 且 UART 输入也会继续注入 VT0，导致“无提示符/无法输入”。
+        self.vt_client.bind_seat(Badge::null(), 0, vt_id)?;
+        self.vt_client.switch_vt(Badge::null(), 0, vt_id)?;
+
         // 2. 创建 TerminalClient
         let term_client = TerminalClient::new(vt_ep);
         self.stdio_term = Some(term_client);

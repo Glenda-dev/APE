@@ -7,10 +7,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::min;
 use core::mem::size_of;
+use glenda::client::TerminalClient;
 use glenda::error::Error;
 use glenda::interface::SystemService;
 use glenda::interface::{FileHandleService, FileSystemService};
 use glenda::ipc::Badge;
+use glenda::ipc::{MsgFlags, MsgTag, UTCB};
 use glenda::protocol::fs::FileType as FsFileType;
 use linux_raw_sys::errno::*;
 use linux_raw_sys::general::*;
@@ -171,6 +173,37 @@ fn write_zeros_to_user<'a>(
 #[inline]
 fn is_dir_mode(mode: u32) -> bool {
     ((mode as usize) & FsFileType::S_IFMT.bits()) == FsFileType::S_IFDIR.bits()
+}
+
+fn terminal_poll_readable(term: TerminalClient) -> Result<bool, Error> {
+    let mut utcb = unsafe { UTCB::new() };
+    utcb.clear();
+    utcb.set_msg_tag(MsgTag::new(
+        glenda::protocol::TERMINAL_PROTO,
+        glenda::protocol::terminal::TERM_POLL_READ,
+        MsgFlags::NONE,
+    ));
+    term.endpoint().call(&mut utcb)?;
+    Ok(utcb.get_mr(0) != 0)
+}
+
+fn pollin_ready_for_fd<'a>(mgr: &mut ApeManager<'a>, pid: usize, fd: u32) -> Result<bool, Error> {
+    let term = {
+        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
+        match handle.file_type {
+            ApeFileType::Terminal(term) => Some(term),
+            ApeFileType::PtyMaster(master) => Some(master.term),
+            ApeFileType::PtySlave(slave) => Some(slave.term),
+            _ => None,
+        }
+    };
+
+    if let Some(term) = term {
+        terminal_poll_readable(term)
+    } else {
+        Ok(true)
+    }
 }
 
 pub fn sys_uname<'a>(mgr: &mut ApeManager<'a>, pid: usize, buf_ptr: usize) -> Result<isize, Error> {
@@ -341,45 +374,59 @@ pub fn sys_ppoll<'a>(
         return Err(Error::InvalidArgs);
     }
 
-    let mut ready_count = 0usize;
-    for i in 0..nfds {
-        let p = fds_ptr
-            .checked_add(i.checked_mul(size_of::<PollFd>()).ok_or(Error::InvalidAddress)?)
-            .ok_or(Error::InvalidAddress)?;
+    let block_forever = _timeout == 0;
+    loop {
+        let mut ready_count = 0usize;
 
-        let mut raw = [0u8; size_of::<PollFd>()];
-        mgr.copy_from_user(pid, p, &mut raw)?;
-        let mut pfd = unsafe { (raw.as_ptr() as *const PollFd).read_unaligned() };
+        for i in 0..nfds {
+            let p = fds_ptr
+                .checked_add(i.checked_mul(size_of::<PollFd>()).ok_or(Error::InvalidAddress)?)
+                .ok_or(Error::InvalidAddress)?;
 
-        pfd.revents = 0;
-        if pfd.fd >= 0 {
-            let fd = pfd.fd as u32;
-            let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-            if !process.fds.contains_key(&fd) {
-                pfd.revents = POLLNVAL;
-                ready_count += 1;
-            } else {
-                let mut revents = 0i16;
-                if (pfd.events & (POLLIN | POLLPRI)) != 0 {
-                    revents |= POLLIN;
-                }
-                if (pfd.events & POLLOUT) != 0 {
-                    revents |= POLLOUT;
-                }
-                pfd.revents = revents;
-                if revents != 0 {
+            let mut raw = [0u8; size_of::<PollFd>()];
+            mgr.copy_from_user(pid, p, &mut raw)?;
+            let mut pfd = unsafe { (raw.as_ptr() as *const PollFd).read_unaligned() };
+
+            pfd.revents = 0;
+            if pfd.fd >= 0 {
+                let fd = pfd.fd as u32;
+                let valid = {
+                    let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+                    process.fds.contains_key(&fd)
+                };
+                if !valid {
+                    pfd.revents = POLLNVAL;
                     ready_count += 1;
+                } else {
+                    let mut revents = 0i16;
+                    if (pfd.events & (POLLIN | POLLPRI)) != 0 && pollin_ready_for_fd(mgr, pid, fd)? {
+                        revents |= POLLIN;
+                    }
+                    if (pfd.events & POLLOUT) != 0 {
+                        revents |= POLLOUT;
+                    }
+                    pfd.revents = revents;
+                    if revents != 0 {
+                        ready_count += 1;
+                    }
                 }
             }
+
+            let out = unsafe {
+                core::slice::from_raw_parts(
+                    (&pfd as *const PollFd) as *const u8,
+                    size_of::<PollFd>(),
+                )
+            };
+            mgr.copy_to_user(pid, p, out)?;
         }
 
-        let out = unsafe {
-            core::slice::from_raw_parts((&pfd as *const PollFd) as *const u8, size_of::<PollFd>())
-        };
-        mgr.copy_to_user(pid, p, out)?;
-    }
+        if ready_count > 0 || !block_forever {
+            return Ok(ready_count as isize);
+        }
 
-    Ok(ready_count as isize)
+        core::hint::spin_loop();
+    }
 }
 
 pub fn sys_getrandom<'a>(

@@ -283,7 +283,9 @@ fn trace_rw_vector<'a>(
         return format!("{}({}, {}, {})", name, fd, format_ptr(iov_ptr), iov_cnt);
     }
 
-    if let Some(iov0) = read_user_iovec(mgr, pid, iov_ptr) {
+    if let Some(iov0) = read_first_nonempty_iovec(mgr, pid, iov_ptr, iov_cnt)
+        .or_else(|| read_user_iovec(mgr, pid, iov_ptr))
+    {
         if is_write {
             let preview =
                 preview_user_buffer(mgr, pid, iov0.iov_base, iov0.iov_len, TRACE_BUF_PREVIEW)
@@ -586,6 +588,23 @@ fn read_user_iovec<'a>(mgr: &mut ApeManager<'a>, pid: usize, ptr: usize) -> Opti
         return None;
     }
     Some(unsafe { (raw.as_ptr() as *const UserIovec).read_unaligned() })
+}
+
+fn read_first_nonempty_iovec<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    iov_ptr: usize,
+    iov_cnt: usize,
+) -> Option<UserIovec> {
+    let max_scan = core::cmp::min(iov_cnt, 8);
+    for idx in 0..max_scan {
+        let ptr = iov_ptr.checked_add(idx.checked_mul(size_of::<UserIovec>())?)?;
+        let iov = read_user_iovec(mgr, pid, ptr)?;
+        if iov.iov_len > 0 {
+            return Some(iov);
+        }
+    }
+    None
 }
 
 fn read_user_timespec<'a>(
