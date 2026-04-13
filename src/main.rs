@@ -17,6 +17,8 @@ mod mm;
 mod net;
 mod proc;
 mod syscall;
+#[cfg(feature = "strace")]
+mod trace;
 
 pub use ape::ApeManager;
 

@@ -702,9 +702,7 @@ pub fn sys_openat<'a>(
                 if let Err(e) = set_terminal_pgrp(term, pid as i32) {
                     warn!(
                         "sys_openat: set initial tty pgrp failed pid={}, vt_id={}, err={:?}",
-                        pid,
-                        vt_id,
-                        e
+                        pid, vt_id, e
                     );
                 }
 
@@ -776,8 +774,7 @@ pub fn sys_openat<'a>(
     let fs_ep_slot = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
     let mut fs_open_client = FsClient::new(mgr.fs_client.endpoint());
     let open_flags = glenda::protocol::fs::OpenFlags::from_bits_truncate(flags);
-    if let Err(e) = fs_open_client.open(Badge::null(), &path, open_flags, mode as u32, fs_ep_slot)
-    {
+    if let Err(e) = fs_open_client.open(Badge::null(), &path, open_flags, mode as u32, fs_ep_slot) {
         let _ = CSPACE_CAP.delete(fs_ep_slot);
         mgr.cspace_mgr.free(fs_ep_slot);
         return Err(e);

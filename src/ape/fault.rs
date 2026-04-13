@@ -12,8 +12,9 @@ use glenda::error::Error;
 use glenda::interface::{
     CSpaceService, FaultService, ResourceService, SystemService, VSpaceService,
 };
-use glenda::ipc::{Badge, MsgArgs, UTCB};
+use glenda::ipc::{Badge, MsgArgs, MsgFlags, MsgTag, UTCB};
 use glenda::mem::Perms;
+use glenda::protocol;
 use glenda::utils::align::align_down;
 
 impl<'a> ApeManager<'a> {
@@ -411,6 +412,9 @@ impl<'a> FaultService for ApeManager<'a> {
 
         let ret = dispatch_syscall(&mut *self, pid, sys_num, sys_args);
         let utcb = unsafe { UTCB::new() };
+        // 关键：syscall 回包必须显式清理 capability 传递状态，
+        // 否则可能携带之前 IPC（如 openat->nexus OPEN）的 HAS_CAP/CapPtr 残留。
+        utcb.clear();
         utcb.set_mr(0, ret as usize);
         Ok(())
     }

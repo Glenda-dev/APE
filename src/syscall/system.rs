@@ -106,19 +106,12 @@ fn reboot_ape_runtime<'a>(mgr: &mut ApeManager<'a>, caller_pid: usize) -> Result
             continue;
         }
         if let Err(e) = mgr.terminate_process_preserve_reply(victim, 0, false) {
-            warn!(
-                "sys_reboot: failed to terminate pid {} during APE reboot: {:?}",
-                victim, e
-            );
+            warn!("sys_reboot: failed to terminate pid {} during APE reboot: {:?}", victim, e);
         }
     }
 
     let init_path = mgr.config.init_path.clone();
-    log!(
-        "sys_reboot: rebooting APE runtime by exec init pid={}, path={}",
-        init_pid,
-        init_path
-    );
+    log!("sys_reboot: rebooting APE runtime by exec init pid={}, path={}", init_pid, init_path);
     mgr.execve_path(init_pid, &init_path, &[], &[])?;
 
     // 若重启对象不是当前正在执行 syscall 的线程，确保其可运行。

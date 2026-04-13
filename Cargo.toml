@@ -20,3 +20,6 @@ serde = { version = "1.0", default-features = false, features = [
     "alloc",
 ] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+
+[features]
+strace = []

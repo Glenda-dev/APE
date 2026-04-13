@@ -62,12 +62,7 @@ impl<'a> ApeManager<'a> {
         let stat = match self.fs_client.stat_path(Badge::null(), path) {
             Ok(stat) => stat,
             Err(e) => {
-                error!(
-                    "execve: stat_path failed pid={} path={} err={:?}",
-                    pid,
-                    path,
-                    e
-                );
+                error!("execve: stat_path failed pid={} path={} err={:?}", pid, path, e);
                 return Err(e);
             }
         };

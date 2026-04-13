@@ -1,6 +1,8 @@
 use crate::ApeManager;
-use crate::syscall::common::{log_syscall_result, map_error_to_errno, syscall_name};
+use crate::syscall::common::map_error_to_errno;
 use crate::syscall::{system, task};
+#[cfg(feature = "strace")]
+use crate::trace;
 use crate::{fs, init, mm};
 use glenda::error::Error;
 use linux_raw_sys::general::*;
@@ -13,8 +15,8 @@ pub fn dispatch_syscall<'a>(
     args: [usize; 6],
 ) -> isize {
     let sys_num_u32 = sys_num as u32;
-    let name = syscall_name(sys_num_u32);
-    debug!("Syscall {} invoked: pid={}, sys_num={}, args={:?}", name, pid, sys_num, args);
+    #[cfg(feature = "strace")]
+    let trace_state = trace::trace_syscall_enter(mgr, pid, sys_num_u32, args);
     let result = match sys_num_u32 {
         __NR_read => fs::sys_read(mgr, pid, args[0], args[1], args[2]),
         __NR_write => fs::sys_write(mgr, pid, args[0], args[1], args[2]),
@@ -91,6 +93,7 @@ pub fn dispatch_syscall<'a>(
         Err(e) => map_error_to_errno(e),
     };
 
-    log_syscall_result(pid, name, sys_num_u32, args, ret);
+    #[cfg(feature = "strace")]
+    trace::trace_syscall_exit(mgr, pid, sys_num_u32, args, ret, &trace_state);
     ret
 }

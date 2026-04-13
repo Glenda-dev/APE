@@ -57,7 +57,10 @@ impl<'a> ApeManager<'a> {
         self.processes.remove(&pid);
 
         if panic_if_init && pid == 1 {
-            panic!("Init process faulted with exit code {:#x}, shutting down Ape service", exit_code);
+            panic!(
+                "Init process faulted with exit code {:#x}, shutting down Ape service",
+                exit_code
+            );
         }
 
         Ok(())

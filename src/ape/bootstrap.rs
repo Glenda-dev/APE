@@ -77,11 +77,7 @@ impl<'a> ApeManager<'a> {
     fn setup_view(&mut self) -> Result<(), Error> {
         let view_id = self.fs_client.create_view(Badge::null(), DEFAULT_VIEW_ROOT)?;
         self.fs_client.set_view(Badge::null(), view_id)?;
-        log!(
-            "bootstrap: switched to view {} with root {}",
-            view_id,
-            DEFAULT_VIEW_ROOT
-        );
+        log!("bootstrap: switched to view {} with root {}", view_id, DEFAULT_VIEW_ROOT);
         Ok(())
     }
 
