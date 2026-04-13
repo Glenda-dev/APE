@@ -1,29 +1,24 @@
 use crate::ApeManager;
-use crate::syscall::common::map_error_to_errno;
-use crate::syscall::{system, task};
-#[cfg(feature = "strace")]
-use crate::trace;
-use crate::{fs, init, mm};
+use crate::syscall::{fs as fs_sys, mm, system, task};
 use glenda::error::Error;
 use linux_raw_sys::general::*;
 
 #[allow(non_upper_case_globals)]
-pub fn dispatch_syscall<'a>(
+pub(crate) fn route_syscall<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,
     sys_num: usize,
     args: [usize; 6],
-) -> isize {
+) -> Result<isize, Error> {
     let sys_num_u32 = sys_num as u32;
-    #[cfg(feature = "strace")]
-    let trace_state = trace::trace_syscall_enter(mgr, pid, sys_num_u32, args);
-    let result = match sys_num_u32 {
-        __NR_read => fs::sys_read(mgr, pid, args[0], args[1], args[2]),
-        __NR_write => fs::sys_write(mgr, pid, args[0], args[1], args[2]),
-        __NR_readv => fs::sys_readv(mgr, pid, args[0], args[1], args[2]),
-        __NR_writev => fs::sys_writev(mgr, pid, args[0], args[1], args[2]),
-        __NR_openat => fs::sys_openat(mgr, pid, args[0], args[1], args[2], args[3]),
-        __NR_close => fs::sys_close(mgr, pid, args[0]),
+    match sys_num_u32 {
+        __NR_read => fs_sys::sys_read(mgr, pid, args[0], args[1], args[2]),
+        __NR_write => fs_sys::sys_write(mgr, pid, args[0], args[1], args[2]),
+        __NR_readv => fs_sys::sys_readv(mgr, pid, args[0], args[1], args[2]),
+        __NR_writev => fs_sys::sys_writev(mgr, pid, args[0], args[1], args[2]),
+        __NR_openat => fs_sys::sys_openat(mgr, pid, args[0], args[1], args[2], args[3]),
+        __NR_newfstatat => fs_sys::sys_newfstatat(mgr, pid, args[0], args[1], args[2], args[3]),
+        __NR_close => fs_sys::sys_close(mgr, pid, args[0]),
         __NR_getcwd => system::sys_getcwd(mgr, pid, args[0], args[1]),
         __NR_chdir => system::sys_chdir(mgr, pid, args[0]),
         __NR_fchdir => system::sys_fchdir(mgr, pid, args[0]),
@@ -48,10 +43,11 @@ pub fn dispatch_syscall<'a>(
         ),
         __NR_mprotect => mm::sys_mprotect(mgr, pid, args[0], args[1], args[2] as u32),
         __NR_munmap => mm::sys_munmap(mgr, pid, args[0], args[1]),
-        __NR_lseek => fs::sys_lseek(mgr, pid, args[0], args[1] as isize, args[2]),
-        __NR_fcntl => fs::sys_fcntl(mgr, pid, args[0], args[1], args[2]),
-        __NR_ioctl => fs::sys_ioctl(mgr, pid, args[0], args[1], args[2]),
-        __NR_execve => init::sys_execve(mgr, pid, args[0], args[1], args[2]),
+        __NR_mremap => mm::sys_mremap(mgr, pid, args[0], args[1], args[2], args[3] as u32, args[4]),
+        __NR_lseek => fs_sys::sys_lseek(mgr, pid, args[0], args[1] as isize, args[2]),
+        __NR_fcntl => fs_sys::sys_fcntl(mgr, pid, args[0], args[1], args[2]),
+        __NR_ioctl => fs_sys::sys_ioctl(mgr, pid, args[0], args[1], args[2]),
+        __NR_execve => task::sys_execve(mgr, pid, args[0], args[1], args[2]),
         __NR_rt_sigaction => system::sys_rt_sigaction(mgr, pid, args[0], args[1], args[2], args[3]),
         __NR_rt_sigsuspend => system::sys_rt_sigsuspend(mgr, pid, args[0], args[1]),
         __NR_rt_sigprocmask => {
@@ -85,15 +81,6 @@ pub fn dispatch_syscall<'a>(
         __NR_futex => {
             system::sys_futex(mgr, pid, args[0], args[1], args[2], args[3], args[4], args[5])
         }
-        _ => Err(Error::NotImplemented), // map ENOSYS later
-    };
-
-    let ret = match result {
-        Ok(ret) => ret,
-        Err(e) => map_error_to_errno(e),
-    };
-
-    #[cfg(feature = "strace")]
-    trace::trace_syscall_exit(mgr, pid, sys_num_u32, args, ret, &trace_state);
-    ret
+        _ => Err(Error::NotImplemented),
+    }
 }

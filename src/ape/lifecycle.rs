@@ -29,14 +29,11 @@ impl<'a> ApeManager<'a> {
     }
 
     fn kill_host_process_by_local_pid(&mut self, pid: usize) {
-        let host_pid = self
-            .host_pid_map
-            .iter()
-            .find_map(|(host_pid, local_pid)| (*local_pid == pid).then_some(*host_pid));
+        let host_pid = self.host_pid_by_local(pid);
 
         if let Some(host_pid) = host_pid {
             let _ = self.proc_client.kill(Badge::null(), host_pid);
-            self.host_pid_map.remove(&host_pid);
+            self.remove_host_pid_mapping(host_pid);
         }
     }
 
@@ -54,7 +51,7 @@ impl<'a> ApeManager<'a> {
         self.kill_host_process_by_local_pid(pid);
 
         let _ = self.release_process_intermediate_page_tables(pid);
-        self.processes.remove(&pid);
+        self.remove_process_record(pid);
 
         if panic_if_init && pid == 1 {
             panic!(

@@ -1,8 +1,5 @@
 #![allow(non_upper_case_globals)]
 
-mod names;
-mod result;
-
 use crate::ApeManager;
 use crate::ape::user::USER_PATH_MAX;
 use alloc::format;
@@ -12,59 +9,124 @@ use core::cmp::min;
 use core::mem::size_of;
 use linux_raw_sys::errno::*;
 use linux_raw_sys::general::*;
-use names::syscall_name;
-use result::format_result;
+use linux_raw_sys::ioctl::*;
 
 const TRACE_BUF_PREVIEW: usize = 64;
 
-const F_DUPFD: usize = 0;
-const F_GETFD: usize = 1;
-const F_SETFD: usize = 2;
-const F_GETFL: usize = 3;
-const F_SETFL: usize = 4;
-const F_DUPFD_CLOEXEC: usize = 1030;
-
-const TTY_IOCTL_TCGETS: usize = 0x5401;
-const TTY_IOCTL_TCSETS: usize = 0x5402;
-const TTY_IOCTL_TCSETSW: usize = 0x5403;
-const TTY_IOCTL_TCSETSF: usize = 0x5404;
-const TTY_IOCTL_TIOCGPGRP: usize = 0x540F;
-const TTY_IOCTL_TIOCSPGRP: usize = 0x5410;
-const TTY_IOCTL_TIOCGWINSZ: usize = 0x5413;
-const TTY_IOCTL_TIOCSWINSZ: usize = 0x5414;
-const PTY_IOCTL_TIOCGPTN: usize = 0x8004_5430;
-const PTY_IOCTL_TIOCSPTLCK: usize = 0x4004_5431;
-
-const FUTEX_CMD_MASK: usize = 0x7f;
-const FUTEX_PRIVATE_FLAG: usize = 128;
-const FUTEX_CLOCK_REALTIME: usize = 256;
-
-const FUTEX_WAIT: usize = 0;
-const FUTEX_WAKE: usize = 1;
-const FUTEX_FD: usize = 2;
-const FUTEX_REQUEUE: usize = 3;
-const FUTEX_CMP_REQUEUE: usize = 4;
-const FUTEX_WAKE_OP: usize = 5;
-const FUTEX_LOCK_PI: usize = 6;
-const FUTEX_UNLOCK_PI: usize = 7;
-const FUTEX_TRYLOCK_PI: usize = 8;
-const FUTEX_WAIT_BITSET: usize = 9;
-const FUTEX_WAKE_BITSET: usize = 10;
-const FUTEX_WAIT_REQUEUE_PI: usize = 11;
-const FUTEX_CMP_REQUEUE_PI: usize = 12;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct UserIovec {
-    iov_base: usize,
-    iov_len: usize,
+pub(crate) fn syscall_name(sys_num: u32) -> &'static str {
+    match sys_num {
+        __NR_set_tid_address => "set_tid_address",
+        __NR_gettid => "gettid",
+        __NR_getpid => "getpid",
+        __NR_getppid => "getppid",
+        __NR_exit => "exit",
+        __NR_exit_group => "exit_group",
+        __NR_brk => "brk",
+        __NR_mmap => "mmap",
+        __NR_mprotect => "mprotect",
+        __NR_munmap => "munmap",
+        __NR_mremap => "mremap",
+        __NR_lseek => "lseek",
+        __NR_fcntl => "fcntl",
+        __NR_ioctl => "ioctl",
+        __NR_read => "read",
+        __NR_write => "write",
+        __NR_readv => "readv",
+        __NR_writev => "writev",
+        __NR_openat => "openat",
+        __NR_newfstatat => "newfstatat",
+        __NR_close => "close",
+        __NR_getcwd => "getcwd",
+        __NR_chdir => "chdir",
+        __NR_fchdir => "fchdir",
+        __NR_chroot => "chroot",
+        __NR_uname => "uname",
+        __NR_rt_sigsuspend => "rt_sigsuspend",
+        __NR_rt_sigaction => "rt_sigaction",
+        __NR_rt_sigprocmask => "rt_sigprocmask",
+        __NR_rt_sigpending => "rt_sigpending",
+        __NR_rt_sigtimedwait => "rt_sigtimedwait",
+        __NR_set_robust_list => "set_robust_list",
+        __NR_prlimit64 => "prlimit64",
+        __NR_clock_gettime => "clock_gettime",
+        __NR_gettimeofday => "gettimeofday",
+        __NR_nanosleep => "nanosleep",
+        __NR_ppoll => "ppoll",
+        __NR_getrandom => "getrandom",
+        __NR_getuid => "getuid",
+        __NR_geteuid => "geteuid",
+        __NR_getgid => "getgid",
+        __NR_getegid => "getegid",
+        __NR_execve => "execve",
+        __NR_clone => "clone",
+        __NR_wait4 => "wait4",
+        __NR_setsid => "setsid",
+        __NR_getsid => "getsid",
+        __NR_setpgid => "setpgid",
+        __NR_getpgid => "getpgid",
+        __NR_kill => "kill",
+        __NR_reboot => "reboot",
+        __NR_sched_yield => "sched_yield",
+        __NR_prctl => "prctl",
+        __NR_futex => "futex",
+        _ => "unknown",
+    }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct UserTimespec {
-    tv_sec: isize,
-    tv_nsec: isize,
+pub(crate) fn format_result(sys_num: u32, ret: isize) -> String {
+    if ret >= 0 {
+        return match sys_num {
+            __NR_brk | __NR_mmap | __NR_mremap => format!("{:#x}", ret as usize),
+            _ => format!("{}", ret),
+        };
+    }
+
+    let errno = (-ret) as u32;
+    if let Some((name, desc)) = errno_name_desc(errno) {
+        format!("-1 {} ({})", name, desc)
+    } else {
+        format!("{}", ret)
+    }
+}
+
+fn errno_name_desc(errno: u32) -> Option<(&'static str, &'static str)> {
+    Some(match errno {
+        EPERM => ("EPERM", "Operation not permitted"),
+        ENOENT => ("ENOENT", "No such file or directory"),
+        ESRCH => ("ESRCH", "No such process"),
+        EINTR => ("EINTR", "Interrupted system call"),
+        EIO => ("EIO", "I/O error"),
+        ENXIO => ("ENXIO", "No such device or address"),
+        E2BIG => ("E2BIG", "Argument list too long"),
+        ENOEXEC => ("ENOEXEC", "Exec format error"),
+        EBADF => ("EBADF", "Bad file descriptor"),
+        ECHILD => ("ECHILD", "No child processes"),
+        EAGAIN => ("EAGAIN", "Resource temporarily unavailable"),
+        ENOMEM => ("ENOMEM", "Cannot allocate memory"),
+        EACCES => ("EACCES", "Permission denied"),
+        EFAULT => ("EFAULT", "Bad address"),
+        EBUSY => ("EBUSY", "Device or resource busy"),
+        EEXIST => ("EEXIST", "File exists"),
+        ENODEV => ("ENODEV", "No such device"),
+        ENOTDIR => ("ENOTDIR", "Not a directory"),
+        EISDIR => ("EISDIR", "Is a directory"),
+        EINVAL => ("EINVAL", "Invalid argument"),
+        ENFILE => ("ENFILE", "Too many open files in system"),
+        EMFILE => ("EMFILE", "Too many open files"),
+        ENOTTY => ("ENOTTY", "Inappropriate ioctl for device"),
+        ETXTBSY => ("ETXTBSY", "Text file busy"),
+        EFBIG => ("EFBIG", "File too large"),
+        ENOSPC => ("ENOSPC", "No space left on device"),
+        ESPIPE => ("ESPIPE", "Illegal seek"),
+        EROFS => ("EROFS", "Read-only file system"),
+        EMLINK => ("EMLINK", "Too many links"),
+        EPIPE => ("EPIPE", "Broken pipe"),
+        EDOM => ("EDOM", "Numerical argument out of domain"),
+        ERANGE => ("ERANGE", "Numerical result out of range"),
+        ENOSYS => ("ENOSYS", "Function not implemented"),
+        ETIMEDOUT => ("ETIMEDOUT", "Connection timed out"),
+        _ => return None,
+    })
 }
 
 pub struct TraceState {
@@ -297,31 +359,31 @@ fn trace_rw_vector<'a>(
     if let Some(iov0) = read_first_nonempty_iovec(mgr, pid, iov_ptr, iov_cnt)
         .or_else(|| read_user_iovec(mgr, pid, iov_ptr))
     {
+        let iov_base = iov0.iov_base as usize;
+        let iov_len = iov0.iov_len as usize;
+
         if is_write {
-            let preview =
-                preview_user_buffer(mgr, pid, iov0.iov_base, iov0.iov_len, TRACE_BUF_PREVIEW)
-                    .unwrap_or_else(|| format_ptr(iov0.iov_base));
+            let preview = preview_user_buffer(mgr, pid, iov_base, iov_len, TRACE_BUF_PREVIEW)
+                .unwrap_or_else(|| format_ptr(iov_base));
             return format!(
                 "writev({}, [{{iov_base={}, iov_len={}}}, ...], {})",
-                fd, preview, iov0.iov_len, iov_cnt
+                fd, preview, iov_len, iov_cnt
             );
         }
 
-        let first_base = format_ptr(iov0.iov_base);
+        let first_base = format_ptr(iov_base);
         if ret > 0 {
             let got = ret as usize;
-            if let Some(preview) =
-                preview_user_buffer(mgr, pid, iov0.iov_base, got, TRACE_BUF_PREVIEW)
-            {
+            if let Some(preview) = preview_user_buffer(mgr, pid, iov_base, got, TRACE_BUF_PREVIEW) {
                 return format!(
                     "readv({}, [{{iov_base={}, iov_len={}}}, ...], {})",
-                    fd, preview, iov0.iov_len, iov_cnt
+                    fd, preview, iov_len, iov_cnt
                 );
             }
         }
         return format!(
             "readv({}, [{{iov_base={}, iov_len={}}}, ...], {})",
-            fd, first_base, iov0.iov_len, iov_cnt
+            fd, first_base, iov_len, iov_cnt
         );
     }
 
@@ -601,15 +663,15 @@ fn preview_user_buffer<'a>(
     Some(format!("\"{}\"{}", escaped, suffix))
 }
 
-fn read_user_iovec<'a>(mgr: &mut ApeManager<'a>, pid: usize, ptr: usize) -> Option<UserIovec> {
+fn read_user_iovec<'a>(mgr: &mut ApeManager<'a>, pid: usize, ptr: usize) -> Option<iovec> {
     if ptr == 0 {
         return None;
     }
-    let mut raw = [0u8; size_of::<UserIovec>()];
+    let mut raw = [0u8; size_of::<iovec>()];
     if mgr.copy_from_user(pid, ptr, &mut raw).is_err() {
         return None;
     }
-    Some(unsafe { (raw.as_ptr() as *const UserIovec).read_unaligned() })
+    Some(unsafe { (raw.as_ptr() as *const iovec).read_unaligned() })
 }
 
 fn read_first_nonempty_iovec<'a>(
@@ -617,10 +679,10 @@ fn read_first_nonempty_iovec<'a>(
     pid: usize,
     iov_ptr: usize,
     iov_cnt: usize,
-) -> Option<UserIovec> {
+) -> Option<iovec> {
     let max_scan = core::cmp::min(iov_cnt, 8);
     for idx in 0..max_scan {
-        let ptr = iov_ptr.checked_add(idx.checked_mul(size_of::<UserIovec>())?)?;
+        let ptr = iov_ptr.checked_add(idx.checked_mul(size_of::<iovec>())?)?;
         let iov = read_user_iovec(mgr, pid, ptr)?;
         if iov.iov_len > 0 {
             return Some(iov);
@@ -633,15 +695,15 @@ fn read_user_timespec<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,
     ptr: usize,
-) -> Option<UserTimespec> {
+) -> Option<__kernel_timespec> {
     if ptr == 0 {
         return None;
     }
-    let mut raw = [0u8; size_of::<UserTimespec>()];
+    let mut raw = [0u8; size_of::<__kernel_timespec>()];
     if mgr.copy_from_user(pid, ptr, &mut raw).is_err() {
         return None;
     }
-    Some(unsafe { (raw.as_ptr() as *const UserTimespec).read_unaligned() })
+    Some(unsafe { (raw.as_ptr() as *const __kernel_timespec).read_unaligned() })
 }
 
 fn format_timespec<'a>(mgr: &mut ApeManager<'a>, pid: usize, ptr: usize) -> String {
@@ -837,6 +899,7 @@ fn format_whence(whence: u32) -> &'static str {
 }
 
 fn format_fcntl_cmd(cmd: usize) -> &'static str {
+    let cmd = cmd as u32;
     match cmd {
         F_DUPFD => "F_DUPFD",
         F_GETFD => "F_GETFD",
@@ -849,17 +912,18 @@ fn format_fcntl_cmd(cmd: usize) -> &'static str {
 }
 
 fn format_ioctl_req(req: usize) -> &'static str {
+    let req = req as u32;
     match req {
-        TTY_IOCTL_TCGETS => "TCGETS",
-        TTY_IOCTL_TCSETS => "TCSETS",
-        TTY_IOCTL_TCSETSW => "TCSETSW",
-        TTY_IOCTL_TCSETSF => "TCSETSF",
-        TTY_IOCTL_TIOCGPGRP => "TIOCGPGRP",
-        TTY_IOCTL_TIOCSPGRP => "TIOCSPGRP",
-        TTY_IOCTL_TIOCGWINSZ => "TIOCGWINSZ",
-        TTY_IOCTL_TIOCSWINSZ => "TIOCSWINSZ",
-        PTY_IOCTL_TIOCGPTN => "TIOCGPTN",
-        PTY_IOCTL_TIOCSPTLCK => "TIOCSPTLCK",
+        TCGETS => "TCGETS",
+        TCSETS => "TCSETS",
+        TCSETSW => "TCSETSW",
+        TCSETSF => "TCSETSF",
+        TIOCGPGRP => "TIOCGPGRP",
+        TIOCSPGRP => "TIOCSPGRP",
+        TIOCGWINSZ => "TIOCGWINSZ",
+        TIOCSWINSZ => "TIOCSWINSZ",
+        TIOCGPTN => "TIOCGPTN",
+        TIOCSPTLCK => "TIOCSPTLCK",
         _ => "IOCTL_?",
     }
 }
@@ -881,70 +945,71 @@ fn format_getrandom_flags(flags: u32) -> String {
 fn format_signal(sig: isize) -> String {
     let name = match sig {
         0 => "0",
-        1 => "SIGHUP",
-        2 => "SIGINT",
-        3 => "SIGQUIT",
-        4 => "SIGILL",
-        5 => "SIGTRAP",
-        6 => "SIGABRT",
-        7 => "SIGBUS",
-        8 => "SIGFPE",
-        9 => "SIGKILL",
-        10 => "SIGUSR1",
-        11 => "SIGSEGV",
-        12 => "SIGUSR2",
-        13 => "SIGPIPE",
-        14 => "SIGALRM",
-        15 => "SIGTERM",
-        16 => "SIGSTKFLT",
-        17 => "SIGCHLD",
-        18 => "SIGCONT",
-        19 => "SIGSTOP",
-        20 => "SIGTSTP",
-        21 => "SIGTTIN",
-        22 => "SIGTTOU",
-        23 => "SIGURG",
-        24 => "SIGXCPU",
-        25 => "SIGXFSZ",
-        26 => "SIGVTALRM",
-        27 => "SIGPROF",
-        28 => "SIGWINCH",
-        29 => "SIGIO",
-        30 => "SIGPWR",
-        31 => "SIGSYS",
+        x if x == SIGHUP as isize => "SIGHUP",
+        x if x == SIGINT as isize => "SIGINT",
+        x if x == SIGQUIT as isize => "SIGQUIT",
+        x if x == SIGILL as isize => "SIGILL",
+        x if x == SIGTRAP as isize => "SIGTRAP",
+        x if x == SIGABRT as isize => "SIGABRT",
+        x if x == SIGBUS as isize => "SIGBUS",
+        x if x == SIGFPE as isize => "SIGFPE",
+        x if x == SIGKILL as isize => "SIGKILL",
+        x if x == SIGUSR1 as isize => "SIGUSR1",
+        x if x == SIGSEGV as isize => "SIGSEGV",
+        x if x == SIGUSR2 as isize => "SIGUSR2",
+        x if x == SIGPIPE as isize => "SIGPIPE",
+        x if x == SIGALRM as isize => "SIGALRM",
+        x if x == SIGTERM as isize => "SIGTERM",
+        x if x == SIGSTKFLT as isize => "SIGSTKFLT",
+        x if x == SIGCHLD as isize => "SIGCHLD",
+        x if x == SIGCONT as isize => "SIGCONT",
+        x if x == SIGSTOP as isize => "SIGSTOP",
+        x if x == SIGTSTP as isize => "SIGTSTP",
+        x if x == SIGTTIN as isize => "SIGTTIN",
+        x if x == SIGTTOU as isize => "SIGTTOU",
+        x if x == SIGURG as isize => "SIGURG",
+        x if x == SIGXCPU as isize => "SIGXCPU",
+        x if x == SIGXFSZ as isize => "SIGXFSZ",
+        x if x == SIGVTALRM as isize => "SIGVTALRM",
+        x if x == SIGPROF as isize => "SIGPROF",
+        x if x == SIGWINCH as isize => "SIGWINCH",
+        x if x == SIGIO as isize => "SIGIO",
+        x if x == SIGPWR as isize => "SIGPWR",
+        x if x == SIGSYS as isize => "SIGSYS",
         _ => return format!("{}", sig),
     };
     if sig == 0 { "0".to_string() } else { name.to_string() }
 }
 
 fn format_sigmask_how(how: isize) -> &'static str {
-    match how {
-        0 => "SIG_BLOCK",
-        1 => "SIG_UNBLOCK",
-        2 => "SIG_SETMASK",
+    match how as u32 {
+        SIG_BLOCK => "SIG_BLOCK",
+        SIG_UNBLOCK => "SIG_UNBLOCK",
+        SIG_SETMASK => "SIG_SETMASK",
         _ => "SIGMASK_?",
     }
 }
 
 fn format_clockid(clockid: isize) -> &'static str {
-    match clockid {
-        0 => "CLOCK_REALTIME",
-        1 => "CLOCK_MONOTONIC",
-        2 => "CLOCK_PROCESS_CPUTIME_ID",
-        3 => "CLOCK_THREAD_CPUTIME_ID",
-        4 => "CLOCK_MONOTONIC_RAW",
-        5 => "CLOCK_REALTIME_COARSE",
-        6 => "CLOCK_MONOTONIC_COARSE",
-        7 => "CLOCK_BOOTTIME",
-        8 => "CLOCK_REALTIME_ALARM",
-        9 => "CLOCK_BOOTTIME_ALARM",
-        11 => "CLOCK_TAI",
+    match clockid as u32 {
+        CLOCK_REALTIME => "CLOCK_REALTIME",
+        CLOCK_MONOTONIC => "CLOCK_MONOTONIC",
+        CLOCK_PROCESS_CPUTIME_ID => "CLOCK_PROCESS_CPUTIME_ID",
+        CLOCK_THREAD_CPUTIME_ID => "CLOCK_THREAD_CPUTIME_ID",
+        CLOCK_MONOTONIC_RAW => "CLOCK_MONOTONIC_RAW",
+        CLOCK_REALTIME_COARSE => "CLOCK_REALTIME_COARSE",
+        CLOCK_MONOTONIC_COARSE => "CLOCK_MONOTONIC_COARSE",
+        CLOCK_BOOTTIME => "CLOCK_BOOTTIME",
+        CLOCK_REALTIME_ALARM => "CLOCK_REALTIME_ALARM",
+        CLOCK_BOOTTIME_ALARM => "CLOCK_BOOTTIME_ALARM",
+        CLOCK_TAI => "CLOCK_TAI",
         _ => "CLOCK_?",
     }
 }
 
 fn format_futex_op(op: usize) -> String {
-    let cmd = op & FUTEX_CMD_MASK;
+    let op = op as u32;
+    let cmd = op & (FUTEX_CMD_MASK as u32);
     let mut parts: Vec<&str> = Vec::new();
     let cmd_name = match cmd {
         FUTEX_WAIT => "FUTEX_WAIT",

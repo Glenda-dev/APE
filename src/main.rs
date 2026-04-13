@@ -15,10 +15,9 @@ mod io;
 mod layout;
 mod mm;
 mod net;
-mod proc;
 mod syscall;
-#[cfg(feature = "strace")]
-mod trace;
+mod system;
+mod task;
 
 pub use ape::ApeManager;
 

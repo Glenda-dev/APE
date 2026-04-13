@@ -363,6 +363,27 @@ impl<'a> ApeManager<'a> {
         self.with_user_session(pid, |sess| sess.copy_to_user(user_dst, src))
     }
 
+    /// 将用户地址空间 `[user_ptr, user_ptr + len)` 填充为 0。
+    pub fn write_zeros_to_user(
+        &mut self,
+        pid: usize,
+        user_ptr: usize,
+        len: usize,
+    ) -> Result<(), Error> {
+        if user_ptr == 0 || len == 0 {
+            return Ok(());
+        }
+
+        let mut done = 0usize;
+        let zeros = [0u8; 64];
+        while done < len {
+            let chunk = min(len - done, zeros.len());
+            self.copy_to_user(pid, user_ptr + done, &zeros[..chunk])?;
+            done += chunk;
+        }
+        Ok(())
+    }
+
     /// Linux 风格 `strncpy_from_user`：读取用户态 NUL 结尾字符串。
     ///
     /// - 成功：返回不带结尾 NUL 的 Rust `String`。

@@ -52,26 +52,23 @@ impl<'a> ApeManager<'a> {
                     config.stdio.seat_id,
                     config.stdio.devices.len()
                 );
-                self.config = config;
+                self.set_config(config);
             }
             Err(e) => {
                 warn!("bootstrap: load ape config failed: {:?}, using defaults", e);
-                self.config = ApeConfig::default();
+                self.set_config(ApeConfig::default());
             }
         }
     }
 
     fn mount_rootfs(&mut self) -> Result<(), Error> {
+        let root_partition = self.config().root_partition.clone();
         log!(
             "bootstrap: mounting rootfs partition {} -> {}",
-            self.config.root_partition,
+            root_partition,
             DEFAULT_VIEW_ROOT
         );
-        let target_ep = self.vol_client.mount_partition(
-            Badge::null(),
-            &self.config.root_partition,
-            ROOTFS_SLOT,
-        )?;
+        let target_ep = self.vol_client.mount_partition(Badge::null(), &root_partition, ROOTFS_SLOT)?;
         self.fs_client.mount(Badge::null(), DEFAULT_VIEW_ROOT, target_ep)?;
         log!("bootstrap: mounted rootfs successfully");
         Ok(())
@@ -85,13 +82,14 @@ impl<'a> ApeManager<'a> {
     }
 
     fn init_stdio(&mut self) -> Result<(), Error> {
-        let vt_name = if self.config.stdio.vt_name.is_empty() {
+        let cfg = self.config().clone();
+        let vt_name = if cfg.stdio.vt_name.is_empty() {
             DEFAULT_VT_NAME
         } else {
-            self.config.stdio.vt_name.as_str()
+            cfg.stdio.vt_name.as_str()
         };
-        let seat_id = self.config.stdio.seat_id;
-        let devices_to_bind = self.config.stdio.devices.clone();
+        let seat_id = cfg.stdio.seat_id;
+        let devices_to_bind = cfg.stdio.devices;
 
         let (vt_id, vt_ep) = self.vt_client.create_vt(Badge::null(), vt_name, STDIO_SLOT)?;
 
@@ -106,7 +104,7 @@ impl<'a> ApeManager<'a> {
 
         // 2. 创建 TerminalClient
         let term_client = TerminalClient::new(vt_ep);
-        self.stdio_term = Some(term_client);
+        self.set_stdio_term(Some(term_client));
 
         Ok(())
     }
@@ -128,7 +126,7 @@ impl<'a> ApeManager<'a> {
         log!("load_init: registered local init pid={}", pid);
 
         // 4. 为 init 进程初始化 stdio fds
-        if let Some(term) = self.stdio_term {
+        if let Some(term) = self.stdio_term() {
             set_terminal_foreground_pgrp(term, pid as i32)?;
 
             let proc = self.get_process_mut(pid).unwrap();
@@ -138,7 +136,7 @@ impl<'a> ApeManager<'a> {
             proc.next_fd = FIRST_USER_FD;
         }
 
-        let init_path = self.config.init_path.clone();
+        let init_path = self.config().init_path.clone();
         log!("load_init: execve init path={}", init_path);
         self.execve_path(pid, &init_path, &[], &[])?;
         log!("load_init: execve completed");

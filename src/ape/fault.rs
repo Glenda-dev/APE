@@ -1,5 +1,7 @@
 use crate::ApeManager;
 use crate::ape::process::{MemoryMap, MemoryType};
+#[cfg(feature = "strace")]
+use crate::ape::utils::strace;
 use crate::arch::constants::{INST_PAGE_FAULT, LOAD_PAGE_FAULT, STORE_PAGE_FAULT};
 use crate::syscall::dispatch_syscall;
 use alloc::vec::Vec;
@@ -410,7 +412,12 @@ impl<'a> FaultService for ApeManager<'a> {
         let sys_num = args[0];
         let sys_args = [args[1], args[2], args[3], args[4], args[5], args[6]];
 
+        #[cfg(feature = "strace")]
+        let trace_state = strace::trace_syscall_enter(mgr, pid, sys_num as u32, args);
+
         let ret = dispatch_syscall(&mut *self, pid, sys_num, sys_args);
+        #[cfg(feature = "strace")]
+        strace::trace_syscall_exit(mgr, pid, sys_num as u32, args, ret, &trace_state);
         let utcb = unsafe { UTCB::new() };
         // 关键：syscall 回包必须显式清理 capability 传递状态，
         // 否则可能携带之前 IPC（如 openat->nexus OPEN）的 HAS_CAP/CapPtr 残留。

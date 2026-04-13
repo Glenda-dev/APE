@@ -1,6 +1,7 @@
 use crate::ApeManager;
 use crate::ape::process::{MemoryMap, MemoryType};
 use alloc::vec::Vec;
+use core::cmp::min;
 use glenda::arch::mem::PGSIZE;
 use glenda::cap::{CapPtr, Frame};
 use glenda::error::Error;
@@ -59,6 +60,113 @@ fn range_is_free(process: &crate::ape::process::SubProcess, start: usize, end: u
     }
 
     true
+}
+
+fn range_is_free_excluding(
+    process: &crate::ape::process::SubProcess,
+    start: usize,
+    end: usize,
+    except_start: usize,
+    except_end: usize,
+) -> bool {
+    if end > process.mmap_limit || start < process.mmap_base || start >= end {
+        return false;
+    }
+
+    if has_overlap(
+        start,
+        end,
+        process.heap_start,
+        process.heap_brk.saturating_sub(process.heap_start),
+    ) {
+        return false;
+    }
+
+    let stack_low = process.stack_bottom.saturating_sub(process.max_stack_size);
+    if has_overlap(start, end, stack_low, process.max_stack_size) {
+        return false;
+    }
+
+    for map in process.memory_maps.values() {
+        if has_overlap(start, end, map.vaddr, map.size) {
+            let map_end = map.vaddr.saturating_add(map.size);
+            let in_except = map.vaddr >= except_start && map_end <= except_end;
+            if !in_except {
+                return false;
+            }
+        }
+    }
+
+    for map in process.lazy_memory_maps.values() {
+        if has_overlap(start, end, map.vaddr, map.size) {
+            let map_end = map.vaddr.saturating_add(map.size);
+            let in_except = map.vaddr >= except_start && map_end <= except_end;
+            if !in_except {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+#[derive(Clone, Copy)]
+enum RemapPageState {
+    Mapped { frame_cap: usize, flags: Perms },
+    Lazy { flags: Perms },
+}
+
+impl RemapPageState {
+    fn flags(self) -> Perms {
+        match self {
+            Self::Mapped { flags, .. } | Self::Lazy { flags } => flags,
+        }
+    }
+}
+
+fn collect_remap_states(
+    process: &crate::ape::process::SubProcess,
+    old_addr: usize,
+    old_len: usize,
+) -> Result<Vec<RemapPageState>, Error> {
+    let mut out = Vec::new();
+    for page in (old_addr..old_addr + old_len).step_by(PGSIZE) {
+        if let Some(map) = process.memory_maps.get(&page) {
+            if map.mem_type != MemoryType::Anonymous || map.size != PGSIZE {
+                return Err(Error::InvalidArgs);
+            }
+            out.push(RemapPageState::Mapped {
+                frame_cap: map.frame_cap,
+                flags: map.flags,
+            });
+            continue;
+        }
+
+        if let Some(map) = process.lazy_memory_maps.get(&page) {
+            if map.mem_type != MemoryType::Anonymous || map.size != PGSIZE {
+                return Err(Error::InvalidArgs);
+            }
+            out.push(RemapPageState::Lazy { flags: map.flags });
+            continue;
+        }
+
+        return Err(Error::InvalidAddress);
+    }
+    Ok(out)
+}
+
+fn find_free_remap_target(process: &crate::ape::process::SubProcess, len_aligned: usize) -> Option<usize> {
+    let mut candidate = process.mmap_next.max(process.mmap_base);
+    while let Some(end) = candidate.checked_add(len_aligned) {
+        if end > process.mmap_limit {
+            break;
+        }
+        if range_is_free(process, candidate, end) {
+            return Some(candidate);
+        }
+        candidate = candidate.saturating_add(PGSIZE);
+    }
+    None
 }
 
 pub(crate) fn do_brk<'a>(
@@ -305,38 +413,214 @@ pub(crate) fn do_mprotect<'a>(
     Ok(0)
 }
 
-pub fn sys_brk<'a>(mgr: &mut ApeManager<'a>, pid: usize, addr: usize) -> Result<isize, Error> {
-    Ok(do_brk(mgr, pid, addr)? as isize)
-}
-
-pub fn sys_mmap<'a>(
+pub(crate) fn do_mremap<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,
-    addr: usize,
-    len: usize,
-    prot: u32,
+    old_addr: usize,
+    old_size: usize,
+    new_size: usize,
     flags: u32,
-    fd: usize,
-    offset: usize,
-) -> Result<isize, Error> {
-    Ok(do_mmap(mgr, pid, addr, len, prot, flags, fd, offset)? as isize)
+    new_addr: usize,
+) -> Result<usize, Error> {
+    if old_size == 0 || new_size == 0 || old_addr % PGSIZE != 0 {
+        return Err(Error::InvalidArgs);
+    }
+
+    let allowed = MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP;
+    if flags & !allowed != 0 || (flags & MREMAP_DONTUNMAP) != 0 {
+        return Err(Error::InvalidArgs);
+    }
+    if (flags & MREMAP_FIXED) != 0 && (flags & MREMAP_MAYMOVE) == 0 {
+        return Err(Error::InvalidArgs);
+    }
+
+    let old_len = align_up(old_size, PGSIZE);
+    let new_len = align_up(new_size, PGSIZE);
+    let old_end = old_addr.checked_add(old_len).ok_or(Error::OutOfMemory)?;
+    let new_end_in_place = old_addr.checked_add(new_len).ok_or(Error::OutOfMemory)?;
+    let old_pages = old_len / PGSIZE;
+    let new_pages = new_len / PGSIZE;
+
+    let page_states = {
+        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        collect_remap_states(process, old_addr, old_len)?
+    };
+    let base_flags = page_states
+        .first()
+        .map(|s| s.flags())
+        .unwrap_or(Perms::READ | Perms::WRITE);
+
+    if (flags & MREMAP_FIXED) == 0 {
+        if new_len <= old_len {
+            if new_len < old_len {
+                do_munmap(mgr, pid, old_addr + new_len, old_len - new_len)?;
+            }
+            return Ok(old_addr);
+        }
+
+        let can_expand_in_place = {
+            let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+            range_is_free_excluding(process, old_addr, new_end_in_place, old_addr, old_end)
+        };
+
+        if can_expand_in_place {
+            let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+            for page in (old_end..new_end_in_place).step_by(PGSIZE) {
+                process.add_lazy_memory_map(MemoryMap {
+                    vaddr: page,
+                    paddr: 0,
+                    size: PGSIZE,
+                    flags: base_flags,
+                    mem_type: MemoryType::Anonymous,
+                    cow: false,
+                    frame_cap: 0,
+                });
+            }
+            process.mmap_next = process.mmap_next.max(new_end_in_place);
+            return Ok(old_addr);
+        }
+
+        if (flags & MREMAP_MAYMOVE) == 0 {
+            return Err(Error::OutOfMemory);
+        }
+    }
+
+    let target = if (flags & MREMAP_FIXED) != 0 {
+        if new_addr % PGSIZE != 0 {
+            return Err(Error::InvalidArgs);
+        }
+        new_addr
+    } else {
+        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        find_free_remap_target(process, new_len).ok_or(Error::OutOfMemory)?
+    };
+    let target_end = target.checked_add(new_len).ok_or(Error::OutOfMemory)?;
+
+    if target == old_addr {
+        if new_len < old_len {
+            do_munmap(mgr, pid, old_addr + new_len, old_len - new_len)?;
+        } else if new_len > old_len {
+            let can_expand_in_place = {
+                let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+                range_is_free_excluding(process, old_addr, target_end, old_addr, old_end)
+            };
+            if !can_expand_in_place {
+                return Err(Error::OutOfMemory);
+            }
+
+            let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+            for page in (old_end..target_end).step_by(PGSIZE) {
+                process.add_lazy_memory_map(MemoryMap {
+                    vaddr: page,
+                    paddr: 0,
+                    size: PGSIZE,
+                    flags: base_flags,
+                    mem_type: MemoryType::Anonymous,
+                    cow: false,
+                    frame_cap: 0,
+                });
+            }
+            process.mmap_next = process.mmap_next.max(target_end);
+        }
+        return Ok(old_addr);
+    }
+
+    if has_overlap(target, target_end, old_addr, old_len) {
+        return Err(Error::InvalidArgs);
+    }
+
+    {
+        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        if !range_is_free(process, target, target_end) {
+            return Err(Error::OutOfMemory);
+        }
+    }
+
+    let copy_pages = min(old_pages, new_pages);
+    let mut old_mapped_pages = Vec::new();
+    for (idx, state) in page_states.iter().enumerate() {
+        if let RemapPageState::Mapped { .. } = state {
+            old_mapped_pages.push(old_addr + idx * PGSIZE);
+        }
+    }
+
+    let mut mapped_dst_pages = Vec::new();
+    for i in 0..copy_pages {
+        if let RemapPageState::Mapped { frame_cap, flags } = page_states[i]
+            && let Err(e) = mgr.map_process_frame(
+                pid,
+                Frame::from(CapPtr::from(frame_cap)),
+                target + i * PGSIZE,
+                flags,
+                1,
+            )
+        {
+            for page in mapped_dst_pages {
+                let _ = mgr.unmap_process_pages(pid, page, 1);
+            }
+            return Err(e);
+        }
+
+        if matches!(page_states[i], RemapPageState::Mapped { .. }) {
+            mapped_dst_pages.push(target + i * PGSIZE);
+        }
+    }
+
+    {
+        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+        for page in (old_addr..old_end).step_by(PGSIZE) {
+            process.memory_maps.remove(&page);
+            process.lazy_memory_maps.remove(&page);
+        }
+
+        for i in 0..copy_pages {
+            let vaddr = target + i * PGSIZE;
+            match page_states[i] {
+                RemapPageState::Mapped { frame_cap, flags } => {
+                    process.add_memory_map(MemoryMap {
+                        vaddr,
+                        paddr: 0,
+                        size: PGSIZE,
+                        flags,
+                        mem_type: MemoryType::Anonymous,
+                        cow: false,
+                        frame_cap,
+                    });
+                }
+                RemapPageState::Lazy { flags } => {
+                    process.add_lazy_memory_map(MemoryMap {
+                        vaddr,
+                        paddr: 0,
+                        size: PGSIZE,
+                        flags,
+                        mem_type: MemoryType::Anonymous,
+                        cow: false,
+                        frame_cap: 0,
+                    });
+                }
+            }
+        }
+
+        for i in copy_pages..new_pages {
+            let vaddr = target + i * PGSIZE;
+            process.add_lazy_memory_map(MemoryMap {
+                vaddr,
+                paddr: 0,
+                size: PGSIZE,
+                flags: base_flags,
+                mem_type: MemoryType::Anonymous,
+                cow: false,
+                frame_cap: 0,
+            });
+        }
+
+        process.mmap_next = process.mmap_next.max(target_end);
+    }
+
+    for page in old_mapped_pages {
+        let _ = mgr.unmap_process_pages(pid, page, 1);
+    }
+
+    Ok(target)
 }
 
-pub fn sys_munmap<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    addr: usize,
-    len: usize,
-) -> Result<isize, Error> {
-    do_munmap(mgr, pid, addr, len)
-}
-
-pub fn sys_mprotect<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    addr: usize,
-    len: usize,
-    prot: u32,
-) -> Result<isize, Error> {
-    do_mprotect(mgr, pid, addr, len, prot)
-}

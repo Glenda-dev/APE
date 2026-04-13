@@ -1,6 +1,5 @@
 use crate::ApeManager;
 use crate::ape::process::{MemoryMap, MemoryType};
-use crate::ape::user::ExecveUserInput;
 use crate::elf::{ET_DYN, ET_EXEC, ElfFile, PF_W, PF_X, PT_LOAD, PT_PHDR};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -52,7 +51,7 @@ impl<'a> ApeManager<'a> {
 
         for fd in cloexec_fds {
             log!("execve: closing cloexec fd {} for pid {}", fd, pid);
-            let _ = crate::fs::sys_close(self, pid, fd as usize)?;
+            let _ = crate::fs::fd::do_close(self, pid, fd as usize)?;
         }
 
         Ok(())
@@ -465,29 +464,4 @@ impl<'a> ApeManager<'a> {
     ) -> Result<(), Error> {
         self.do_execve_path(pid, path, argv, envp)
     }
-}
-
-pub(crate) fn do_execve<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    filename_ptr: usize,
-    argv_ptr: usize,
-    envp_ptr: usize,
-) -> Result<(), Error> {
-    let exec_input: ExecveUserInput =
-        mgr.parse_execve_user_input(pid, filename_ptr, argv_ptr, envp_ptr)?;
-
-    // 保持行为与 Linux 接近：允许 filename 与 argv[0] 不同。
-    mgr.do_execve_path(pid, &exec_input.filename, &exec_input.argv, &exec_input.envp)
-}
-
-pub fn sys_execve<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    filename_ptr: usize,
-    argv_ptr: usize,
-    envp_ptr: usize,
-) -> Result<isize, Error> {
-    do_execve(mgr, pid, filename_ptr, argv_ptr, envp_ptr)?;
-    Ok(0)
 }

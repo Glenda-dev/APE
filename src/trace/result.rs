@@ -8,7 +8,7 @@ use linux_raw_sys::general::*;
 pub(crate) fn format_result(sys_num: u32, ret: isize) -> String {
     if ret >= 0 {
         return match sys_num {
-            __NR_brk | __NR_mmap => format!("{:#x}", ret as usize),
+            __NR_brk | __NR_mmap | __NR_mremap => format!("{:#x}", ret as usize),
             _ => format!("{}", ret),
         };
     }
