@@ -3,13 +3,11 @@ use crate::ape::path::resolve_path;
 use crate::ape::process::FileType;
 use crate::ape::user::USER_PATH_MAX;
 use crate::ape::utils::linux_conv::{fs_stat_to_linux_stat, make_linux_char_device_stat};
-use crate::ape::utils::write_obj_to_user;
 use glenda::error::Error;
 use glenda::interface::{FileHandleService, FileSystemService};
 use glenda::ipc::Badge;
 use linux_raw_sys::general::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW, S_IFCHR, S_IFDIR, S_IFMT,
-    stat,
+    AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW, S_IFCHR, S_IFDIR, S_IFMT, stat,
 };
 
 const FSTATAT_ALLOWED_FLAGS: u32 = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT;
@@ -67,7 +65,7 @@ pub(crate) fn do_newfstatat<'a>(
             }
         };
 
-        write_obj_to_user(mgr, pid, statbuf, &st)?;
+        mgr.write_obj_to_user(pid, statbuf, &st)?;
         return Ok(0);
     }
 
@@ -103,6 +101,6 @@ pub(crate) fn do_newfstatat<'a>(
     };
 
     let st = fs_stat_to_linux_stat(fs_stat);
-    write_obj_to_user(mgr, pid, statbuf, &st)?;
+    mgr.write_obj_to_user(pid, statbuf, &st)?;
     Ok(0)
 }

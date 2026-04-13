@@ -410,4 +410,15 @@ impl<'a> ApeManager<'a> {
             sess.parse_execve_user_input(filename_ptr, argv_ptr, envp_ptr)
         })
     }
+
+    pub(crate) fn write_obj_to_user<T>(
+        &mut self,
+        pid: usize,
+        user_ptr: usize,
+        obj: &T,
+    ) -> Result<(), Error> {
+        let bytes =
+            unsafe { core::slice::from_raw_parts((obj as *const T) as *const u8, size_of::<T>()) };
+        self.copy_to_user(pid, user_ptr, bytes)
+    }
 }
