@@ -199,11 +199,7 @@ fn pollin_ready_for_fd<'a>(mgr: &mut ApeManager<'a>, pid: usize, fd: u32) -> Res
         }
     };
 
-    if let Some(term) = term {
-        terminal_poll_readable(term)
-    } else {
-        Ok(true)
-    }
+    if let Some(term) = term { terminal_poll_readable(term) } else { Ok(true) }
 }
 
 pub fn sys_uname<'a>(mgr: &mut ApeManager<'a>, pid: usize, buf_ptr: usize) -> Result<isize, Error> {
@@ -399,7 +395,8 @@ pub fn sys_ppoll<'a>(
                     ready_count += 1;
                 } else {
                     let mut revents = 0i16;
-                    if (pfd.events & (POLLIN | POLLPRI)) != 0 && pollin_ready_for_fd(mgr, pid, fd)? {
+                    if (pfd.events & (POLLIN | POLLPRI)) != 0 && pollin_ready_for_fd(mgr, pid, fd)?
+                    {
                         revents |= POLLIN;
                     }
                     if (pfd.events & POLLOUT) != 0 {

@@ -45,9 +45,12 @@ impl<'a> ApeManager<'a> {
         match ApeConfig::load(self.res_client, self.cspace_mgr, self.vspace_mgr) {
             Ok(config) => {
                 log!(
-                    "bootstrap: loaded ape config (init_path={}, root_partition={})",
+                    "bootstrap: loaded ape config (init_path={}, root_partition={}, stdio_vt={}, seat_id={}, devices={})",
                     config.init_path,
-                    config.root_partition
+                    config.root_partition,
+                    config.stdio.vt_name,
+                    config.stdio.seat_id,
+                    config.stdio.devices.len()
                 );
                 self.config = config;
             }
@@ -82,14 +85,24 @@ impl<'a> ApeManager<'a> {
     }
 
     fn init_stdio(&mut self) -> Result<(), Error> {
-        let (vt_id, vt_ep) =
-            self.vt_client.create_vt(Badge::null(), DEFAULT_VT_NAME, STDIO_SLOT)?;
+        let vt_name = if self.config.stdio.vt_name.is_empty() {
+            DEFAULT_VT_NAME
+        } else {
+            self.config.stdio.vt_name.as_str()
+        };
+        let seat_id = self.config.stdio.seat_id;
+        let devices_to_bind = self.config.stdio.devices.clone();
 
-        // 将 stdio VT 绑定到系统默认 Seat(0)，并切换为前台活动 VT。
-        // 否则 Prism 默认仍在 VT0，APE 写入 VT1 的提示符不会被路由到串口，
-        // 且 UART 输入也会继续注入 VT0，导致“无提示符/无法输入”。
-        self.vt_client.bind_seat(Badge::null(), 0, vt_id)?;
-        self.vt_client.switch_vt(Badge::null(), 0, vt_id)?;
+        let (vt_id, vt_ep) = self.vt_client.create_vt(Badge::null(), vt_name, STDIO_SLOT)?;
+
+        // 将 stdio VT 绑定到指定 seat 并切换为前台活动 VT。
+        self.vt_client.bind_seat(Badge::null(), seat_id, vt_id)?;
+        self.vt_client.switch_vt(Badge::null(), seat_id, vt_id)?;
+
+        for dev in devices_to_bind {
+            self.vt_client.assign_device_to_seat(Badge::null(), seat_id, dev.as_str())?;
+            log!("bootstrap: bound device {} to seat {}", dev, seat_id);
+        }
 
         // 2. 创建 TerminalClient
         let term_client = TerminalClient::new(vt_ep);

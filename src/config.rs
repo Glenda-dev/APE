@@ -11,15 +11,65 @@ use serde::{Deserialize, Serialize};
 
 pub const APE_CONFIG_PATH: &str = "ape.json";
 
+fn default_init_path() -> String {
+    String::from("/bin/sh")
+}
+
+fn default_root_partition() -> String {
+    String::from("disk0p0")
+}
+
+fn default_stdio_vt_name() -> String {
+    String::from("vt0")
+}
+
+fn default_stdio_seat_id() -> usize {
+    0
+}
+
+fn default_stdio_devices() -> alloc::vec::Vec<String> {
+    alloc::vec![String::from("uart0")]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApeStdioConfig {
+    #[serde(default = "default_stdio_vt_name")]
+    pub vt_name: String,
+    #[serde(default = "default_stdio_seat_id")]
+    pub seat_id: usize,
+    #[serde(default = "default_stdio_devices")]
+    pub devices: alloc::vec::Vec<String>,
+}
+
+impl Default for ApeStdioConfig {
+    fn default() -> Self {
+        Self {
+            vt_name: default_stdio_vt_name(),
+            seat_id: default_stdio_seat_id(),
+            devices: default_stdio_devices(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ApeConfig {
+    #[serde(default = "default_init_path")]
     pub init_path: String,
+    #[serde(default = "default_root_partition")]
     pub root_partition: String,
+    #[serde(default)]
+    pub stdio: ApeStdioConfig,
 }
 
 impl Default for ApeConfig {
     fn default() -> Self {
-        Self { init_path: String::from("/bin/sh"), root_partition: String::from("disk0p0") }
+        Self {
+            init_path: default_init_path(),
+            root_partition: default_root_partition(),
+            stdio: ApeStdioConfig::default(),
+        }
     }
 }
 
