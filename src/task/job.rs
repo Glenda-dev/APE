@@ -1,6 +1,6 @@
 use crate::ApeManager;
-use crate::ape::utils::linux_conv::get_exit_code_for_signal;
 use crate::ape::process::{SIGNAL_MAX, signal_bit};
+use crate::ape::utils::linux_conv::get_exit_code_for_signal;
 use glenda::error::Error;
 use linux_raw_sys::errno::{EINVAL, ESRCH};
 use linux_raw_sys::general::{SIGCONT, SIGKILL, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU};
@@ -100,10 +100,8 @@ pub(crate) fn do_kill(
             targets.push(target);
         }
     } else if target_pid == 0 {
-        let caller_group = mgr
-            .get_process(caller_pid)
-            .map(|p| p.process_group_id)
-            .unwrap_or(caller_pid);
+        let caller_group =
+            mgr.get_process(caller_pid).map(|p| p.process_group_id).unwrap_or(caller_pid);
         for pid in pids {
             if mgr
                 .get_process(pid)
@@ -160,7 +158,8 @@ pub(crate) fn do_kill(
             for target in targets.iter().copied() {
                 if let Some(proc) = mgr.get_process_mut(target) {
                     // SIGCONT 会清理 stop 类 pending。
-                    for stop_sig in [SIGSTOP as usize, SIGTSTP as usize, SIGTTIN as usize, SIGTTOU as usize]
+                    for stop_sig in
+                        [SIGSTOP as usize, SIGTSTP as usize, SIGTTIN as usize, SIGTTOU as usize]
                     {
                         if let Some(bit) = signal_bit(stop_sig) {
                             proc.signal_pending &= !bit;

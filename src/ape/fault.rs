@@ -4,10 +4,8 @@ use crate::ape::utils::linux_conv::get_exit_code_for_signal;
 #[cfg(feature = "strace")]
 use crate::ape::utils::strace;
 use crate::arch::constants::{INST_PAGE_FAULT, LOAD_PAGE_FAULT, STORE_PAGE_FAULT};
-use crate::system::signal::{
-    PendingSignalAction, consume_deliverable_signal_on_syscall_return,
-};
 use crate::syscall::dispatch_syscall;
+use crate::system::signal::{PendingSignalAction, consume_deliverable_signal_on_syscall_return};
 use alloc::vec::Vec;
 use glenda::arch::mem::{PGSIZE, SHIFTS};
 use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Frame, PageTable};

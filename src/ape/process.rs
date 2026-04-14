@@ -26,11 +26,7 @@ pub struct SignalAction {
 
 #[inline]
 pub fn signal_bit(signum: usize) -> Option<u64> {
-    if (SIGNAL_MIN..=SIGNAL_MAX).contains(&signum) {
-        Some(1u64 << (signum - 1))
-    } else {
-        None
-    }
+    if (SIGNAL_MIN..=SIGNAL_MAX).contains(&signum) { Some(1u64 << (signum - 1)) } else { None }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

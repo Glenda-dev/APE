@@ -1,7 +1,5 @@
 use crate::ApeManager;
-use crate::ape::process::{
-    SIGNAL_MAX, SIGNAL_UNBLOCKABLE_MASK, SignalAction, SubProcess,
-};
+use crate::ape::process::{SIGNAL_MAX, SIGNAL_UNBLOCKABLE_MASK, SignalAction, SubProcess};
 use crate::ape::utils::linux_conv::get_exit_code_for_signal;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -12,8 +10,8 @@ use glenda::interface::TimeService;
 use glenda::ipc::Badge;
 use linux_raw_sys::errno::{EAGAIN, EINTR, EINVAL, ENOSYS};
 use linux_raw_sys::general::{
-    SIGCHLD, SIGCONT, SIGKILL, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGWINCH,
-    SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, __kernel_timespec,
+    __kernel_timespec, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SIGCHLD, SIGCONT, SIGKILL, SIGSTOP,
+    SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGWINCH,
 };
 
 const SIGACTION_HEAD_WORDS: usize = 3;
@@ -139,9 +137,7 @@ fn timespec_to_ns(ts: __kernel_timespec) -> Result<u64, Error> {
     }
     let sec = ts.tv_sec as u64;
     let nsec = ts.tv_nsec as u64;
-    sec.checked_mul(NSEC_PER_SEC)
-        .and_then(|v| v.checked_add(nsec))
-        .ok_or(Error::OutOfMemory)
+    sec.checked_mul(NSEC_PER_SEC).and_then(|v| v.checked_add(nsec)).ok_or(Error::OutOfMemory)
 }
 
 fn parse_timeout_deadline(

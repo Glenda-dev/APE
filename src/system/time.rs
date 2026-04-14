@@ -7,10 +7,10 @@ use glenda::ipc::Badge;
 use linux_raw_sys::ctypes::c_char;
 use linux_raw_sys::errno::{EINTR, EINVAL};
 use linux_raw_sys::general::{
-    CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE,
-    CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_ALARM,
-    CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, __kernel_timespec, RLIM64_INFINITY,
-    rlimit64, timeval,
+    __kernel_timespec, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC,
+    CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
+    CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID,
+    RLIM64_INFINITY, rlimit64, timeval,
 };
 use linux_raw_sys::system::{__NEW_UTS_LEN, new_utsname};
 
@@ -55,9 +55,7 @@ fn timespec_to_ns(ts: __kernel_timespec) -> Result<u64, Error> {
 
     let sec = ts.tv_sec as u64;
     let nsec = ts.tv_nsec as u64;
-    sec.checked_mul(NSEC_PER_SEC)
-        .and_then(|v| v.checked_add(nsec))
-        .ok_or(Error::OutOfMemory)
+    sec.checked_mul(NSEC_PER_SEC).and_then(|v| v.checked_add(nsec)).ok_or(Error::OutOfMemory)
 }
 
 #[inline]
