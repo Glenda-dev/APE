@@ -1,11 +1,86 @@
 use crate::ApeManager;
 use core::cmp::min;
+use core::mem::size_of;
 use glenda::error::Error;
+use glenda::interface::TimeService;
+use glenda::ipc::Badge;
 use linux_raw_sys::ctypes::c_char;
-use linux_raw_sys::general::{__kernel_timespec, RLIM64_INFINITY, rlimit64, timeval};
+use linux_raw_sys::errno::{EINTR, EINVAL};
+use linux_raw_sys::general::{
+    CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE,
+    CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_ALARM,
+    CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, __kernel_timespec, RLIM64_INFINITY,
+    rlimit64, timeval,
+};
 use linux_raw_sys::system::{__NEW_UTS_LEN, new_utsname};
 
 const UTS_STR_LEN: usize = (__NEW_UTS_LEN as usize) + 1;
+const NSEC_PER_SEC: u64 = 1_000_000_000;
+const NSEC_PER_USEC: u64 = 1_000;
+const SLEEP_POLL_MS: usize = 4;
+
+#[inline]
+fn ns_to_timespec(ns: u64) -> __kernel_timespec {
+    __kernel_timespec {
+        tv_sec: i64::try_from(ns / NSEC_PER_SEC).unwrap_or(i64::MAX),
+        tv_nsec: i64::try_from(ns % NSEC_PER_SEC).unwrap_or(0),
+    }
+}
+
+#[inline]
+fn ns_to_timeval(ns: u64) -> timeval {
+    timeval {
+        tv_sec: i64::try_from(ns / NSEC_PER_SEC).unwrap_or(i64::MAX),
+        tv_usec: i64::try_from((ns % NSEC_PER_SEC) / NSEC_PER_USEC).unwrap_or(0),
+    }
+}
+
+fn read_user_timespec(
+    mgr: &mut ApeManager<'_>,
+    pid: usize,
+    ptr: usize,
+) -> Result<__kernel_timespec, Error> {
+    if ptr == 0 {
+        return Err(Error::InvalidAddress);
+    }
+    let mut raw = [0u8; size_of::<__kernel_timespec>()];
+    mgr.copy_from_user(pid, ptr, &mut raw)?;
+    Ok(unsafe { (raw.as_ptr() as *const __kernel_timespec).read_unaligned() })
+}
+
+fn timespec_to_ns(ts: __kernel_timespec) -> Result<u64, Error> {
+    if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        return Err(Error::InvalidArgs);
+    }
+
+    let sec = ts.tv_sec as u64;
+    let nsec = ts.tv_nsec as u64;
+    sec.checked_mul(NSEC_PER_SEC)
+        .and_then(|v| v.checked_add(nsec))
+        .ok_or(Error::OutOfMemory)
+}
+
+#[inline]
+fn select_clock_source(clockid: usize) -> Option<bool> {
+    Some(match clockid as u32 {
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM | CLOCK_TAI => true,
+        CLOCK_MONOTONIC
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME
+        | CLOCK_BOOTTIME_ALARM
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID => false,
+        _ => return None,
+    })
+}
+
+#[inline]
+fn has_deliverable_signal(mgr: &ApeManager<'_>, pid: usize) -> bool {
+    mgr.get_process(pid)
+        .map(|proc| (proc.signal_pending & !proc.signal_blocked) != 0)
+        .unwrap_or(false)
+}
 
 fn write_cstr(dst: &mut [c_char; UTS_STR_LEN], src: &str) {
     dst.fill(0 as c_char);
@@ -60,14 +135,23 @@ pub(crate) fn do_prlimit64(
 pub(crate) fn do_clock_gettime(
     mgr: &mut ApeManager<'_>,
     pid: usize,
-    _clockid: usize,
+    clockid: usize,
     tp: usize,
 ) -> Result<isize, Error> {
-    // TODO(ape): 对接计时服务并支持不同 clockid 的真实时间源。
     if tp == 0 {
         return Err(Error::InvalidAddress);
     }
-    let ts = __kernel_timespec { tv_sec: 0, tv_nsec: 0 };
+
+    let Some(use_realtime) = select_clock_source(clockid) else {
+        return Ok(-(EINVAL as isize));
+    };
+    let ns = if use_realtime {
+        mgr.time_client.time_now(Badge::null())?
+    } else {
+        mgr.time_client.mono_now(Badge::null())?
+    };
+
+    let ts = ns_to_timespec(ns);
     mgr.write_obj_to_user(pid, tp, &ts)?;
     Ok(0)
 }
@@ -78,9 +162,9 @@ pub(crate) fn do_gettimeofday(
     tv: usize,
     _tz: usize,
 ) -> Result<isize, Error> {
-    // TODO(ape): 返回真实 wall-clock 时间，保留与 Linux 的 timeval 兼容行为。
     if tv != 0 {
-        let tv_obj = timeval { tv_sec: 0, tv_usec: 0 };
+        let ns = mgr.time_client.time_now(Badge::null())?;
+        let tv_obj = ns_to_timeval(ns);
         mgr.write_obj_to_user(pid, tv, &tv_obj)?;
     }
     Ok(0)
@@ -89,13 +173,47 @@ pub(crate) fn do_gettimeofday(
 pub(crate) fn do_nanosleep(
     mgr: &mut ApeManager<'_>,
     pid: usize,
-    _req: usize,
+    req: usize,
     rem: usize,
 ) -> Result<isize, Error> {
-    // TODO(ape): 实现可中断 sleep，并在 EINTR 时回填剩余时间到 rem。
-    if rem != 0 {
-        let ts = __kernel_timespec { tv_sec: 0, tv_nsec: 0 };
-        mgr.write_obj_to_user(pid, rem, &ts)?;
+    let req_ts = read_user_timespec(mgr, pid, req)?;
+    let req_ns = timespec_to_ns(req_ts).map_err(|_| Error::InvalidArgs)?;
+    if req_ns == 0 {
+        if rem != 0 {
+            let zero = __kernel_timespec { tv_sec: 0, tv_nsec: 0 };
+            mgr.write_obj_to_user(pid, rem, &zero)?;
+        }
+        return Ok(0);
     }
+
+    let start = mgr.time_client.mono_now(Badge::null())?;
+    let deadline = start.saturating_add(req_ns);
+
+    loop {
+        let now = mgr.time_client.mono_now(Badge::null())?;
+        if now >= deadline {
+            break;
+        }
+
+        if has_deliverable_signal(mgr, pid) {
+            if rem != 0 {
+                let remain_ns = deadline.saturating_sub(now);
+                let rem_ts = ns_to_timespec(remain_ns);
+                mgr.write_obj_to_user(pid, rem, &rem_ts)?;
+            }
+            return Ok(-(EINTR as isize));
+        }
+
+        let remain_ns = deadline.saturating_sub(now);
+        let remain_ms = usize::try_from(remain_ns.div_ceil(1_000_000)).unwrap_or(usize::MAX);
+        let sleep_ms = core::cmp::max(1, core::cmp::min(SLEEP_POLL_MS, remain_ms));
+        mgr.time_client.sleep(Badge::null(), sleep_ms)?;
+    }
+
+    if rem != 0 {
+        let zero = __kernel_timespec { tv_sec: 0, tv_nsec: 0 };
+        mgr.write_obj_to_user(pid, rem, &zero)?;
+    }
+
     Ok(0)
 }

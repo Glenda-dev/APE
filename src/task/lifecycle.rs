@@ -84,6 +84,9 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         parent_mmap_next,
         parent_mmap_limit,
         parent_clear_child_tid,
+        parent_signal_actions,
+        parent_signal_blocked,
+        parent_stopped,
     ): (
         Vec<MemoryMap>,
         Vec<MemoryMap>,
@@ -106,6 +109,9 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         usize,
         usize,
         usize,
+        alloc::collections::BTreeMap<usize, crate::ape::process::SignalAction>,
+        u64,
+        bool,
     ) = {
         let parent = mgr.get_process(pid).ok_or(Error::NotFound)?;
         (
@@ -130,6 +136,9 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
             parent.mmap_next,
             parent.mmap_limit,
             parent.clear_child_tid,
+            parent.signal_actions.clone(),
+            parent.signal_blocked,
+            parent.stopped,
         )
     };
 
@@ -181,6 +190,11 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         child.mmap_next = parent_mmap_next;
         child.mmap_limit = parent_mmap_limit;
         child.clear_child_tid = parent_clear_child_tid;
+        child.signal_actions = parent_signal_actions;
+        child.signal_blocked = parent_signal_blocked;
+        // Linux 语义：fork 后子进程 pending signal 为空。
+        child.signal_pending = 0;
+        child.stopped = parent_stopped;
 
         child.memory_maps.clear();
         child.lazy_memory_maps.clear();

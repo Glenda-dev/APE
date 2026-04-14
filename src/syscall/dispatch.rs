@@ -57,6 +57,7 @@ pub(crate) fn route_syscall<'a>(
         __NR_rt_sigtimedwait => {
             system::sys_rt_sigtimedwait(mgr, pid, args[0], args[1], args[2], args[3])
         }
+        __NR_rt_sigreturn => system::sys_rt_sigreturn(mgr, pid),
         __NR_set_robust_list => system::sys_set_robust_list(mgr, pid, args[0], args[1]),
         __NR_prlimit64 => system::sys_prlimit64(mgr, pid, args[0], args[1], args[2], args[3]),
         __NR_clock_gettime => system::sys_clock_gettime(mgr, pid, args[0], args[1]),

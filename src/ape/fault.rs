@@ -4,6 +4,9 @@ use crate::ape::utils::linux_conv::get_exit_code_for_signal;
 #[cfg(feature = "strace")]
 use crate::ape::utils::strace;
 use crate::arch::constants::{INST_PAGE_FAULT, LOAD_PAGE_FAULT, STORE_PAGE_FAULT};
+use crate::system::signal::{
+    PendingSignalAction, consume_deliverable_signal_on_syscall_return,
+};
 use crate::syscall::dispatch_syscall;
 use alloc::vec::Vec;
 use glenda::arch::mem::{PGSIZE, SHIFTS};
@@ -16,6 +19,7 @@ use glenda::ipc::{Badge, MsgArgs, MsgFlags, MsgTag, UTCB};
 use glenda::mem::Perms;
 use glenda::protocol;
 use glenda::utils::align::align_down;
+use linux_raw_sys::errno::EINTR;
 use linux_raw_sys::general::{SIGBUS, SIGILL, SIGSEGV, SIGTRAP};
 
 impl<'a> ApeManager<'a> {
@@ -503,7 +507,28 @@ impl<'a> FaultService for ApeManager<'a> {
         #[cfg(feature = "strace")]
         let trace_state = strace::trace_syscall_enter(&mut *self, pid, sys_num as u32, sys_args);
 
-        let ret = dispatch_syscall(&mut *self, pid, sys_num, sys_args);
+        let mut ret = dispatch_syscall(&mut *self, pid, sys_num, sys_args);
+
+        match consume_deliverable_signal_on_syscall_return(self, pid) {
+            Ok(PendingSignalAction::None) => {}
+            Ok(PendingSignalAction::Interrupt) => {
+                if ret >= 0 {
+                    ret = -(EINTR as isize);
+                }
+            }
+            Ok(PendingSignalAction::Terminate(exit_code)) => {
+                // syscall 上下文终止进程时，保留 reply slot 避免破坏本次回包路径。
+                let _ = self.terminate_process_preserve_reply(pid, exit_code, true);
+            }
+            Err(e) if e == Error::NotFound => {}
+            Err(e) => {
+                warn!(
+                    "signal-delivery-on-syscall-return failed: pid={}, sys_num={}, err={:?}",
+                    pid, sys_num, e
+                );
+            }
+        }
+
         #[cfg(feature = "strace")]
         strace::trace_syscall_exit(&mut *self, pid, sys_num as u32, sys_args, ret, &trace_state);
         let utcb = unsafe { UTCB::new() };

@@ -43,6 +43,7 @@ pub struct ApeManager<'a> {
     pub vt_client: &'a mut VirtualTerminalClient,
     pub vol_client: &'a mut VolumeClient,
     pub fs_client: &'a mut FsClient,
+    pub time_client: &'a mut TimeClient,
     pub cspace_mgr: &'a mut CSpaceManager,
     pub vspace_mgr: &'a mut VSpaceManager,
 }
@@ -64,6 +65,7 @@ impl<'a> ApeManager<'a> {
         vt_client: &'a mut VirtualTerminalClient,
         vol_client: &'a mut VolumeClient,
         fs_client: &'a mut FsClient,
+        time_client: &'a mut TimeClient,
         cspace_mgr: &'a mut CSpaceManager,
         vspace_mgr: &'a mut VSpaceManager,
     ) -> Self {
@@ -83,6 +85,7 @@ impl<'a> ApeManager<'a> {
             vt_client,
             vol_client,
             fs_client,
+            time_client,
             cspace_mgr,
             vspace_mgr,
         }

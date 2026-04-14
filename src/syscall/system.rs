@@ -57,6 +57,10 @@ pub fn sys_rt_sigsuspend<'a>(
     system_subsystem::do_rt_sigsuspend(mgr, pid, mask, sigsetsize)
 }
 
+pub fn sys_rt_sigreturn<'a>(mgr: &mut ApeManager<'a>, pid: usize) -> Result<isize, Error> {
+    system_subsystem::do_rt_sigreturn(mgr, pid)
+}
+
 pub fn sys_set_robust_list<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,

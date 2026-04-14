@@ -25,12 +25,14 @@ use glenda::cap::{
     VSPACE_CAP,
 };
 use glenda::client::{
-    FsClient, InitClient, ProcessClient, ResourceClient, VirtualTerminalClient, VolumeClient,
+    FsClient, InitClient, ProcessClient, ResourceClient, TimeClient, VirtualTerminalClient,
+    VolumeClient,
 };
 use glenda::interface::{ResourceService, SystemService};
 use glenda::ipc::Badge;
 use glenda::protocol::resource::{
-    APE_ENDPOINT, FS_ENDPOINT, INIT_ENDPOINT, ResourceType, VOLUME_ENDPOINT, VT_ENDPOINT,
+    APE_ENDPOINT, FS_ENDPOINT, INIT_ENDPOINT, ResourceType, TIME_ENDPOINT, VOLUME_ENDPOINT,
+    VT_ENDPOINT,
 };
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
 use layout::*;
@@ -74,6 +76,11 @@ fn main() -> usize {
     let mut vt_client = VirtualTerminalClient::new(VT_CAP);
 
     res_client
+        .get_cap(Badge::null(), ResourceType::Endpoint, TIME_ENDPOINT, TIME_SLOT)
+        .expect("Failed to get time endpoint");
+    let mut time_client = TimeClient::new(TIME_CAP);
+
+    res_client
         .alloc(Badge::null(), CapType::Endpoint, 0, ENDPOINT_SLOT)
         .expect("Failed to alloc endpoint");
     // Register APE endpoint to monitor
@@ -88,6 +95,7 @@ fn main() -> usize {
         &mut vt_client,
         &mut vol_client,
         &mut fs_client,
+        &mut time_client,
         &mut cspace_mgr,
         &mut vspace_mgr,
     );

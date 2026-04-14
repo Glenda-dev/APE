@@ -9,6 +9,29 @@ use glenda::client::FsClient;
 use glenda::client::TerminalClient;
 use glenda::io::uring::IoUringClient;
 use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
+use linux_raw_sys::general::{SIGKILL, SIGSTOP};
+
+pub const SIGNAL_MIN: usize = 1;
+pub const SIGNAL_MAX: usize = 64;
+pub const SIGNAL_UNBLOCKABLE_MASK: u64 =
+    (1u64 << (SIGKILL as usize - 1)) | (1u64 << (SIGSTOP as usize - 1));
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SignalAction {
+    pub handler: usize,
+    pub flags: usize,
+    pub restorer: usize,
+    pub mask: u64,
+}
+
+#[inline]
+pub fn signal_bit(signum: usize) -> Option<u64> {
+    if (SIGNAL_MIN..=SIGNAL_MAX).contains(&signum) {
+        Some(1u64 << (signum - 1))
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryType {
@@ -118,6 +141,10 @@ pub struct SubProcess {
     pub mmap_limit: usize,
     pub intermediate_page_tables: BTreeMap<(usize, usize), CapPtr>, // (level, vaddr-prefix) -> pagetable cap (null means externally managed)
     pub clear_child_tid: usize,
+    pub signal_actions: BTreeMap<usize, SignalAction>, // signum -> disposition
+    pub signal_blocked: u64,
+    pub signal_pending: u64,
+    pub stopped: bool,
 }
 
 impl SubProcess {
@@ -148,6 +175,10 @@ impl SubProcess {
             mmap_limit: DEFAULT_MMAP_LIMIT,
             intermediate_page_tables: BTreeMap::new(),
             clear_child_tid: 0,
+            signal_actions: BTreeMap::new(),
+            signal_blocked: 0,
+            signal_pending: 0,
+            stopped: false,
         }
     }
 
@@ -204,5 +235,36 @@ impl SubProcess {
 
     pub fn tcb(&self) -> TCB {
         TCB::from(CapPtr::concat(self.cnode_cap.cap(), TCB_SLOT))
+    }
+
+    pub fn signal_action(&self, signum: usize) -> SignalAction {
+        self.signal_actions.get(&signum).copied().unwrap_or_default()
+    }
+
+    pub fn set_signal_blocked(&mut self, mut mask: u64) {
+        // SIGKILL/SIGSTOP 不可屏蔽。
+        mask &= !SIGNAL_UNBLOCKABLE_MASK;
+        self.signal_blocked = mask;
+    }
+
+    pub fn queue_signal(&mut self, signum: usize) -> bool {
+        if let Some(bit) = signal_bit(signum) {
+            self.signal_pending |= bit;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn pop_pending_signal_from_mask(&mut self, mask: u64) -> Option<usize> {
+        let ready = self.signal_pending & mask;
+        if ready == 0 {
+            return None;
+        }
+
+        let idx = ready.trailing_zeros() as usize;
+        let bit = 1u64 << idx;
+        self.signal_pending &= !bit;
+        Some(idx + 1)
     }
 }
