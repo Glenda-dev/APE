@@ -1,9 +1,9 @@
-use crate::layout::DEFAULT_PROCESS_ROOT;
+use crate::layout::{
+    DEFAULT_HEAP_LIMIT, DEFAULT_MAX_STACK_SIZE, DEFAULT_MMAP_BASE, DEFAULT_MMAP_LIMIT,
+    DEFAULT_PROCESS_ROOT,
+};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use ape::sys::constants::{
-    DEFAULT_HEAP_LIMIT, DEFAULT_MAX_STACK_SIZE, DEFAULT_MMAP_BASE, DEFAULT_MMAP_LIMIT,
-};
 use glenda::cap::{CNode, CapPtr, TCB, TCB_SLOT, VSPACE_SLOT, VSpace};
 use glenda::client::FsClient;
 use glenda::client::TerminalClient;

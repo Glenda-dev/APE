@@ -1,4 +1,8 @@
-pub use glenda::cap::{CapPtr, Endpoint};
+use glenda::arch::mem::PGSIZE;
+use glenda::cap::{CapPtr, Endpoint};
+use glenda::mem::{HEAP_VA, THREAD_AREA_BASE};
+use linux_raw_sys::general::{SIGBUS, SIGILL, SIGSEGV, SIGTRAP, STDERR_FILENO};
+
 pub const INIT_SLOT: CapPtr = CapPtr::from(9);
 pub const INIT_CAP: Endpoint = Endpoint::from(INIT_SLOT);
 pub const VT_SLOT: CapPtr = CapPtr::from(10);
@@ -18,3 +22,12 @@ pub const VSPACE_SCRATCH_START: usize = 0x7000_0000;
 pub const VSPACE_SCRATCH_END: usize = 0x8000_0000;
 pub const DEFAULT_PROCESS_ROOT: &str = "/";
 pub const DEFAULT_VIEW_ROOT: &str = "/linux";
+pub const FIRST_USER_FD: u32 = STDERR_FILENO + 1;
+pub const DEFAULT_MAX_STACK_SIZE: usize = 8 * 1024 * 1024;
+pub const DEFAULT_MMAP_BASE: usize = HEAP_VA + 16 * PGSIZE;
+pub const DEFAULT_MMAP_LIMIT: usize = THREAD_AREA_BASE - 16 * PGSIZE;
+pub const DEFAULT_HEAP_LIMIT: usize = DEFAULT_MMAP_BASE;
+pub const APE_SLOT: CapPtr = CapPtr::from(11);
+pub const APE_CAP: Endpoint = Endpoint::from(APE_SLOT);
+pub const FS_ASYNC_POOL_BASE_VADDR: usize = 0x5800_0000;
+pub const FS_ASYNC_POOL_MAX_REGIONS: usize = 64;

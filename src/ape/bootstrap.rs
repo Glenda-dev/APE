@@ -2,9 +2,9 @@ use crate::ApeManager;
 use crate::ape::process::{FileHandle, FileType};
 use crate::config::ApeConfig;
 use crate::layout::{
-    DEFAULT_INIT_PROCESS_NAME, DEFAULT_VIEW_ROOT, DEFAULT_VT_NAME, ROOTFS_SLOT, STDIO_SLOT,
+    DEFAULT_INIT_PROCESS_NAME, DEFAULT_VIEW_ROOT, DEFAULT_VT_NAME, FIRST_USER_FD, ROOTFS_SLOT,
+    STDIO_SLOT,
 };
-use ape::sys::constants::FIRST_USER_FD;
 use glenda::cap::CSPACE_CAP;
 use glenda::client::TerminalClient;
 use glenda::error::Error;
@@ -63,12 +63,9 @@ impl<'a> ApeManager<'a> {
 
     fn mount_rootfs(&mut self) -> Result<(), Error> {
         let root_partition = self.config().root_partition.clone();
-        log!(
-            "bootstrap: mounting rootfs partition {} -> {}",
-            root_partition,
-            DEFAULT_VIEW_ROOT
-        );
-        let target_ep = self.vol_client.mount_partition(Badge::null(), &root_partition, ROOTFS_SLOT)?;
+        log!("bootstrap: mounting rootfs partition {} -> {}", root_partition, DEFAULT_VIEW_ROOT);
+        let target_ep =
+            self.vol_client.mount_partition(Badge::null(), &root_partition, ROOTFS_SLOT)?;
         self.fs_client.mount(Badge::null(), DEFAULT_VIEW_ROOT, target_ep)?;
         log!("bootstrap: mounted rootfs successfully");
         Ok(())
@@ -83,11 +80,8 @@ impl<'a> ApeManager<'a> {
 
     fn init_stdio(&mut self) -> Result<(), Error> {
         let cfg = self.config().clone();
-        let vt_name = if cfg.stdio.vt_name.is_empty() {
-            DEFAULT_VT_NAME
-        } else {
-            cfg.stdio.vt_name.as_str()
-        };
+        let vt_name =
+            if cfg.stdio.vt_name.is_empty() { DEFAULT_VT_NAME } else { cfg.stdio.vt_name.as_str() };
         let seat_id = cfg.stdio.seat_id;
         let devices_to_bind = cfg.stdio.devices;
 

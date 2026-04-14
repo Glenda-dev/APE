@@ -33,19 +33,13 @@ pub(crate) fn make_linux_char_device_stat(ino: usize) -> stat {
 }
 
 pub(crate) fn host_window_size_to_linux_winsize(ws: WindowSize) -> winsize {
-    winsize {
-        ws_row: ws.rows,
-        ws_col: ws.cols,
-        ws_xpixel: ws.xpixel,
-        ws_ypixel: ws.ypixel,
-    }
+    winsize { ws_row: ws.rows, ws_col: ws.cols, ws_xpixel: ws.xpixel, ws_ypixel: ws.ypixel }
 }
 
 pub(crate) fn linux_winsize_to_host_window_size(ws: winsize) -> WindowSize {
-    WindowSize {
-        rows: ws.ws_row,
-        cols: ws.ws_col,
-        xpixel: ws.ws_xpixel,
-        ypixel: ws.ws_ypixel,
-    }
+    WindowSize { rows: ws.ws_row, cols: ws.ws_col, xpixel: ws.ws_xpixel, ypixel: ws.ws_ypixel }
+}
+
+pub(crate) fn get_exit_code_for_signal(signal: u32) -> usize {
+    128 + signal as usize
 }

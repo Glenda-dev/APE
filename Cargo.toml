@@ -9,11 +9,13 @@ libglenda-rs = { path = "../../lib/libglenda-rs", features = [
     "rt-service",
     "vspacemgr_check_bypass",
 ] }
-libape = { path = "../../lib/libape" }
 linux-raw-sys = { version = "0.12.1", default-features = false, features = [
     "no_std",
     "errno",
     "general",
+    "auxvec",
+    "elf",
+    "elf_uapi",
     "ioctl",
     "system",
 ] }

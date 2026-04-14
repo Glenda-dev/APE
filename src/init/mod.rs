@@ -1,9 +1,9 @@
 use crate::ApeManager;
 use crate::ape::process::{MemoryMap, MemoryType};
 use crate::elf::{ET_DYN, ET_EXEC, ElfFile, PF_W, PF_X, PT_LOAD, PT_PHDR};
+use crate::layout::APE_SLOT;
 use alloc::string::String;
 use alloc::vec::Vec;
-use ape::cap::APE_SLOT;
 use core::cmp::{max, min};
 use core::mem::size_of;
 use glenda::arch::mem::PGSIZE;
@@ -16,6 +16,7 @@ use glenda::interface::{
 use glenda::ipc::Badge;
 use glenda::mem::get_utcb_va;
 use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
+use linux_raw_sys::auxvec::{AT_BASE, AT_ENTRY, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM};
 use glenda::protocol::fs::OpenFlags;
 use glenda::utils::align::{align_down, align_up};
 
@@ -24,13 +25,6 @@ const PIE_LOAD_BIAS: usize = 0;
 const INTERP_LOAD_GAP: usize = 0x10_0000;
 const INITIAL_TLS_PAGES: usize = 4;
 const INITIAL_TLS_GAP_PAGES: usize = 8;
-
-const AUXV_AT_PHDR: usize = 3;
-const AUXV_AT_PHENT: usize = 4;
-const AUXV_AT_PHNUM: usize = 5;
-const AUXV_AT_PAGESZ: usize = 6;
-const AUXV_AT_BASE: usize = 7;
-const AUXV_AT_ENTRY: usize = 9;
 
 struct LoadedElfInfo {
     entry: usize,
@@ -434,12 +428,12 @@ impl<'a> ApeManager<'a> {
 
         let main_phdr = main_info.phdr_vaddr.unwrap_or(main_load_bias + main_elf.ph_offset());
         let auxv = [
-            (AUXV_AT_PHDR, main_phdr),
-            (AUXV_AT_PHENT, main_elf.ph_entry_size()),
-            (AUXV_AT_PHNUM, main_elf.ph_num()),
-            (AUXV_AT_PAGESZ, PGSIZE),
-            (AUXV_AT_BASE, aux_at_base),
-            (AUXV_AT_ENTRY, main_info.entry),
+            (AT_PHDR as usize, main_phdr),
+            (AT_PHENT as usize, main_elf.ph_entry_size()),
+            (AT_PHNUM as usize, main_elf.ph_num()),
+            (AT_PAGESZ as usize, PGSIZE),
+            (AT_BASE as usize, aux_at_base),
+            (AT_ENTRY as usize, main_info.entry),
         ];
 
         let initial_sp = self.setup_initial_stack(pid, path, argv, envp, &auxv)?;

@@ -1,13 +1,11 @@
 use crate::ApeManager;
 use crate::ape::process::{MemoryMap, MemoryType};
+use crate::ape::utils::linux_conv::get_exit_code_for_signal;
 #[cfg(feature = "strace")]
 use crate::ape::utils::strace;
 use crate::arch::constants::{INST_PAGE_FAULT, LOAD_PAGE_FAULT, STORE_PAGE_FAULT};
 use crate::syscall::dispatch_syscall;
 use alloc::vec::Vec;
-use ape::sys::constants::{
-    SIGILL_EXIT_CODE, SIGSEGV_EXIT_CODE, SIGTRAP_EXIT_CODE, UNKNOWN_FAULT_EXIT_CODE,
-};
 use glenda::arch::mem::{PGSIZE, SHIFTS};
 use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Frame, PageTable};
 use glenda::error::Error;
@@ -18,8 +16,15 @@ use glenda::ipc::{Badge, MsgArgs, MsgFlags, MsgTag, UTCB};
 use glenda::mem::Perms;
 use glenda::protocol;
 use glenda::utils::align::align_down;
+use linux_raw_sys::general::{SIGBUS, SIGILL, SIGSEGV, SIGTRAP};
 
 impl<'a> ApeManager<'a> {
+    fn cow_fault_perms(perms: Perms) -> Perms {
+        let mut p = perms;
+        p.remove(Perms::WRITE);
+        p
+    }
+
     fn pt_path_prefix(vaddr: usize, level: usize) -> usize {
         vaddr >> SHIFTS[level]
     }
@@ -197,6 +202,66 @@ impl<'a> ApeManager<'a> {
         }
         Ok(())
     }
+
+    fn resolve_cow_fault(
+        &mut self,
+        pid: usize,
+        page_addr: usize,
+        old_frame_cap: usize,
+        perms: Perms,
+    ) -> Result<(), Error> {
+        if !perms.contains(Perms::WRITE) {
+            return Err(Error::PermissionDenied);
+        }
+
+        let new_frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
+        self.res_client.alloc(Badge::null(), CapType::Frame, 1, new_frame_slot)?;
+
+        let old_frame = Frame::from(CapPtr::from(old_frame_cap));
+        let new_frame = Frame::from(new_frame_slot);
+
+        let src = self.vspace_mgr.map_scratch(
+            old_frame,
+            Perms::READ,
+            1,
+            &mut *self.res_client,
+            &mut *self.cspace_mgr,
+        )?;
+
+        let dst = match self.vspace_mgr.map_scratch(
+            new_frame,
+            Perms::READ | Perms::WRITE,
+            1,
+            &mut *self.res_client,
+            &mut *self.cspace_mgr,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = self.vspace_mgr.unmap(src, 1);
+                return Err(e);
+            }
+        };
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, PGSIZE);
+        }
+
+        let _ = self.vspace_mgr.unmap(src, 1);
+        let _ = self.vspace_mgr.unmap(dst, 1);
+
+        let _ = self.unmap_process_pages(pid, page_addr, 1);
+        self.map_process_frame(pid, new_frame, page_addr, perms, 1)?;
+
+        if let Some(process) = self.get_process_mut(pid)
+            && let Some(map) = process.memory_maps.get_mut(&page_addr)
+        {
+            map.frame_cap = new_frame_slot.bits();
+            map.cow = false;
+            map.flags = perms;
+        }
+
+        Ok(())
+    }
 }
 
 impl<'a> FaultService for ApeManager<'a> {
@@ -226,6 +291,22 @@ impl<'a> FaultService for ApeManager<'a> {
                 map.flags,
                 map.mem_type
             );
+
+            if cause == STORE_PAGE_FAULT && map.cow {
+                if !map.flags.contains(Perms::WRITE) {
+                    return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true);
+                }
+
+                log!(
+                    "page_fault: cow write pid={} vaddr={:#x} frame_cap={:#x}",
+                    pid,
+                    map.vaddr,
+                    map.frame_cap
+                );
+                self.resolve_cow_fault(pid, map.vaddr, map.frame_cap, map.flags)?;
+                return Ok(());
+            }
+
             if !Self::fault_access_allowed(cause, map.flags) {
                 if map.mem_type == MemoryType::Image {
                     let adjusted = if cause == STORE_PAGE_FAULT
@@ -263,7 +344,7 @@ impl<'a> FaultService for ApeManager<'a> {
                     "page_fault: permission denied pid={} addr={:#x} pc={:#x} cause={:#x} perms={:?}",
                     pid, addr, pc, cause, map.flags
                 );
-                return self.terminate_process(pid, SIGSEGV_EXIT_CODE, true);
+                return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true);
             }
 
             // 元数据存在但仍触发 fault：尝试按记录重装该页映射（例如页表项被替换/丢失）。
@@ -273,7 +354,14 @@ impl<'a> FaultService for ApeManager<'a> {
                 map.vaddr,
                 map.flags
             );
-            self.remap_existing_page(pid, map.vaddr, map.frame_cap, map.flags)?;
+            let remap_perms = if map.cow { Self::cow_fault_perms(map.flags) } else { map.flags };
+            self.remap_existing_page(pid, map.vaddr, map.frame_cap, remap_perms)?;
+            if map.cow
+                && let Some(process) = self.get_process_mut(pid)
+                && let Some(meta) = process.memory_maps.get_mut(&map.vaddr)
+            {
+                meta.flags = map.flags;
+            }
             return Ok(());
         }
 
@@ -301,7 +389,7 @@ impl<'a> FaultService for ApeManager<'a> {
             );
             let perms = Perms::READ | Perms::WRITE;
             if !Self::fault_access_allowed(cause, perms) {
-                return self.terminate_process(pid, SIGSEGV_EXIT_CODE, true);
+                return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true);
             }
 
             let pages_to_map = (current_stack_low - page_addr) / PGSIZE;
@@ -326,7 +414,7 @@ impl<'a> FaultService for ApeManager<'a> {
             );
             let perms = Perms::READ | Perms::WRITE;
             if !Self::fault_access_allowed(cause, perms) {
-                return self.terminate_process(pid, SIGSEGV_EXIT_CODE, true);
+                return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true);
             }
             self.map_fault_page(pid, page_addr, perms, MemoryType::Heap)?;
             return Ok(());
@@ -346,7 +434,7 @@ impl<'a> FaultService for ApeManager<'a> {
                 cause
             );
             if !Self::fault_access_allowed(cause, map.flags) {
-                return self.terminate_process(pid, SIGSEGV_EXIT_CODE, true);
+                return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true);
             }
             if let Some(process) = self.get_process_mut(pid) {
                 process.remove_lazy_memory_map(page_addr);
@@ -359,7 +447,7 @@ impl<'a> FaultService for ApeManager<'a> {
             "page_fault: unmanaged region pid={} addr={:#x} pc={:#x} cause={:#x}",
             pid, addr, pc, cause
         );
-        self.terminate_process(pid, SIGSEGV_EXIT_CODE, true)
+        self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true)
     }
 
     fn unknown_fault(
@@ -371,27 +459,27 @@ impl<'a> FaultService for ApeManager<'a> {
     ) -> Result<(), Error> {
         let pid = badge.bits();
         error!("unknown_fault: pid={} cause={:#x} value={:#x} pc={:#x}", pid, cause, value, pc);
-        self.terminate_process(pid, UNKNOWN_FAULT_EXIT_CODE, true)
+        self.terminate_process(pid, usize::MAX, true)
     }
     fn illegal_instruction(&mut self, badge: Badge, inst: usize, pc: usize) -> Result<(), Error> {
         let pid = badge.bits();
         error!("illegal_instruction: pid={} inst={:#x} pc={:#x}", pid, inst, pc);
-        self.terminate_process(pid, SIGILL_EXIT_CODE, true)
+        self.terminate_process(pid, get_exit_code_for_signal(SIGILL), true)
     }
     fn breakpoint(&mut self, badge: Badge, pc: usize) -> Result<(), Error> {
         let pid = badge.bits();
         warn!("breakpoint: pid={} pc={:#x}", pid, pc);
-        self.terminate_process(pid, SIGTRAP_EXIT_CODE, true)
+        self.terminate_process(pid, get_exit_code_for_signal(SIGTRAP), true)
     }
     fn access_fault(&mut self, badge: Badge, addr: usize, pc: usize) -> Result<(), Error> {
         let pid = badge.bits();
         error!("access_fault: pid={} addr={:#x} pc={:#x}", pid, addr, pc);
-        self.terminate_process(pid, SIGSEGV_EXIT_CODE, true)
+        self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true)
     }
     fn access_misaligned(&mut self, badge: Badge, addr: usize, pc: usize) -> Result<(), Error> {
         let pid = badge.bits();
         error!("access_misaligned: pid={} addr={:#x} pc={:#x}", pid, addr, pc);
-        self.terminate_process(pid, SIGSEGV_EXIT_CODE, true)
+        self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true)
     }
     fn virt_exit(
         &mut self,
@@ -406,7 +494,7 @@ impl<'a> FaultService for ApeManager<'a> {
             "virt_exit: pid={} reason={:#x} detail0={:#x} detail1={:#x} detail2={:#x}",
             pid, reason, detail0, detail1, detail2
         );
-        self.terminate_process(pid, UNKNOWN_FAULT_EXIT_CODE, true)
+        self.terminate_process(pid, usize::MAX, true)
     }
     fn handle_syscall(&mut self, pid: usize, args: MsgArgs) -> Result<(), Error> {
         let sys_num = args[0];

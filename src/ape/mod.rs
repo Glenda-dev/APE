@@ -1,17 +1,17 @@
 pub mod bootstrap;
 pub mod fault;
-pub mod lifecycle;
 pub mod path;
 pub mod policy;
 pub mod process;
 pub mod server;
 pub mod state;
+pub mod task;
 pub mod user;
 pub mod utils;
 
 use crate::config::ApeConfig;
+use crate::layout::{APE_SLOT, FS_ASYNC_POOL_BASE_VADDR, FS_ASYNC_POOL_MAX_REGIONS};
 use alloc::string::String;
-use ape::cap::APE_SLOT;
 use glenda::arch::mem::{PGSIZE, SHIFTS};
 use glenda::cap::{CNode, CSPACE_CAP, CapPtr, CapType, Endpoint, Frame, Reply, Rights};
 use glenda::client::*;
@@ -23,9 +23,6 @@ use glenda::utils::align::align_up;
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
 use process::{AsyncIoRegion, SubProcess};
 use state::{ApeFsState, ApeRuntimeState, ApeTaskState};
-
-const FS_ASYNC_POOL_BASE_VADDR: usize = 0x5800_0000;
-const FS_ASYNC_POOL_MAX_REGIONS: usize = 64;
 
 pub struct ApeIpc {
     pub running: bool,
@@ -205,5 +202,4 @@ impl<'a> ApeManager<'a> {
     pub fn recycle_fs_async_region(&mut self, region_id: usize) {
         self.fs_state.recycle_region(region_id);
     }
-
 }

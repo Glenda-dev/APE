@@ -1,4 +1,5 @@
 use core::mem::size_of;
+pub use linux_raw_sys::elf::{ET_DYN, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS};
 
 pub const ELF_MAGIC: [u8; 4] = [0x7f, 0x45, 0x4c, 0x46];
 
@@ -34,17 +35,7 @@ pub struct Elf64Phdr {
     pub p_align: usize,
 }
 
-pub const PT_LOAD: u32 = 1;
-pub const PT_INTERP: u32 = 3;
-pub const PT_PHDR: u32 = 6;
-pub const PT_TLS: u32 = 7;
-
-pub const ET_EXEC: u16 = 2;
-pub const ET_DYN: u16 = 3;
-
-pub const PF_X: u32 = 1;
-pub const PF_W: u32 = 2;
-pub const PF_R: u32 = 4;
+pub const ET_EXEC: u16 = linux_raw_sys::elf_uapi::ET_EXEC as u16;
 
 pub struct ElfFile<'a> {
     data: &'a [u8],
