@@ -10,7 +10,6 @@ mod arch;
 mod config;
 mod elf;
 mod fs;
-mod init;
 mod io;
 mod layout;
 mod mm;

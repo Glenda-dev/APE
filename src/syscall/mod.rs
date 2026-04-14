@@ -9,6 +9,7 @@ mod common;
 mod dispatch;
 mod entry;
 pub mod fs;
+pub mod io;
 pub mod mm;
 pub mod system;
 pub mod task;

@@ -69,6 +69,9 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         parent_fd_paths,
         parent_fd_cloexec,
         parent_next_fd,
+        parent_session_id,
+        parent_process_group_id,
+        parent_controlling_tty,
         parent_root_dir,
         parent_cwd,
         parent_stack_bottom,
@@ -88,6 +91,9 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         alloc::collections::BTreeMap<u32, alloc::string::String>,
         alloc::collections::BTreeMap<u32, bool>,
         u32,
+        usize,
+        usize,
+        Option<usize>,
         alloc::string::String,
         alloc::string::String,
         usize,
@@ -109,6 +115,9 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
             parent.fd_paths.clone(),
             parent.fd_cloexec.clone(),
             parent.next_fd,
+            parent.session_id,
+            parent.process_group_id,
+            parent.controlling_tty,
             parent.root_dir.clone(),
             parent.cwd.clone(),
             parent.stack_bottom,
@@ -158,6 +167,9 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         child.fd_paths = parent_fd_paths;
         child.fd_cloexec = parent_fd_cloexec;
         child.next_fd = parent_next_fd;
+        child.session_id = parent_session_id;
+        child.process_group_id = parent_process_group_id;
+        child.controlling_tty = parent_controlling_tty;
 
         child.stack_bottom = parent_stack_bottom;
         child.stack_size = parent_stack_size;

@@ -95,6 +95,9 @@ pub struct FileHandle {
 pub struct SubProcess {
     pub pid: usize,
     pub parent_pid: usize,
+    pub session_id: usize,
+    pub process_group_id: usize,
+    pub controlling_tty: Option<usize>,
     pub cnode_cap: CNode, // Copy of CNode capability
     pub root_dir: String,
     pub cwd: String,
@@ -122,6 +125,9 @@ impl SubProcess {
         Self {
             pid,
             parent_pid,
+            session_id: pid,
+            process_group_id: pid,
+            controlling_tty: None,
             cnode_cap,
             root_dir: String::from(DEFAULT_PROCESS_ROOT),
             cwd: String::from(DEFAULT_PROCESS_ROOT),

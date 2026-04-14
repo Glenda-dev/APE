@@ -1,22 +1,9 @@
 use crate::ApeManager;
 use crate::ape::process::FileType as ApeFileType;
+use crate::io::tty::terminal_poll_readable;
 use core::mem::size_of;
-use glenda::client::TerminalClient;
 use glenda::error::Error;
-use glenda::ipc::{MsgFlags, MsgTag, UTCB};
 use linux_raw_sys::general::{POLLIN, POLLNVAL, POLLOUT, POLLPRI, pollfd};
-
-fn terminal_poll_readable(term: TerminalClient) -> Result<bool, Error> {
-    let mut utcb = unsafe { UTCB::new() };
-    utcb.clear();
-    utcb.set_msg_tag(MsgTag::new(
-        glenda::protocol::TERMINAL_PROTO,
-        glenda::protocol::terminal::TERM_POLL_READ,
-        MsgFlags::NONE,
-    ));
-    term.endpoint().call(&mut utcb)?;
-    Ok(utcb.get_mr(0) != 0)
-}
 
 fn pollin_ready_for_fd(mgr: &mut ApeManager<'_>, pid: usize, fd: u32) -> Result<bool, Error> {
     let term = {
@@ -30,7 +17,7 @@ fn pollin_ready_for_fd(mgr: &mut ApeManager<'_>, pid: usize, fd: u32) -> Result<
         }
     };
 
-    if let Some(term) = term { terminal_poll_readable(term) } else { Ok(true) }
+    if let Some(term) = term { terminal_poll_readable(mgr, term) } else { Ok(true) }
 }
 
 pub(crate) fn do_ppoll(

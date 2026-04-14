@@ -1,15 +1,23 @@
 use crate::ApeManager;
 use crate::ape::path::path_inside_root;
-use crate::ape::process::{AsyncIoState, FileHandle, FileType, NormalFileHandle, PseudoCharDevice, PtyMasterHandle, PtySlaveHandle};
+use crate::ape::process::{
+    AsyncIoState, FileHandle, FileType, NormalFileHandle, PseudoCharDevice, PtyMasterHandle,
+    PtySlaveHandle,
+};
 use crate::ape::user::USER_PATH_MAX;
+use crate::io::tty::set_terminal_pgrp_local;
 use alloc::format;
 use glenda::cap::{CSPACE_CAP, Endpoint, Frame};
 use glenda::client::{FsClient, TerminalClient};
 use glenda::error::Error;
-use glenda::interface::{CSpaceService, FileHandleService, FileSystemService, VirtualTerminalService};
+use glenda::interface::{
+    CSpaceService, FileHandleService, FileSystemService, VirtualTerminalService,
+};
 use glenda::io::uring::{IoUringBuffer, IoUringClient};
-use glenda::ipc::{Badge, MsgFlags, MsgTag, UTCB};
-use linux_raw_sys::general::{F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC};
+use glenda::ipc::Badge;
+use linux_raw_sys::general::{
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC,
+};
 
 // 4KB ring + 12KB data window，降低每 fd 的常驻内存。
 const FS_ASYNC_REGION_SIZE: usize = 16 * 1024;
@@ -50,18 +58,6 @@ fn classify_device_path(path: &str) -> Option<DevicePathKind> {
     pseudo.map(DevicePathKind::Pseudo)
 }
 
-fn set_terminal_pgrp(term: TerminalClient, pgrp: i32) -> Result<(), Error> {
-    let mut utcb = unsafe { UTCB::new() };
-    utcb.clear();
-    utcb.set_msg_tag(MsgTag::new(
-        glenda::protocol::TERMINAL_PROTO,
-        glenda::protocol::terminal::TERM_SET_PGRP,
-        MsgFlags::NONE,
-    ));
-    utcb.set_mr(0, pgrp as usize);
-    term.endpoint().call(utcb)
-}
-
 pub(crate) fn do_openat<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,
@@ -81,7 +77,8 @@ pub(crate) fn do_openat<'a>(
             DevicePathKind::PtyMaster => {
                 let ep_slot = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
                 let vt_name = format!("pts-{}-{}", pid, guest_path);
-                let (vt_id, vt_ep) = match mgr.vt_client.create_vt(Badge::null(), &vt_name, ep_slot) {
+                let (vt_id, vt_ep) = match mgr.vt_client.create_vt(Badge::null(), &vt_name, ep_slot)
+                {
                     Ok(v) => v,
                     Err(e) => {
                         mgr.cspace_mgr.free(ep_slot);
@@ -96,12 +93,7 @@ pub(crate) fn do_openat<'a>(
                 }
 
                 let term = TerminalClient::new(vt_ep);
-                if let Err(e) = set_terminal_pgrp(term, pid as i32) {
-                    warn!(
-                        "sys_openat: set initial tty pgrp failed pid={}, vt_id={}, err={:?}",
-                        pid, vt_id, e
-                    );
-                }
+                set_terminal_pgrp_local(mgr, term, pid as i32);
 
                 let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
                 let fd = process.next_fd;
@@ -267,7 +259,11 @@ pub(crate) fn do_openat<'a>(
     Ok(fd as isize)
 }
 
-pub(crate) fn do_close<'a>(mgr: &mut ApeManager<'a>, pid: usize, fd: usize) -> Result<isize, Error> {
+pub(crate) fn do_close<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    fd: usize,
+) -> Result<isize, Error> {
     let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
     let handle = {
         let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;

@@ -1,4 +1,5 @@
 use crate::ape::process::{AsyncIoRegion, SubProcess};
+use crate::ape::tty::TtyRegistry;
 use crate::config::ApeConfig;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -12,11 +13,7 @@ pub struct ApeTaskState {
 
 impl ApeTaskState {
     pub fn new(next_pid: usize) -> Self {
-        Self {
-            processes: BTreeMap::new(),
-            host_pid_map: BTreeMap::new(),
-            next_pid,
-        }
+        Self { processes: BTreeMap::new(), host_pid_map: BTreeMap::new(), next_pid }
     }
 
     pub fn alloc_pid(&mut self) -> usize {
@@ -64,14 +61,12 @@ impl ApeTaskState {
 pub struct ApeRuntimeState {
     config: ApeConfig,
     stdio_term: Option<TerminalClient>,
+    tty_registry: TtyRegistry,
 }
 
 impl ApeRuntimeState {
     pub fn new(config: ApeConfig) -> Self {
-        Self {
-            config,
-            stdio_term: None,
-        }
+        Self { config, stdio_term: None, tty_registry: TtyRegistry::new() }
     }
 
     pub fn config(&self) -> &ApeConfig {
@@ -88,6 +83,14 @@ impl ApeRuntimeState {
 
     pub fn set_stdio_term(&mut self, term: Option<TerminalClient>) {
         self.stdio_term = term;
+    }
+
+    pub fn tty_registry(&self) -> &TtyRegistry {
+        &self.tty_registry
+    }
+
+    pub fn tty_registry_mut(&mut self) -> &mut TtyRegistry {
+        &mut self.tty_registry
     }
 }
 
@@ -115,9 +118,7 @@ impl ApeFsState {
     }
 
     pub fn try_reuse_region(&mut self) -> Option<AsyncIoRegion> {
-        self.async_free
-            .pop()
-            .and_then(|region_id| self.async_regions.get(region_id).copied())
+        self.async_free.pop().and_then(|region_id| self.async_regions.get(region_id).copied())
     }
 
     pub fn region_count(&self) -> usize {

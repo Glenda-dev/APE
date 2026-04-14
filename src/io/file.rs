@@ -1,25 +1,15 @@
 use crate::ApeManager;
 use crate::ape::process::{FileHandle, FileType, PseudoCharDevice};
-use crate::ape::utils::linux_conv::{
-    host_window_size_to_linux_winsize, linux_winsize_to_host_window_size,
-};
-use alloc::vec;
 use core::cmp::min;
 use core::mem::size_of;
-use glenda::client::{FsClient, TerminalClient};
+use glenda::client::FsClient;
 use glenda::error::Error;
 use glenda::interface::{FileHandleService, FileSystemService, VirtualTerminalService};
 use glenda::io::uring::{IOURING_OP_READ, IOURING_OP_WRITE, IoUringClient, IoUringSqe};
+use glenda::ipc::Badge;
 use glenda::ipc::IPC_BUFFER_SIZE;
-use glenda::ipc::{Badge, MsgFlags, MsgTag, UTCB};
-use linux_raw_sys::ctypes::{c_int, c_uint};
-use linux_raw_sys::general::{SEEK_CUR, SEEK_END, SEEK_SET, iovec, winsize};
-use linux_raw_sys::ioctl::{
-    TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGPGRP, TIOCGPTN, TIOCGWINSZ, TIOCSPGRP, TIOCSPTLCK,
-    TIOCSWINSZ,
-};
-
-const TTY_TERMIOS_SIZE: usize = 44;
+use linux_raw_sys::ctypes::c_uint;
+use linux_raw_sys::general::{SEEK_CUR, SEEK_END, SEEK_SET, iovec};
 
 pub(crate) fn do_read<'a>(
     mgr: &mut ApeManager<'a>,
@@ -33,8 +23,12 @@ pub(crate) fn do_read<'a>(
     }
 
     with_fd_handle_mut(mgr, pid, fd, |mgr, handle| match &mut handle.file_type {
-        FileType::PtyMaster(master) => read_from_terminal(mgr, pid, master.term, buf_ptr, len),
-        FileType::PtySlave(slave) => read_from_terminal(mgr, pid, slave.term, buf_ptr, len),
+        FileType::PtyMaster(master) => {
+            crate::io::tty::do_read_terminal(mgr, pid, master.term, buf_ptr, len)
+        }
+        FileType::PtySlave(slave) => {
+            crate::io::tty::do_read_terminal(mgr, pid, slave.term, buf_ptr, len)
+        }
         FileType::PseudoChar(dev) => match dev {
             PseudoCharDevice::Null => Ok(0),
             PseudoCharDevice::Zero | PseudoCharDevice::Random | PseudoCharDevice::URandom => {
@@ -42,7 +36,7 @@ pub(crate) fn do_read<'a>(
                 Ok(len as isize)
             }
         },
-        FileType::Terminal(term) => read_from_terminal(mgr, pid, *term, buf_ptr, len),
+        FileType::Terminal(term) => crate::io::tty::do_read_terminal(mgr, pid, *term, buf_ptr, len),
         FileType::Normal(normal) => {
             if let Some(async_io) = normal.async_io.as_mut() {
                 let fs_client = &mut normal.fs_client;
@@ -100,9 +94,11 @@ pub(crate) fn do_read<'a>(
                             break;
                         }
 
-                        let read_len = normal
-                            .fs_client
-                            .read(Badge::null(), normal.offset, &mut kbuf[..chunk])?;
+                        let read_len = normal.fs_client.read(
+                            Badge::null(),
+                            normal.offset,
+                            &mut kbuf[..chunk],
+                        )?;
                         if read_len == 0 {
                             break;
                         }
@@ -136,10 +132,16 @@ pub(crate) fn do_write<'a>(
     }
 
     with_fd_handle_mut(mgr, pid, fd, |mgr, handle| match &mut handle.file_type {
-        FileType::PtyMaster(master) => write_to_terminal(mgr, pid, master.term, buf_ptr, len),
-        FileType::PtySlave(slave) => write_to_terminal(mgr, pid, slave.term, buf_ptr, len),
+        FileType::PtyMaster(master) => {
+            crate::io::tty::do_write_terminal(mgr, pid, master.term, buf_ptr, len)
+        }
+        FileType::PtySlave(slave) => {
+            crate::io::tty::do_write_terminal(mgr, pid, slave.term, buf_ptr, len)
+        }
         FileType::PseudoChar(_) => Ok(len as isize),
-        FileType::Terminal(term) => write_to_terminal(mgr, pid, *term, buf_ptr, len),
+        FileType::Terminal(term) => {
+            crate::io::tty::do_write_terminal(mgr, pid, *term, buf_ptr, len)
+        }
         FileType::Normal(normal) => {
             if let Some(async_io) = normal.async_io.as_mut() {
                 let fs_client = &mut normal.fs_client;
@@ -196,9 +198,8 @@ pub(crate) fn do_write<'a>(
                         let user_src = buf_ptr.checked_add(total).ok_or(Error::InvalidAddress)?;
                         sess.copy_from_user(user_src, &mut kbuf[..chunk])?;
 
-                        let written = normal
-                            .fs_client
-                            .write(Badge::null(), normal.offset, &kbuf[..chunk])?;
+                        let written =
+                            normal.fs_client.write(Badge::null(), normal.offset, &kbuf[..chunk])?;
                         total += written;
                         normal.offset = normal.offset.saturating_add(written);
                         if written < chunk {
@@ -276,242 +277,22 @@ pub(crate) fn do_ioctl<'a>(
     let req = u32::try_from(request).map_err(|_| Error::InvalidArgs)?;
 
     with_fd_handle_mut(mgr, pid, fd, |mgr, handle| match &mut handle.file_type {
-        FileType::PtyMaster(master) => match req {
-            TIOCGPTN => {
-                write_user_u32(mgr, pid, argp, master.vt_id as u32)?;
-                Ok(0)
-            }
-            TIOCSPTLCK => {
-                let lock = read_user_u32(mgr, pid, argp)?;
-                mgr.vt_client.set_pty_lock(Badge::null(), master.vt_id, lock != 0)?;
-                master.locked = lock != 0;
-                Ok(0)
-            }
-            _ => ioctl_to_terminal(mgr, pid, master.term, req, argp),
-        },
-        FileType::PtySlave(slave) => ioctl_to_terminal(mgr, pid, slave.term, req, argp),
+        FileType::PtyMaster(master) => crate::io::tty::do_ioctl_pty_master(
+            mgr,
+            pid,
+            master.vt_id,
+            &mut master.locked,
+            master.term,
+            req,
+            argp,
+        ),
+        FileType::PtySlave(slave) => {
+            crate::io::tty::do_ioctl_terminal(mgr, pid, slave.term, req, argp)
+        }
         FileType::PseudoChar(_) => Err(Error::InvalidType),
-        FileType::Terminal(term) => ioctl_to_terminal(mgr, pid, *term, req, argp),
+        FileType::Terminal(term) => crate::io::tty::do_ioctl_terminal(mgr, pid, *term, req, argp),
         FileType::Normal(_) => Err(Error::InvalidType),
     })
-}
-
-fn read_user_winsize<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    user_ptr: usize,
-) -> Result<winsize, Error> {
-    let mut raw = [0u8; size_of::<winsize>()];
-    mgr.copy_from_user(pid, user_ptr, &mut raw)?;
-    Ok(unsafe { (raw.as_ptr() as *const winsize).read_unaligned() })
-}
-
-fn write_user_winsize<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    user_ptr: usize,
-    value: winsize,
-) -> Result<(), Error> {
-    let raw = unsafe {
-        core::slice::from_raw_parts((&value as *const winsize) as *const u8, size_of::<winsize>())
-    };
-    mgr.copy_to_user(pid, user_ptr, raw)
-}
-
-fn read_user_i32<'a>(mgr: &mut ApeManager<'a>, pid: usize, user_ptr: usize) -> Result<i32, Error> {
-    let mut raw = [0u8; 4];
-    mgr.copy_from_user(pid, user_ptr, &mut raw)?;
-    Ok(i32::from_ne_bytes(raw))
-}
-
-fn write_user_i32<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    user_ptr: usize,
-    value: i32,
-) -> Result<(), Error> {
-    mgr.copy_to_user(pid, user_ptr, &value.to_ne_bytes())
-}
-
-fn read_user_u32<'a>(mgr: &mut ApeManager<'a>, pid: usize, user_ptr: usize) -> Result<u32, Error> {
-    let mut raw = [0u8; 4];
-    mgr.copy_from_user(pid, user_ptr, &mut raw)?;
-    Ok(u32::from_ne_bytes(raw))
-}
-
-fn write_user_u32<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    user_ptr: usize,
-    value: u32,
-) -> Result<(), Error> {
-    mgr.copy_to_user(pid, user_ptr, &value.to_ne_bytes())
-}
-
-fn read_user_bytes<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    user_ptr: usize,
-    len: usize,
-) -> Result<vec::Vec<u8>, Error> {
-    let mut buf = vec![0u8; len];
-    mgr.copy_from_user(pid, user_ptr, &mut buf)?;
-    Ok(buf)
-}
-
-fn write_user_bytes<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    user_ptr: usize,
-    data: &[u8],
-) -> Result<(), Error> {
-    if data.is_empty() {
-        return Ok(());
-    }
-    mgr.copy_to_user(pid, user_ptr, data)
-}
-
-fn read_from_terminal<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    term: TerminalClient,
-    buf_ptr: usize,
-    len: usize,
-) -> Result<isize, Error> {
-    let mut utcb = unsafe { UTCB::new() };
-    let tag = MsgTag::new(
-        glenda::protocol::TERMINAL_PROTO,
-        glenda::protocol::terminal::TERM_GET_STR,
-        MsgFlags::HAS_BUFFER,
-    );
-    utcb.set_mr(0, len);
-    utcb.set_msg_tag(tag);
-    term.endpoint().call(utcb)?;
-    utcb.error_check()?;
-
-    let read_len = min(utcb.get_mr(0), min(len, utcb.buffer().len()));
-    if read_len > 0 {
-        mgr.copy_to_user(pid, buf_ptr, &utcb.buffer()[..read_len])?;
-    }
-    Ok(read_len as isize)
-}
-
-fn write_to_terminal<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    term: TerminalClient,
-    buf_ptr: usize,
-    len: usize,
-) -> Result<isize, Error> {
-    let mut kbuf = vec![0u8; len];
-    mgr.copy_from_user(pid, buf_ptr, &mut kbuf)?;
-
-    let mut utcb = unsafe { UTCB::new() };
-    let tag = MsgTag::new(
-        glenda::protocol::TERMINAL_PROTO,
-        glenda::protocol::terminal::TERM_PUT_STR,
-        MsgFlags::HAS_BUFFER,
-    );
-    let copied = utcb.write(&kbuf);
-    utcb.set_msg_tag(tag);
-    term.endpoint().call(utcb)?;
-    utcb.error_check()?;
-
-    let written = if utcb.get_mr(0) > 0 { min(utcb.get_mr(0), copied) } else { copied };
-    Ok(written as isize)
-}
-
-fn ioctl_to_terminal<'a>(
-    mgr: &mut ApeManager<'a>,
-    pid: usize,
-    term: TerminalClient,
-    request: u32,
-    argp: usize,
-) -> Result<isize, Error> {
-    match request {
-        TIOCGWINSZ => {
-            let mut utcb = unsafe { UTCB::new() };
-            utcb.clear();
-            utcb.set_msg_tag(MsgTag::new(
-                glenda::protocol::TERMINAL_PROTO,
-                glenda::protocol::terminal::TERM_GET_WINSIZE,
-                MsgFlags::NONE,
-            ));
-            term.endpoint().call(utcb)?;
-            let ws = unsafe { utcb.read_postcard()? };
-            write_user_winsize(mgr, pid, argp, host_window_size_to_linux_winsize(ws))?;
-            Ok(0)
-        }
-        TIOCSWINSZ => {
-            let ws = read_user_winsize(mgr, pid, argp)?;
-            let mut utcb = unsafe { UTCB::new() };
-            utcb.clear();
-            utcb.set_msg_tag(MsgTag::new(
-                glenda::protocol::TERMINAL_PROTO,
-                glenda::protocol::terminal::TERM_SET_WINSIZE,
-                MsgFlags::HAS_BUFFER,
-            ));
-            unsafe {
-                utcb.write_postcard(&linux_winsize_to_host_window_size(ws))?;
-            }
-            term.endpoint().call(utcb)?;
-            Ok(0)
-        }
-        TCGETS => {
-            let mut utcb = unsafe { UTCB::new() };
-            utcb.clear();
-            utcb.set_msg_tag(MsgTag::new(
-                glenda::protocol::TERMINAL_PROTO,
-                glenda::protocol::terminal::TERM_GET_TERMIOS,
-                MsgFlags::NONE,
-            ));
-            term.endpoint().call(utcb)?;
-
-            let copy_len = min(TTY_TERMIOS_SIZE, utcb.buffer().len());
-            write_user_bytes(mgr, pid, argp, &utcb.buffer()[..copy_len])?;
-            Ok(0)
-        }
-        TCSETS | TCSETSW | TCSETSF => {
-            let payload = read_user_bytes(mgr, pid, argp, TTY_TERMIOS_SIZE)?;
-            let mut utcb = unsafe { UTCB::new() };
-            utcb.clear();
-            utcb.set_msg_tag(MsgTag::new(
-                glenda::protocol::TERMINAL_PROTO,
-                glenda::protocol::terminal::TERM_SET_TERMIOS,
-                MsgFlags::HAS_BUFFER,
-            ));
-            let copied = utcb.write(&payload);
-            utcb.set_mr(0, copied);
-            term.endpoint().call(utcb)?;
-            Ok(0)
-        }
-        TIOCGPGRP => {
-            let mut utcb = unsafe { UTCB::new() };
-            utcb.clear();
-            utcb.set_msg_tag(MsgTag::new(
-                glenda::protocol::TERMINAL_PROTO,
-                glenda::protocol::terminal::TERM_GET_PGRP,
-                MsgFlags::NONE,
-            ));
-            term.endpoint().call(utcb)?;
-            write_user_i32(mgr, pid, argp, utcb.get_mr(0) as c_int)?;
-            Ok(0)
-        }
-        TIOCSPGRP => {
-            let pgrp = read_user_i32(mgr, pid, argp)?;
-            let mut utcb = unsafe { UTCB::new() };
-            utcb.clear();
-            utcb.set_msg_tag(MsgTag::new(
-                glenda::protocol::TERMINAL_PROTO,
-                glenda::protocol::terminal::TERM_SET_PGRP,
-                MsgFlags::NONE,
-            ));
-            utcb.set_mr(0, pgrp as usize);
-            term.endpoint().call(utcb)?;
-            Ok(0)
-        }
-        _ => Err(Error::InvalidType),
-    }
 }
 
 fn with_fd_handle_mut<'a, T, F>(

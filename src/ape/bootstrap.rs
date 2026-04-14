@@ -1,32 +1,20 @@
 use crate::ApeManager;
 use crate::ape::process::{FileHandle, FileType};
 use crate::config::ApeConfig;
+use crate::io::tty::set_terminal_pgrp_local;
 use crate::layout::{
     DEFAULT_INIT_PROCESS_NAME, DEFAULT_VIEW_ROOT, DEFAULT_VT_NAME, FIRST_USER_FD, ROOTFS_SLOT,
     STDIO_SLOT,
 };
-use glenda::cap::CSPACE_CAP;
 use glenda::client::TerminalClient;
 use glenda::error::Error;
 use glenda::interface::{
     CSpaceService, InitService, ProcessService, ResourceService, ThreadService,
     VirtualFileSystemService, VirtualTerminalService, VolumeService,
 };
-use glenda::ipc::{Badge, MsgFlags, MsgTag, UTCB};
+use glenda::ipc::Badge;
 use glenda::protocol;
 use linux_raw_sys::general::*;
-
-fn set_terminal_foreground_pgrp(term: TerminalClient, pgrp: i32) -> Result<(), Error> {
-    let mut utcb = unsafe { UTCB::new() };
-    utcb.clear();
-    utcb.set_msg_tag(MsgTag::new(
-        protocol::TERMINAL_PROTO,
-        protocol::terminal::TERM_SET_PGRP,
-        MsgFlags::NONE,
-    ));
-    utcb.set_mr(0, pgrp as usize);
-    term.endpoint().call(utcb)
-}
 
 impl<'a> ApeManager<'a> {
     pub fn bootstrap(&mut self) -> Result<(), Error> {
@@ -121,9 +109,10 @@ impl<'a> ApeManager<'a> {
 
         // 4. 为 init 进程初始化 stdio fds
         if let Some(term) = self.stdio_term() {
-            set_terminal_foreground_pgrp(term, pid as i32)?;
+            set_terminal_pgrp_local(self, term, pid as i32);
 
             let proc = self.get_process_mut(pid).unwrap();
+            proc.controlling_tty = Some(term.endpoint().cap().bits());
             proc.fds.insert(STDIN_FILENO, FileHandle { file_type: FileType::Terminal(term) });
             proc.fds.insert(STDOUT_FILENO, FileHandle { file_type: FileType::Terminal(term) });
             proc.fds.insert(STDERR_FILENO, FileHandle { file_type: FileType::Terminal(term) });
@@ -132,7 +121,7 @@ impl<'a> ApeManager<'a> {
 
         let init_path = self.config().init_path.clone();
         log!("load_init: execve init path={}", init_path);
-        self.execve_path(pid, &init_path, &[], &[])?;
+        self.do_execve_path(pid, &init_path, &[], &[])?;
         log!("load_init: execve completed");
         let tcb_cap = self.get_process(pid).ok_or(Error::NotFound)?.tcb();
         tcb_cap.resume()?;

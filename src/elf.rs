@@ -1,54 +1,21 @@
 use core::mem::size_of;
-pub use linux_raw_sys::elf::{ET_DYN, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS};
-
-pub const ELF_MAGIC: [u8; 4] = [0x7f, 0x45, 0x4c, 0x46];
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct Elf64Ehdr {
-    pub e_ident: [u8; 16],
-    pub e_type: u16,
-    pub e_machine: u16,
-    pub e_version: u32,
-    pub e_entry: usize,
-    pub e_phoff: usize,
-    pub e_shoff: usize,
-    pub e_flags: u32,
-    pub e_ehsize: u16,
-    pub e_phentsize: u16,
-    pub e_phnum: u16,
-    pub e_shentsize: u16,
-    pub e_shnum: u16,
-    pub e_shstrndx: u16,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct Elf64Phdr {
-    pub p_type: u32,
-    pub p_flags: u32,
-    pub p_offset: usize,
-    pub p_vaddr: usize,
-    pub p_paddr: usize,
-    pub p_filesz: usize,
-    pub p_memsz: usize,
-    pub p_align: usize,
-}
-
-pub const ET_EXEC: u16 = linux_raw_sys::elf_uapi::ET_EXEC as u16;
+use linux_raw_sys::elf::{
+    ELFMAG, ET_DYN, Elf_Ehdr, Elf_Phdr, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS,
+};
+use linux_raw_sys::elf_uapi::ET_EXEC;
 
 pub struct ElfFile<'a> {
     data: &'a [u8],
-    header: Elf64Ehdr,
+    header: Elf_Ehdr,
 }
 
 impl<'a> ElfFile<'a> {
     pub fn new(data: &'a [u8]) -> Result<Self, &'static str> {
-        if data.len() < size_of::<Elf64Ehdr>() {
+        if data.len() < size_of::<Elf_Ehdr>() {
             return Err("Buffer too small for ELF header");
         }
-        let header = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const Elf64Ehdr) };
-        if header.e_ident[0..4] != ELF_MAGIC {
+        let header = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const Elf_Ehdr) };
+        if header.e_ident[0..4] != ELFMAG {
             return Err("Invalid ELF magic");
         }
         Ok(Self { data, header })
@@ -113,7 +80,7 @@ pub struct ProgramHeaders<'a> {
 }
 
 impl<'a> Iterator for ProgramHeaders<'a> {
-    type Item = Elf64Phdr;
+    type Item = Elf_Phdr;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current >= self.ph_num {
@@ -121,12 +88,12 @@ impl<'a> Iterator for ProgramHeaders<'a> {
         }
 
         let off = self.ph_off + self.current * self.ph_size;
-        if off + size_of::<Elf64Phdr>() > self.data.len() {
+        if off + size_of::<Elf_Phdr>() > self.data.len() {
             return None;
         }
 
         let ph =
-            unsafe { core::ptr::read_unaligned(self.data.as_ptr().add(off) as *const Elf64Phdr) };
+            unsafe { core::ptr::read_unaligned(self.data.as_ptr().add(off) as *const Elf_Phdr) };
         self.current += 1;
         Some(ph)
     }

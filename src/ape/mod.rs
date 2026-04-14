@@ -6,6 +6,7 @@ pub mod process;
 pub mod server;
 pub mod state;
 pub mod task;
+pub mod tty;
 pub mod user;
 pub mod utils;
 
@@ -156,6 +157,14 @@ impl<'a> ApeManager<'a> {
 
     pub fn set_stdio_term(&mut self, term: Option<glenda::client::TerminalClient>) {
         self.runtime_state.set_stdio_term(term);
+    }
+
+    pub fn tty_registry(&self) -> &self::tty::TtyRegistry {
+        self.runtime_state.tty_registry()
+    }
+
+    pub fn tty_registry_mut(&mut self) -> &mut self::tty::TtyRegistry {
+        self.runtime_state.tty_registry_mut()
     }
 
     pub fn take_next_fs_handle_badge(&mut self) -> usize {
