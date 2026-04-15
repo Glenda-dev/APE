@@ -521,7 +521,7 @@ impl<'a> ApeManager<'a> {
             (process.tcb(), fault_ep)
         };
         tcb_cap.set_entrypoint(entry_point, initial_sp, initial_tp)?;
-        tcb_cap.set_fault_handler(fault_ep, false)?;
+        tcb_cap.set_fault_handler(fault_ep)?;
         self.close_cloexec_fds(pid)?;
         Ok(())
     }

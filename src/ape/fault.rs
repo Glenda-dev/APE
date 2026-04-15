@@ -4,6 +4,7 @@ use crate::ape::utils::linux_conv::get_exit_code_for_signal;
 #[cfg(feature = "strace")]
 use crate::ape::utils::strace;
 use crate::arch::constants::{INST_PAGE_FAULT, LOAD_PAGE_FAULT, STORE_PAGE_FAULT};
+use crate::arch::parse_syscall_args;
 use crate::syscall::dispatch_syscall;
 use crate::system::signal::{PendingSignalAction, consume_deliverable_signal_on_syscall_return};
 use alloc::vec::Vec;
@@ -499,8 +500,7 @@ impl<'a> FaultService for ApeManager<'a> {
         self.terminate_process(pid, usize::MAX, true)
     }
     fn handle_syscall(&mut self, pid: usize, args: MsgArgs) -> Result<(), Error> {
-        let sys_num = args[0];
-        let sys_args = [args[1], args[2], args[3], args[4], args[5], args[6]];
+        let (sys_num, sys_args) = parse_syscall_args(args);
 
         #[cfg(feature = "strace")]
         let trace_state = strace::trace_syscall_enter(&mut *self, pid, sys_num as u32, sys_args);
