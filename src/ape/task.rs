@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::cmp::{max, min};
 use core::mem::size_of;
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Endpoint, Frame};
+use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Endpoint, Page};
 use glenda::error::Error;
 use glenda::interface::{
     CSpaceService, FileHandleService, FileSystemService, ProcessService, ResourceService,
@@ -184,8 +184,8 @@ impl<'a> ApeManager<'a> {
         let perms = Perms::READ | Perms::WRITE;
 
         let frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
-        self.res_client.alloc(Badge::null(), CapType::Frame, 1, frame_slot)?;
-        let frame = Frame::from(frame_slot);
+        self.res_client.alloc(Badge::null(), CapType::Page, 1, frame_slot)?;
+        let frame = Page::from(frame_slot);
 
         self.map_process_frame(pid, frame, stack_page_vaddr, perms, 1)?;
 
@@ -293,8 +293,9 @@ impl<'a> ApeManager<'a> {
         let tls_size = INITIAL_TLS_PAGES * PGSIZE;
 
         let frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
-        self.res_client.alloc(Badge::null(), CapType::Frame, INITIAL_TLS_PAGES, frame_slot)?;
-        let frame = Frame::from(frame_slot);
+        let tls_level = CapType::page_pages_to_level(INITIAL_TLS_PAGES).ok_or(Error::InvalidArgs)?;
+        self.res_client.alloc(Badge::null(), CapType::Page, tls_level, frame_slot)?;
+        let frame = Page::from(frame_slot);
 
         self.map_process_frame(
             pid,
@@ -384,8 +385,8 @@ impl<'a> ApeManager<'a> {
                 let page_vaddr = start_page + i * PGSIZE;
 
                 let frame_cap = self.cspace_mgr.alloc(&mut *self.res_client)?;
-                self.res_client.alloc(Badge::null(), CapType::Frame, 1, frame_cap)?;
-                let frame = Frame::from(frame_cap);
+                self.res_client.alloc(Badge::null(), CapType::Page, 1, frame_cap)?;
+                let frame = Page::from(frame_cap);
 
                 self.map_process_frame(pid, frame, page_vaddr, perms, 1)?;
 

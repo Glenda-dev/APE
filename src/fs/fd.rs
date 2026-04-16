@@ -7,7 +7,7 @@ use crate::ape::process::{
 use crate::ape::user::USER_PATH_MAX;
 use crate::io::tty::set_terminal_pgrp_local;
 use alloc::format;
-use glenda::cap::{CSPACE_CAP, Endpoint, Frame};
+use glenda::cap::{CSPACE_CAP, Endpoint, Page};
 use glenda::client::{FsClient, TerminalClient};
 use glenda::error::Error;
 use glenda::interface::{
@@ -199,7 +199,7 @@ pub(crate) fn do_openat<'a>(
                 Badge::null(),
                 region.vaddr,
                 region.size,
-                Some(Frame::from(region.frame_slot)),
+                Some(Page::from(region.frame_slot)),
             ) {
                 Ok(()) => {
                     log!("sys_openat: setup_iouring ok pid={}, path={}", pid, path);

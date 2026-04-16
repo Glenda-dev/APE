@@ -2,7 +2,7 @@ use crate::ApeManager;
 use crate::ape::process::MemoryMap;
 use alloc::format;
 use alloc::vec::Vec;
-use glenda::cap::{CapPtr, Frame};
+use glenda::cap::{CapPtr, Page};
 use glenda::error::Error;
 use glenda::interface::{CSpaceService, ProcessService, ResourceService};
 use glenda::ipc::Badge;
@@ -164,7 +164,7 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
 
     for (vaddr, frame_cap, ro_perms) in parent_ro_remaps {
         let _ = mgr.unmap_process_pages(pid, vaddr, 1);
-        mgr.map_process_frame(pid, Frame::from(CapPtr::from(frame_cap)), vaddr, ro_perms, 1)?;
+        mgr.map_process_frame(pid, Page::from(CapPtr::from(frame_cap)), vaddr, ro_perms, 1)?;
     }
 
     {

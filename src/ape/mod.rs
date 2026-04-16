@@ -14,7 +14,7 @@ use crate::config::ApeConfig;
 use crate::layout::{APE_SLOT, FS_ASYNC_POOL_BASE_VADDR, FS_ASYNC_POOL_MAX_REGIONS};
 use alloc::string::String;
 use glenda::arch::mem::{PGSIZE, SHIFTS};
-use glenda::cap::{CNode, CSPACE_CAP, CapPtr, CapType, Endpoint, Frame, Reply, Rights};
+use glenda::cap::{CNode, CSPACE_CAP, CapPtr, CapType, Endpoint, Page, Reply, Rights};
 use glenda::client::*;
 use glenda::error::Error;
 use glenda::interface::{CSpaceService, ResourceService, VSpaceService};
@@ -187,12 +187,13 @@ impl<'a> ApeManager<'a> {
 
         let frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
         let pages = size_aligned / PGSIZE;
-        self.res_client.alloc(Badge::null(), CapType::Frame, pages, frame_slot)?;
-        let frame = Frame::from(frame_slot);
+        let page_level = CapType::page_pages_to_level(pages).ok_or(Error::InvalidArgs)?;
+        self.res_client.alloc(Badge::null(), CapType::Page, page_level, frame_slot)?;
+        let frame = Page::from(frame_slot);
 
         let vaddr = self.fs_state.reserve_async_vaddr(size_aligned).ok_or(Error::OutOfMemory)?;
 
-        self.vspace_mgr.map_frame(
+        self.vspace_mgr.map_page(
             frame,
             vaddr,
             Perms::READ | Perms::WRITE,

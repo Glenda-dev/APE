@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::cmp::min;
 use core::mem::size_of;
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, Frame};
+use glenda::cap::{CapPtr, Page};
 use glenda::error::Error;
 use glenda::interface::VSpaceService;
 use glenda::mem::Perms;
@@ -100,7 +100,7 @@ impl<P: SharedPagePoolPolicy> SharedPagePool<P> {
         }
 
         let pages = align_up(map.size, PGSIZE) / PGSIZE;
-        let frame = Frame::from(CapPtr::from(map.frame_cap));
+        let frame = Page::from(CapPtr::from(map.frame_cap));
         let scratch_vaddr = mgr.vspace_mgr.map_scratch(
             frame,
             perms,

@@ -9,7 +9,7 @@ use crate::syscall::dispatch_syscall;
 use crate::system::signal::{PendingSignalAction, consume_deliverable_signal_on_syscall_return};
 use alloc::vec::Vec;
 use glenda::arch::mem::{PGSIZE, SHIFTS};
-use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Frame, PageTable};
+use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Page, PageTable};
 use glenda::error::Error;
 use glenda::interface::{
     CSpaceService, FaultService, ResourceService, SystemService, VSpaceService,
@@ -20,6 +20,9 @@ use glenda::protocol;
 use glenda::utils::align::align_down;
 use linux_raw_sys::errno::EINTR;
 use linux_raw_sys::general::{SIGBUS, SIGILL, SIGSEGV, SIGTRAP};
+
+const L1_HUGE_PAGES: usize = 1 << (SHIFTS[1] - SHIFTS[0]);
+const L1_HUGE_SIZE: usize = L1_HUGE_PAGES * PGSIZE;
 
 impl<'a> ApeManager<'a> {
     fn cow_fault_perms(perms: Perms) -> Perms {
@@ -81,12 +84,21 @@ impl<'a> ApeManager<'a> {
         pid: usize,
         page_addr: usize,
     ) -> Result<(), Error> {
+        self.ensure_intermediate_page_tables_with_leaf(pid, page_addr, 1)
+    }
+
+    fn ensure_intermediate_page_tables_with_leaf(
+        &mut self,
+        pid: usize,
+        page_addr: usize,
+        leaf_level: usize,
+    ) -> Result<(), Error> {
         let vspace = self.get_process(pid).ok_or(Error::NotFound)?.vspace();
 
         let mut missing_paths = Vec::new();
         {
             let process = self.get_process(pid).ok_or(Error::NotFound)?;
-            for level in (1..SHIFTS.len()).rev() {
+            for level in (leaf_level..SHIFTS.len()).rev() {
                 let prefix = Self::pt_path_prefix(page_addr, level);
                 if !process.has_intermediate_page_table(level, prefix) {
                     missing_paths.push((level, prefix));
@@ -128,17 +140,37 @@ impl<'a> ApeManager<'a> {
     pub(crate) fn map_process_frame(
         &mut self,
         pid: usize,
-        frame: Frame,
+        frame: Page,
         vaddr: usize,
         perms: Perms,
         pages: usize,
     ) -> Result<(), Error> {
-        for i in 0..pages {
-            self.ensure_intermediate_page_tables(pid, vaddr + i * PGSIZE)?;
+        let mut i = 0;
+        while i < pages {
+            let curr_vaddr = vaddr + i * PGSIZE;
+            let remain = pages - i;
+            if curr_vaddr % L1_HUGE_SIZE == 0 && remain >= L1_HUGE_PAGES {
+                self.ensure_intermediate_page_tables_with_leaf(pid, curr_vaddr, 2)?;
+                i += L1_HUGE_PAGES;
+            } else {
+                self.ensure_intermediate_page_tables_with_leaf(pid, curr_vaddr, 1)?;
+                i += 1;
+            }
         }
 
         let vspace = self.get_process(pid).ok_or(Error::NotFound)?.vspace();
-        vspace.map(frame, vaddr, perms, pages)
+        match vspace.map(frame, vaddr, perms, pages) {
+            Ok(()) => Ok(()),
+            Err(Error::MappingFailed) => {
+                // 大页尝试失败（常见于物理地址未对齐）时，回退到全 4K 路径。
+                let _ = vspace.unmap(vaddr, pages * PGSIZE);
+                for j in 0..pages {
+                    self.ensure_intermediate_page_tables_with_leaf(pid, vaddr + j * PGSIZE, 1)?;
+                }
+                vspace.map(frame, vaddr, perms, pages)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub(crate) fn unmap_process_pages(
@@ -168,8 +200,8 @@ impl<'a> ApeManager<'a> {
         mem_type: MemoryType,
     ) -> Result<(), Error> {
         let frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
-        self.res_client.alloc(Badge::null(), CapType::Frame, 1, frame_slot)?;
-        let frame = Frame::from(frame_slot);
+        self.res_client.alloc(Badge::null(), CapType::Page, 1, frame_slot)?;
+        let frame = Page::from(frame_slot);
         self.map_process_frame(pid, frame, page_addr, perms, 1)?;
 
         let process = self.get_process_mut(pid).ok_or(Error::NotFound)?;
@@ -192,7 +224,7 @@ impl<'a> ApeManager<'a> {
         frame_cap: usize,
         perms: Perms,
     ) -> Result<(), Error> {
-        let frame = Frame::from(CapPtr::from(frame_cap));
+        let frame = Page::from(CapPtr::from(frame_cap));
 
         // 先尝试移除旧映射（若不存在则忽略），随后补齐中间页表并重映射。
         let _ = self.unmap_process_pages(pid, page_addr, 1);
@@ -218,10 +250,10 @@ impl<'a> ApeManager<'a> {
         }
 
         let new_frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
-        self.res_client.alloc(Badge::null(), CapType::Frame, 1, new_frame_slot)?;
+        self.res_client.alloc(Badge::null(), CapType::Page, 1, new_frame_slot)?;
 
-        let old_frame = Frame::from(CapPtr::from(old_frame_cap));
-        let new_frame = Frame::from(new_frame_slot);
+        let old_frame = Page::from(CapPtr::from(old_frame_cap));
+        let new_frame = Page::from(new_frame_slot);
 
         let src = self.vspace_mgr.map_scratch(
             old_frame,

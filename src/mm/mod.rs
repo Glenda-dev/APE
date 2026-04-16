@@ -3,7 +3,7 @@ use crate::ape::process::{MemoryMap, MemoryType};
 use alloc::vec::Vec;
 use core::cmp::min;
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, Frame};
+use glenda::cap::{CapPtr, Page};
 use glenda::error::Error;
 use glenda::mem::Perms;
 use glenda::utils::align::{align_down, align_up};
@@ -396,7 +396,7 @@ pub(crate) fn do_mprotect<'a>(
 
     for (page, frame_cap) in &pages {
         let _ = mgr.unmap_process_pages(pid, *page, 1);
-        mgr.map_process_frame(pid, Frame::from(CapPtr::from(*frame_cap)), *page, new_perms, 1)?;
+        mgr.map_process_frame(pid, Page::from(CapPtr::from(*frame_cap)), *page, new_perms, 1)?;
     }
 
     if let Some(process) = mgr.get_process_mut(pid) {
@@ -549,7 +549,7 @@ pub(crate) fn do_mremap<'a>(
         if let RemapPageState::Mapped { frame_cap, flags } = page_states[i]
             && let Err(e) = mgr.map_process_frame(
                 pid,
-                Frame::from(CapPtr::from(frame_cap)),
+                Page::from(CapPtr::from(frame_cap)),
                 target + i * PGSIZE,
                 flags,
                 1,
