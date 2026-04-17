@@ -4,9 +4,10 @@ use alloc::format;
 use alloc::vec::Vec;
 use glenda::cap::{CapPtr, Page};
 use glenda::error::Error;
-use glenda::interface::{CSpaceService, ProcessService, ResourceService};
+use glenda::interface::{AuthService, CSpaceService, ProcessService, ResourceService};
 use glenda::ipc::Badge;
 use glenda::mem::Perms;
+use glenda::protocol::auth::IdentityInfo;
 use linux_raw_sys::errno::{ECHILD, ENOSYS};
 use linux_raw_sys::general::{
     CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, CLONE_VFORK, CLONE_VM,
@@ -84,6 +85,7 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         parent_mmap_next,
         parent_mmap_limit,
         parent_clear_child_tid,
+        parent_identity,
         parent_signal_actions,
         parent_signal_blocked,
         parent_stopped,
@@ -109,6 +111,7 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         usize,
         usize,
         usize,
+        IdentityInfo,
         alloc::collections::BTreeMap<usize, crate::ape::process::SignalAction>,
         u64,
         bool,
@@ -136,6 +139,7 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
             parent.mmap_next,
             parent.mmap_limit,
             parent.clear_child_tid,
+            parent.identity,
             parent.signal_actions.clone(),
             parent.signal_blocked,
             parent.stopped,
@@ -190,6 +194,7 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         child.mmap_next = parent_mmap_next;
         child.mmap_limit = parent_mmap_limit;
         child.clear_child_tid = parent_clear_child_tid;
+        child.identity = parent_identity;
         child.signal_actions = parent_signal_actions;
         child.signal_blocked = parent_signal_blocked;
         // Linux 语义：fork 后子进程 pending signal 为空。
@@ -205,6 +210,10 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         for map in parent_lazy_maps {
             child.add_lazy_memory_map(map);
         }
+    }
+
+    if let Some(child) = mgr.get_process(child_pid) {
+        let _ = mgr.auth_client.set_identity(child_pid, child.identity);
     }
 
     Ok(child_pid)

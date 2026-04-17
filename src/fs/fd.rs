@@ -349,15 +349,6 @@ pub(crate) fn do_fcntl<'a>(
             if process.next_fd <= new_fd {
                 process.next_fd = new_fd.saturating_add(1);
             }
-
-            log!(
-                "sys_fcntl: pid={}, cmd={}, fd={}, new_fd={}, cloexec={}",
-                pid,
-                cmd,
-                fd,
-                new_fd,
-                new_cloexec
-            );
             Ok(new_fd as isize)
         }
         _ => Err(Error::InvalidArgs),

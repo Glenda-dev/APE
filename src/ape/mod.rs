@@ -17,7 +17,7 @@ use glenda::arch::mem::{PGSIZE, SHIFTS};
 use glenda::cap::{CNode, CSPACE_CAP, CapPtr, CapType, Endpoint, Page, Reply, Rights};
 use glenda::client::*;
 use glenda::error::Error;
-use glenda::interface::{CSpaceService, ResourceService, VSpaceService};
+use glenda::interface::{AuthService, CSpaceService, ResourceService, VSpaceService};
 use glenda::ipc::Badge;
 use glenda::mem::{Perms, TRAMPOLINE_VA, get_trapframe_va, get_utcb_va};
 use glenda::utils::align::align_up;
@@ -44,6 +44,7 @@ pub struct ApeManager<'a> {
     pub vol_client: &'a mut VolumeClient,
     pub fs_client: &'a mut FsClient,
     pub time_client: &'a mut TimeClient,
+    pub auth_client: &'a mut AuthClient,
     pub cspace_mgr: &'a mut CSpaceManager,
     pub vspace_mgr: &'a mut VSpaceManager,
 }
@@ -66,6 +67,7 @@ impl<'a> ApeManager<'a> {
         vol_client: &'a mut VolumeClient,
         fs_client: &'a mut FsClient,
         time_client: &'a mut TimeClient,
+        auth_client: &'a mut AuthClient,
         cspace_mgr: &'a mut CSpaceManager,
         vspace_mgr: &'a mut VSpaceManager,
     ) -> Self {
@@ -86,6 +88,7 @@ impl<'a> ApeManager<'a> {
             vol_client,
             fs_client,
             time_client,
+            auth_client,
             cspace_mgr,
             vspace_mgr,
         }
@@ -109,7 +112,9 @@ impl<'a> ApeManager<'a> {
 
         let mut proc = SubProcess::new(pid, parent_pid, proc_cnode);
         Self::seed_initial_pagetable_paths(&mut proc);
+        let identity = proc.identity;
         self.task_state.register_process(pid, host_pid, proc);
+        let _ = self.auth_client.set_identity(pid, identity);
         pid
     }
 

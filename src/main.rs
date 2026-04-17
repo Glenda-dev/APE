@@ -25,14 +25,14 @@ use glenda::cap::{
     VSPACE_CAP,
 };
 use glenda::client::{
-    FsClient, InitClient, ProcessClient, ResourceClient, TimeClient, VirtualTerminalClient,
-    VolumeClient,
+    AuthClient, FsClient, InitClient, ProcessClient, ResourceClient, TimeClient,
+    VirtualTerminalClient, VolumeClient,
 };
 use glenda::interface::{ResourceService, SystemService};
 use glenda::ipc::Badge;
 use glenda::protocol::resource::{
-    APE_ENDPOINT, FS_ENDPOINT, INIT_ENDPOINT, ResourceType, TIME_ENDPOINT, VOLUME_ENDPOINT,
-    VT_ENDPOINT,
+    APE_ENDPOINT, FACTOTUM_ENDPOINT, FS_ENDPOINT, INIT_ENDPOINT, ResourceType, TIME_ENDPOINT,
+    VOLUME_ENDPOINT, VT_ENDPOINT,
 };
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
 use layout::*;
@@ -42,7 +42,7 @@ fn main() -> usize {
     glenda::console::init_logging("APE");
     log!("Starting ANSI/POSIX Environment...");
 
-    let mut cspace_mgr = CSpaceManager::new(CSPACE_CAP, 16);
+    let mut cspace_mgr = CSpaceManager::new(CSPACE_CAP, CSPACE_DYNAMIC_L1_START_SLOT);
     let mut vspace_mgr = VSpaceManager::new(VSPACE_CAP, VSPACE_SCRATCH_START, VSPACE_SCRATCH_END);
     let mut res_client = ResourceClient::new(MONITOR_CAP);
     let mut proc_client = ProcessClient::new(MONITOR_CAP);
@@ -81,6 +81,11 @@ fn main() -> usize {
     let mut time_client = TimeClient::new(TIME_CAP);
 
     res_client
+        .get_cap(Badge::null(), ResourceType::Endpoint, FACTOTUM_ENDPOINT, AUTH_SLOT)
+        .expect("Failed to get factotum endpoint");
+    let mut auth_client = AuthClient::new(AUTH_CAP);
+
+    res_client
         .alloc(Badge::null(), CapType::Endpoint, 0, ENDPOINT_SLOT)
         .expect("Failed to alloc endpoint");
     // Register APE endpoint to monitor
@@ -96,6 +101,7 @@ fn main() -> usize {
         &mut vol_client,
         &mut fs_client,
         &mut time_client,
+        &mut auth_client,
         &mut cspace_mgr,
         &mut vspace_mgr,
     );

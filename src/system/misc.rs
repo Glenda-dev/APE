@@ -1,10 +1,24 @@
 use crate::ApeManager;
 use glenda::error::Error;
+use glenda::interface::auth::AuthService;
+use glenda::protocol::auth::IdentityInfo;
 use linux_raw_sys::errno::EAGAIN;
 use linux_raw_sys::general::{
     FUTEX_CMD_MASK, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAIT_BITSET_PRIVATE, FUTEX_WAIT_PRIVATE,
     FUTEX_WAKE, FUTEX_WAKE_PRIVATE,
 };
+
+fn load_identity(mgr: &mut ApeManager<'_>, pid: usize) -> Result<IdentityInfo, Error> {
+    match mgr.auth_client.get_identity(pid) {
+        Ok(identity) => {
+            if let Some(process) = mgr.get_process_mut(pid) {
+                process.identity = identity;
+            }
+            Ok(identity)
+        }
+        Err(_) => mgr.get_process(pid).map(|p| p.identity).ok_or(Error::NotFound),
+    }
+}
 
 pub(crate) fn do_getrandom(
     mgr: &mut ApeManager<'_>,
@@ -21,24 +35,20 @@ pub(crate) fn do_getrandom(
     Ok(len as isize)
 }
 
-pub(crate) fn do_getuid(_mgr: &mut ApeManager<'_>, _pid: usize) -> Result<isize, Error> {
-    // TODO(ape): 接入进程凭据，返回真实 uid。
-    Ok(0)
+pub(crate) fn do_getuid(mgr: &mut ApeManager<'_>, pid: usize) -> Result<isize, Error> {
+    Ok(load_identity(mgr, pid)?.uid as isize)
 }
 
-pub(crate) fn do_geteuid(_mgr: &mut ApeManager<'_>, _pid: usize) -> Result<isize, Error> {
-    // TODO(ape): 接入进程凭据，返回真实 euid。
-    Ok(0)
+pub(crate) fn do_geteuid(mgr: &mut ApeManager<'_>, pid: usize) -> Result<isize, Error> {
+    Ok(load_identity(mgr, pid)?.euid as isize)
 }
 
-pub(crate) fn do_getgid(_mgr: &mut ApeManager<'_>, _pid: usize) -> Result<isize, Error> {
-    // TODO(ape): 接入进程凭据，返回真实 gid。
-    Ok(0)
+pub(crate) fn do_getgid(mgr: &mut ApeManager<'_>, pid: usize) -> Result<isize, Error> {
+    Ok(load_identity(mgr, pid)?.gid as isize)
 }
 
-pub(crate) fn do_getegid(_mgr: &mut ApeManager<'_>, _pid: usize) -> Result<isize, Error> {
-    // TODO(ape): 接入进程凭据，返回真实 egid。
-    Ok(0)
+pub(crate) fn do_getegid(mgr: &mut ApeManager<'_>, pid: usize) -> Result<isize, Error> {
+    Ok(load_identity(mgr, pid)?.egid as isize)
 }
 
 pub(crate) fn do_sched_yield(_mgr: &mut ApeManager<'_>, _pid: usize) -> Result<isize, Error> {

@@ -9,6 +9,7 @@ use glenda::client::FsClient;
 use glenda::client::TerminalClient;
 use glenda::io::uring::IoUringClient;
 use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
+use glenda::protocol::auth::IdentityInfo;
 use linux_raw_sys::general::{SIGKILL, SIGSTOP};
 
 pub const SIGNAL_MIN: usize = 1;
@@ -117,6 +118,7 @@ pub struct SubProcess {
     pub session_id: usize,
     pub process_group_id: usize,
     pub controlling_tty: Option<usize>,
+    pub identity: IdentityInfo,
     pub cnode_cap: CNode, // Copy of CNode capability
     pub root_dir: String,
     pub cwd: String,
@@ -151,6 +153,7 @@ impl SubProcess {
             session_id: pid,
             process_group_id: pid,
             controlling_tty: None,
+            identity: IdentityInfo::default(),
             cnode_cap,
             root_dir: String::from(DEFAULT_PROCESS_ROOT),
             cwd: String::from(DEFAULT_PROCESS_ROOT),
