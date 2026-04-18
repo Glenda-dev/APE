@@ -99,6 +99,7 @@ pub struct ApeFsState {
     async_free: Vec<usize>,
     next_async_vaddr: usize,
     next_handle_badge: usize,
+    iouring_supported: Option<bool>,
 }
 
 impl ApeFsState {
@@ -108,7 +109,20 @@ impl ApeFsState {
             async_free: Vec::new(),
             next_async_vaddr,
             next_handle_badge,
+            iouring_supported: None,
         }
+    }
+
+    pub fn should_try_iouring(&self) -> bool {
+        self.iouring_supported != Some(false)
+    }
+
+    pub fn mark_iouring_supported(&mut self) {
+        self.iouring_supported = Some(true);
+    }
+
+    pub fn mark_iouring_unsupported(&mut self) {
+        self.iouring_supported = Some(false);
     }
 
     pub fn take_next_handle_badge(&mut self) -> usize {

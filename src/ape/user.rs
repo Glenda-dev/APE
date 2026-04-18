@@ -201,6 +201,47 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
         Ok(())
     }
 
+    /// 直接将用户空间数据复制到目标原始指针地址。
+    ///
+    /// 该接口用于 io_uring 快路径，避免通过临时切片造成额外中间层。
+    pub(crate) fn copy_from_user_to_ptr(
+        &mut self,
+        user_src: usize,
+        dst_ptr: *mut u8,
+        len: usize,
+    ) -> Result<(), Error> {
+        if len == 0 {
+            return Ok(());
+        }
+        if user_src == 0 || dst_ptr.is_null() {
+            return Err(Error::InvalidAddress);
+        }
+
+        let mut copied = 0usize;
+        let mut cursor = user_src;
+
+        while copied < len {
+            let map = self.lookup_map(cursor, Perms::READ)?;
+
+            let start = cursor - map.vaddr;
+            let chunk = min(map.size - start, len - copied);
+            if chunk == 0 {
+                return Err(Error::InvalidAddress);
+            }
+
+            let scratch = self.pool.acquire(self.mgr, &map, Perms::READ)?;
+            let src_ptr = (scratch + start) as *const u8;
+            unsafe {
+                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr.add(copied), chunk);
+            }
+
+            copied += chunk;
+            cursor = cursor.saturating_add(chunk);
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn copy_to_user(&mut self, user_dst: usize, src: &[u8]) -> Result<(), Error> {
         if src.is_empty() {
             return Ok(());
@@ -228,6 +269,49 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
             let dst =
                 unsafe { core::slice::from_raw_parts_mut((scratch + start) as *mut u8, chunk) };
             dst.copy_from_slice(&src[copied..copied + chunk]);
+
+            copied += chunk;
+            cursor = cursor.saturating_add(chunk);
+        }
+
+        Ok(())
+    }
+
+    /// 从源原始指针地址直接复制到用户空间。
+    ///
+    /// 该接口用于 io_uring 快路径，确保 APE -> 用户空间单次搬运。
+    pub(crate) fn copy_to_user_from_ptr(
+        &mut self,
+        user_dst: usize,
+        src_ptr: *const u8,
+        len: usize,
+    ) -> Result<(), Error> {
+        if len == 0 {
+            return Ok(());
+        }
+        if user_dst == 0 || src_ptr.is_null() {
+            return Err(Error::InvalidAddress);
+        }
+
+        let mut copied = 0usize;
+        let mut cursor = user_dst;
+
+        while copied < len {
+            let map = self.lookup_map(cursor, Perms::WRITE)?;
+
+            let start = cursor - map.vaddr;
+            let chunk = min(map.size - start, len - copied);
+            if chunk == 0 {
+                return Err(Error::InvalidAddress);
+            }
+
+            // RISC-V 要求可写页同时具备可读属性（W=1 且 R=0 为无效叶子 PTE）。
+            // 对用户页执行 copy_to_user 时，scratch 映射必须至少是 RW。
+            let scratch = self.pool.acquire(self.mgr, &map, Perms::READ | Perms::WRITE)?;
+            let dst_ptr = (scratch + start) as *mut u8;
+            unsafe {
+                core::ptr::copy_nonoverlapping(src_ptr.add(copied), dst_ptr, chunk);
+            }
 
             copied += chunk;
             cursor = cursor.saturating_add(chunk);

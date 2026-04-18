@@ -220,4 +220,16 @@ impl<'a> ApeManager<'a> {
     pub fn recycle_fs_async_region(&mut self, region_id: usize) {
         self.fs_state.recycle_region(region_id);
     }
+
+    pub fn should_try_fs_iouring(&self) -> bool {
+        self.fs_state.should_try_iouring()
+    }
+
+    pub fn mark_fs_iouring_supported(&mut self) {
+        self.fs_state.mark_iouring_supported();
+    }
+
+    pub fn mark_fs_iouring_unsupported(&mut self) {
+        self.fs_state.mark_iouring_unsupported();
+    }
 }

@@ -67,11 +67,8 @@ pub(crate) fn do_read<'a>(
                             break;
                         }
 
-                        let src = unsafe {
-                            core::slice::from_raw_parts(data_vaddr as *const u8, read_len)
-                        };
                         let user_dst = buf_ptr.checked_add(total).ok_or(Error::InvalidAddress)?;
-                        sess.copy_to_user(user_dst, src)?;
+                        sess.copy_to_user_from_ptr(user_dst, data_vaddr as *const u8, read_len)?;
 
                         total += read_len;
                         file_off = file_off.saturating_add(read_len);
@@ -159,11 +156,8 @@ pub(crate) fn do_write<'a>(
                             break;
                         }
 
-                        let dst = unsafe {
-                            core::slice::from_raw_parts_mut(data_vaddr as *mut u8, data_len)
-                        };
                         let user_src = buf_ptr.checked_add(total).ok_or(Error::InvalidAddress)?;
-                        sess.copy_from_user(user_src, &mut dst[..chunk])?;
+                        sess.copy_from_user_to_ptr(user_src, data_vaddr as *mut u8, chunk)?;
 
                         let written = async_submit_and_wait(
                             fs_client,

@@ -129,6 +129,7 @@ impl<'a> ApeManager<'a> {
     }
 
     fn read_exec_image_from_fs(&mut self, pid: usize, path: &str) -> Result<Vec<u8>, Error> {
+        log!("execve: reading image pid={} path={}", pid, path);
         let stat = match self.fs_client.stat_path(Badge::null(), path) {
             Ok(stat) => stat,
             Err(e) => {
@@ -152,11 +153,28 @@ impl<'a> ApeManager<'a> {
         }
         let fs_ep = Endpoint::from(fs_ep_slot);
         let mut handle_client = glenda::client::FsClient::new(fs_ep);
+        log!("execve: open ok pid={} path={} size={} ep={:?}", pid, path, size, fs_ep);
 
         let mut elf_data = alloc::vec![0u8; size];
         let mut offset = 0;
         while offset < size {
-            let read_len = handle_client.read(Badge::null(), offset, &mut elf_data[offset..])?;
+            let read_len = match handle_client.read(Badge::null(), offset, &mut elf_data[offset..]) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!(
+                        "execve: read failed pid={} path={} off={} remain={} err={:?}",
+                        pid,
+                        path,
+                        offset,
+                        size.saturating_sub(offset),
+                        e
+                    );
+                    let _ = handle_client.close(Badge::null());
+                    let _ = CSPACE_CAP.delete(fs_ep_slot);
+                    self.cspace_mgr.free(fs_ep_slot);
+                    return Err(e);
+                }
+            };
             if read_len == 0 {
                 error!("read_exec_image_from_fs: unexpected EOF while reading exec image");
                 handle_client.close(Badge::null())?;
@@ -166,7 +184,13 @@ impl<'a> ApeManager<'a> {
             }
             offset += read_len;
         }
-        handle_client.close(Badge::null())?;
+        if let Err(e) = handle_client.close(Badge::null()) {
+            error!("execve: close failed pid={} path={} err={:?}", pid, path, e);
+            let _ = CSPACE_CAP.delete(fs_ep_slot);
+            self.cspace_mgr.free(fs_ep_slot);
+            return Err(e);
+        }
+        log!("execve: read complete pid={} path={} bytes={}", pid, path, size);
         let _ = CSPACE_CAP.delete(fs_ep_slot);
         self.cspace_mgr.free(fs_ep_slot);
         Ok(elf_data)

@@ -25,8 +25,7 @@ const FS_ASYNC_RING_SIZE: usize = 4096;
 const FS_ASYNC_DATA_OFFSET: usize = FS_ASYNC_RING_SIZE;
 const FS_ASYNC_SQ_ENTRIES: u32 = 16;
 const FS_ASYNC_CQ_ENTRIES: u32 = 16;
-// TODO(ape): io_uring 路径稳定后启用，并补齐错误恢复与资源回收测试。
-const ENABLE_FS_ASYNC_IO: bool = false;
+const ENABLE_FS_ASYNC_IO: bool = true;
 
 enum DevicePathKind {
     StdioTty,
@@ -173,7 +172,7 @@ pub(crate) fn do_openat<'a>(
     let mut fs_client = FsClient::new(fs_ep);
 
     let mut async_io = None;
-    if ENABLE_FS_ASYNC_IO {
+    if ENABLE_FS_ASYNC_IO && mgr.should_try_fs_iouring() {
         if let Ok(region) = mgr.allocate_fs_async_region(FS_ASYNC_REGION_SIZE) {
             log!(
                 "sys_openat: try setup_iouring pid={}, path={}, region_id={}, vaddr={:#x}, size={}",
@@ -193,7 +192,10 @@ pub(crate) fn do_openat<'a>(
                 )
             };
             let mut ring = IoUringClient::new(ring_buf);
-            ring.set_server_notify(fs_client.endpoint());
+            // NOTE:
+            // 通过 Nexus 代理的文件句柄 endpoint 无法可靠承载 io_uring 的 notify badge 路由，
+            // 直接 notify 会在 Nexus 侧落入未知请求分支。
+            // APE 的读写路径会在 submit 后显式调用 process_iouring()，因此这里不设置 notify。
 
             match fs_client.setup_iouring(
                 Badge::null(),
@@ -202,7 +204,7 @@ pub(crate) fn do_openat<'a>(
                 Some(Page::from(region.frame_slot)),
             ) {
                 Ok(()) => {
-                    log!("sys_openat: setup_iouring ok pid={}, path={}", pid, path);
+                    mgr.mark_fs_iouring_supported();
                     let data_vaddr = region.vaddr + FS_ASYNC_DATA_OFFSET;
                     if data_vaddr < region.vaddr + region.size {
                         let data_len = region.size - FS_ASYNC_DATA_OFFSET;
@@ -218,23 +220,20 @@ pub(crate) fn do_openat<'a>(
                     }
                 }
                 Err(Error::NotSupported) => {
-                    log!(
-                        "sys_openat: setup_iouring not supported pid={}, path={}, fallback sync",
-                        pid,
-                        path
+                    mgr.mark_fs_iouring_unsupported();
+                    warn!(
+                        "sys_openat: setup_iouring not supported pid={}, path={}, disable async probe and fallback sync",
+                        pid, path
                     );
                     mgr.recycle_fs_async_region(region.id);
                 }
                 Err(e) => {
-                    error!(
-                        "sys_openat: setup_iouring failed pid={}, path={}, err={:?}",
+                    warn!(
+                        "sys_openat: setup_iouring failed pid={}, path={}, err={:?}; disable async probe and fallback sync",
                         pid, path, e
                     );
-                    let _ = fs_client.close(Badge::null());
-                    let _ = CSPACE_CAP.delete(fs_ep_slot);
-                    mgr.cspace_mgr.free(fs_ep_slot);
+                    mgr.mark_fs_iouring_unsupported();
                     mgr.recycle_fs_async_region(region.id);
-                    return Err(e);
                 }
             }
         }
