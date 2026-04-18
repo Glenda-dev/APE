@@ -106,7 +106,7 @@ fn main() -> usize {
         &mut vspace_mgr,
     );
 
-    ape_mgr.listen(ENDPOINT_CAP, RECV_SLOT, REPLY_SLOT).expect("Failed to listen");
+    ape_mgr.listen(ENDPOINT_CAP, REPLY_SLOT, RECV_SLOT).expect("Failed to listen");
     ape_mgr.init().expect("Failed to init");
     ape_mgr.run().expect("Failed to run");
     0

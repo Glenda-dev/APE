@@ -533,7 +533,6 @@ impl<'a> FaultService for ApeManager<'a> {
     }
     fn handle_syscall(&mut self, pid: usize, args: MsgArgs) -> Result<(), Error> {
         let (sys_num, sys_args) = parse_syscall_args(args);
-
         #[cfg(feature = "strace")]
         let trace_state = strace::trace_syscall_enter(&mut *self, pid, sys_num as u32, sys_args);
 

@@ -174,15 +174,6 @@ pub(crate) fn do_openat<'a>(
     let mut async_io = None;
     if ENABLE_FS_ASYNC_IO && mgr.should_try_fs_iouring() {
         if let Ok(region) = mgr.allocate_fs_async_region(FS_ASYNC_REGION_SIZE) {
-            log!(
-                "sys_openat: try setup_iouring pid={}, path={}, region_id={}, vaddr={:#x}, size={}",
-                pid,
-                path,
-                region.id,
-                region.vaddr,
-                region.size
-            );
-
             let ring_buf = unsafe {
                 IoUringBuffer::new(
                     region.vaddr as *mut u8,
