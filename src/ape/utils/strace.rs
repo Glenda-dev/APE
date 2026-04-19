@@ -7,6 +7,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::min;
 use core::mem::size_of;
+use glenda::arch::time::get_time;
 use linux_raw_sys::errno::*;
 use linux_raw_sys::general::*;
 use linux_raw_sys::ioctl::*;
@@ -132,6 +133,12 @@ fn errno_name_desc(errno: u32) -> Option<(&'static str, &'static str)> {
 
 pub struct TraceState {
     enter_call: Option<String>,
+    start_ticks: u64,
+}
+
+#[inline]
+fn now_ticks() -> u64 {
+    get_time() as u64
 }
 
 pub fn trace_syscall_enter<'a>(
@@ -151,7 +158,10 @@ pub fn trace_syscall_enter<'a>(
         __NR_writev => Some(trace_writev(mgr, pid, args)),
         _ => None,
     };
-    TraceState { enter_call }
+    TraceState {
+        enter_call,
+        start_ticks: now_ticks(),
+    }
 }
 
 pub fn trace_syscall_exit<'a>(
@@ -162,6 +172,7 @@ pub fn trace_syscall_exit<'a>(
     ret: isize,
     state: &TraceState,
 ) {
+    let elapsed_ticks = now_ticks().wrapping_sub(state.start_ticks);
     let call = match sys_num {
         __NR_execve => enter_or_fallback(state, || trace_execve_enter(mgr, pid, args)),
         __NR_exit => trace_exit_like("exit", args),
@@ -222,7 +233,13 @@ pub fn trace_syscall_exit<'a>(
         _ => trace_default(sys_num, args),
     };
 
-    debug!("[pid {}] {} = {}", pid, call, format_result(sys_num, ret));
+    debug!(
+        "[pid {}] {} = {} <{} ticks>",
+        pid,
+        call,
+        format_result(sys_num, ret),
+        elapsed_ticks
+    );
 }
 
 fn enter_or_fallback<F>(state: &TraceState, fallback: F) -> String
