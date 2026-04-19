@@ -35,6 +35,10 @@ pub(crate) fn syscall_name(sys_num: u32) -> &'static str {
         __NR_readv => "readv",
         __NR_writev => "writev",
         __NR_openat => "openat",
+        __NR_pipe2 => "pipe2",
+        __NR_linkat => "linkat",
+        __NR_mount => "mount",
+        __NR_umount2 => "umount2",
         __NR_newfstatat => "newfstatat",
         __NR_close => "close",
         __NR_getcwd => "getcwd",
@@ -176,6 +180,10 @@ pub fn trace_syscall_exit<'a>(
         __NR_exit_group => trace_exit_like("exit_group", args),
         __NR_brk => trace_brk(args),
         __NR_openat => enter_or_fallback(state, || trace_openat(mgr, pid, args)),
+        __NR_pipe2 => trace_pipe2(args),
+        __NR_linkat => trace_linkat(mgr, pid, args),
+        __NR_mount => trace_mount(mgr, pid, args),
+        __NR_umount2 => trace_umount2(mgr, pid, args),
         __NR_newfstatat => enter_or_fallback(state, || trace_newfstatat(mgr, pid, args)),
         __NR_read => trace_read(mgr, pid, args, ret),
         __NR_write => enter_or_fallback(state, || trace_write(mgr, pid, args)),
@@ -313,6 +321,40 @@ fn trace_newfstatat<'a>(mgr: &mut ApeManager<'a>, pid: usize, args: [usize; 6]) 
     let statbuf = format_ptr(args[2]);
     let flags = format_at_flags(args[3] as u32);
     format!("newfstatat({}, {}, {}, {})", dirfd, path, statbuf, flags)
+}
+
+fn trace_pipe2(args: [usize; 6]) -> String {
+    format!("pipe2({}, {})", format_ptr(args[0]), format_pipe2_flags(args[1] as u32))
+}
+
+fn trace_linkat<'a>(mgr: &mut ApeManager<'a>, pid: usize, args: [usize; 6]) -> String {
+    format!(
+        "linkat({}, {}, {}, {}, {})",
+        format_dirfd(args[0]),
+        read_user_path(mgr, pid, args[1]),
+        format_dirfd(args[2]),
+        read_user_path(mgr, pid, args[3]),
+        format_linkat_flags(args[4] as u32)
+    )
+}
+
+fn trace_mount<'a>(mgr: &mut ApeManager<'a>, pid: usize, args: [usize; 6]) -> String {
+    format!(
+        "mount({}, {}, {}, {}, {})",
+        read_user_path(mgr, pid, args[0]),
+        read_user_path(mgr, pid, args[1]),
+        read_user_path(mgr, pid, args[2]),
+        format_mount_flags(args[3] as u32),
+        format_ptr(args[4])
+    )
+}
+
+fn trace_umount2<'a>(mgr: &mut ApeManager<'a>, pid: usize, args: [usize; 6]) -> String {
+    format!(
+        "umount2({}, {})",
+        read_user_path(mgr, pid, args[0]),
+        format_umount_flags(args[1] as u32)
+    )
 }
 
 fn trace_read<'a>(mgr: &mut ApeManager<'a>, pid: usize, args: [usize; 6], ret: isize) -> String {
@@ -839,6 +881,67 @@ fn format_at_flags(flags: u32) -> String {
     }
     if flags & AT_NO_AUTOMOUNT as u32 != 0 {
         parts.push("AT_NO_AUTOMOUNT");
+    }
+    if flags & AT_REMOVEDIR as u32 != 0 {
+        parts.push("AT_REMOVEDIR");
+    }
+    if flags & AT_SYMLINK_FOLLOW as u32 != 0 {
+        parts.push("AT_SYMLINK_FOLLOW");
+    }
+    join_flags(&parts)
+}
+
+fn format_linkat_flags(flags: u32) -> String {
+    if flags == 0 {
+        return "0".to_string();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    if flags & AT_SYMLINK_FOLLOW as u32 != 0 {
+        parts.push("AT_SYMLINK_FOLLOW");
+    }
+    if flags & AT_EMPTY_PATH as u32 != 0 {
+        parts.push("AT_EMPTY_PATH");
+    }
+    join_flags(&parts)
+}
+
+fn format_pipe2_flags(flags: u32) -> String {
+    if flags == 0 {
+        return "0".to_string();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    if flags & O_CLOEXEC != 0 {
+        parts.push("O_CLOEXEC");
+    }
+    if flags & O_NONBLOCK != 0 {
+        parts.push("O_NONBLOCK");
+    }
+    join_flags(&parts)
+}
+
+fn format_mount_flags(flags: u32) -> String {
+    if flags == 0 {
+        return "0".to_string();
+    }
+    format!("{:#x}", flags)
+}
+
+fn format_umount_flags(flags: u32) -> String {
+    if flags == 0 {
+        return "0".to_string();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    if flags & MNT_FORCE != 0 {
+        parts.push("MNT_FORCE");
+    }
+    if flags & MNT_DETACH != 0 {
+        parts.push("MNT_DETACH");
+    }
+    if flags & MNT_EXPIRE != 0 {
+        parts.push("MNT_EXPIRE");
+    }
+    if flags & UMOUNT_NOFOLLOW != 0 {
+        parts.push("UMOUNT_NOFOLLOW");
     }
     join_flags(&parts)
 }

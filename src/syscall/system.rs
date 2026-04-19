@@ -99,6 +99,10 @@ pub fn sys_gettimeofday<'a>(
     system_subsystem::do_gettimeofday(mgr, pid, tv, tz)
 }
 
+pub fn sys_times<'a>(mgr: &mut ApeManager<'a>, pid: usize, tms_ptr: usize) -> Result<isize, Error> {
+    system_subsystem::do_times(mgr, pid, tms_ptr)
+}
+
 pub fn sys_nanosleep<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,

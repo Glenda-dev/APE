@@ -1,12 +1,13 @@
 use crate::ApeManager;
 use crate::ape::path::path_inside_root;
 use crate::ape::process::{
-    AsyncIoState, FileHandle, FileType, NormalFileHandle, PseudoCharDevice, PtyMasterHandle,
-    PtySlaveHandle,
+    AsyncIoState, FileHandle, FileType, NormalFileHandle, PipeEndHandle, PseudoCharDevice,
+    PtyMasterHandle, PtySlaveHandle,
 };
 use crate::ape::user::USER_PATH_MAX;
 use crate::io::tty::set_terminal_pgrp_local;
 use alloc::format;
+use alloc::vec::Vec;
 use glenda::cap::{CSPACE_CAP, Endpoint, Page};
 use glenda::client::{FsClient, TerminalClient};
 use glenda::error::Error;
@@ -16,8 +17,18 @@ use glenda::interface::{
 use glenda::io::uring::{IoUringBuffer, IoUringClient};
 use glenda::ipc::Badge;
 use linux_raw_sys::general::{
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC,
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC, O_CLOEXEC,
+    O_NONBLOCK,
 };
+
+const DIRENT64_FIXED_SIZE: usize = 8 + 8 + 2 + 1;
+const DIRENT64_MIN_RECLEN: usize = 24;
+const PIPE2_ALLOWED_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
+
+#[inline]
+fn align_up_8(v: usize) -> usize {
+    (v + 7) & !7
+}
 
 // 4KB ring + 12KB data window，降低每 fd 的常驻内存。
 const FS_ASYNC_REGION_SIZE: usize = 16 * 1024;
@@ -292,6 +303,12 @@ pub(crate) fn do_close<'a>(
             let _ = CSPACE_CAP.delete(slave.ep_slot);
             mgr.cspace_mgr.free(slave.ep_slot);
         }
+        FileType::PipeRead(pipe) => {
+            mgr.close_pipe_read_end(pipe.pipe_id);
+        }
+        FileType::PipeWrite(pipe) => {
+            mgr.close_pipe_write_end(pipe.pipe_id);
+        }
         FileType::Normal(mut normal) => {
             let _ = normal.fs_client.close(Badge::null());
             if !normal.fs_ep_slot.is_null() {
@@ -319,49 +336,278 @@ pub(crate) fn do_fcntl<'a>(
     let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
     let cmd = u32::try_from(cmd).map_err(|_| Error::InvalidArgs)?;
 
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    if !process.fds.contains_key(&fd) {
-        return Err(Error::InvalidSlot);
-    }
-
     match cmd {
         F_GETFD => {
+            let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+            if !process.fds.contains_key(&fd) {
+                return Err(Error::InvalidSlot);
+            }
             let cloexec = process.fd_cloexec.get(&fd).copied().unwrap_or(false);
             Ok(if cloexec { FD_CLOEXEC as isize } else { 0 })
         }
         F_SETFD => {
+            let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+            if !process.fds.contains_key(&fd) {
+                return Err(Error::InvalidSlot);
+            }
             let cloexec = (arg & (FD_CLOEXEC as usize)) != 0;
             process.fd_cloexec.insert(fd, cloexec);
             Ok(0)
         }
         F_GETFL => {
+            let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+            if !process.fds.contains_key(&fd) {
+                return Err(Error::InvalidSlot);
+            }
             // TODO(ape): 维护并返回真实文件状态标志（O_APPEND/O_NONBLOCK 等）。
             Ok(0)
         }
         F_SETFL => {
+            let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+            if !process.fds.contains_key(&fd) {
+                return Err(Error::InvalidSlot);
+            }
             // TODO(ape): 应用并持久化可变状态标志，影响后续 I/O 行为。
             Ok(0)
         }
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            let min_fd = u32::try_from(arg).map_err(|_| Error::InvalidArgs)?;
-            let mut new_fd = min_fd;
-            while process.fds.contains_key(&new_fd) {
-                new_fd = new_fd.checked_add(1).ok_or(Error::OutOfMemory)?;
+            let (new_fd, pipe_clone) = {
+                let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+                if !process.fds.contains_key(&fd) {
+                    return Err(Error::InvalidSlot);
+                }
+
+                let min_fd = u32::try_from(arg).map_err(|_| Error::InvalidArgs)?;
+                let mut new_fd = min_fd;
+                while process.fds.contains_key(&new_fd) {
+                    new_fd = new_fd.checked_add(1).ok_or(Error::OutOfMemory)?;
+                }
+
+                let cloned = process.fds.get(&fd).cloned().ok_or(Error::InvalidSlot)?;
+                let pipe_clone = match cloned.file_type {
+                    FileType::PipeRead(pipe) => Some((true, pipe.pipe_id)),
+                    FileType::PipeWrite(pipe) => Some((false, pipe.pipe_id)),
+                    _ => None,
+                };
+
+                process.fds.insert(new_fd, cloned);
+                if let Some(path) = process.fd_paths.get(&fd).cloned() {
+                    process.fd_paths.insert(new_fd, path);
+                }
+
+                let new_cloexec = cmd == F_DUPFD_CLOEXEC;
+                process.fd_cloexec.insert(new_fd, new_cloexec);
+                if process.next_fd <= new_fd {
+                    process.next_fd = new_fd.saturating_add(1);
+                }
+
+                (new_fd, pipe_clone)
+            };
+
+            if let Some((is_read, pipe_id)) = pipe_clone {
+                if is_read {
+                    mgr.clone_pipe_read_end(pipe_id);
+                } else {
+                    mgr.clone_pipe_write_end(pipe_id);
+                }
             }
 
-            let cloned = process.fds.get(&fd).cloned().ok_or(Error::InvalidSlot)?;
-            process.fds.insert(new_fd, cloned);
-            if let Some(path) = process.fd_paths.get(&fd).cloned() {
-                process.fd_paths.insert(new_fd, path);
-            }
-
-            let new_cloexec = cmd == F_DUPFD_CLOEXEC;
-            process.fd_cloexec.insert(new_fd, new_cloexec);
-            if process.next_fd <= new_fd {
-                process.next_fd = new_fd.saturating_add(1);
-            }
+            mgr.ledger_record_fd_open(pid);
             Ok(new_fd as isize)
         }
         _ => Err(Error::InvalidArgs),
     }
+}
+
+pub(crate) fn do_dup<'a>(mgr: &mut ApeManager<'a>, pid: usize, fd: usize) -> Result<isize, Error> {
+    do_fcntl(mgr, pid, fd, F_DUPFD as usize, 0)
+}
+
+pub(crate) fn do_dup3<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    oldfd: usize,
+    newfd: usize,
+    flags: usize,
+) -> Result<isize, Error> {
+    let oldfd = u32::try_from(oldfd).map_err(|_| Error::InvalidSlot)?;
+    let newfd = u32::try_from(newfd).map_err(|_| Error::InvalidSlot)?;
+
+    if oldfd == newfd {
+        return Err(Error::InvalidArgs);
+    }
+    if (flags & !(O_CLOEXEC as usize)) != 0 {
+        return Err(Error::InvalidArgs);
+    }
+
+    let (cloned, path_clone) = {
+        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        (
+            process.fds.get(&oldfd).cloned().ok_or(Error::InvalidSlot)?,
+            process.fd_paths.get(&oldfd).cloned(),
+        )
+    };
+
+    let need_close_target = {
+        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        process.fds.contains_key(&newfd)
+    };
+    if need_close_target {
+        do_close(mgr, pid, newfd as usize)?;
+    }
+
+    match cloned.file_type {
+        FileType::PipeRead(pipe) => mgr.clone_pipe_read_end(pipe.pipe_id),
+        FileType::PipeWrite(pipe) => mgr.clone_pipe_write_end(pipe.pipe_id),
+        _ => {}
+    }
+
+    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+    process.fds.insert(newfd, cloned);
+    if let Some(path) = path_clone {
+        process.fd_paths.insert(newfd, path);
+    }
+    process.fd_cloexec.insert(newfd, (flags & (O_CLOEXEC as usize)) != 0);
+    if process.next_fd <= newfd {
+        process.next_fd = newfd.saturating_add(1);
+    }
+
+    mgr.ledger_record_fd_open(pid);
+    Ok(newfd as isize)
+}
+
+pub(crate) fn do_getdents64<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    fd: usize,
+    dirp: usize,
+    count: usize,
+) -> Result<isize, Error> {
+    if count == 0 {
+        return Ok(0);
+    }
+    if dirp == 0 {
+        return Err(Error::InvalidAddress);
+    }
+    if count < DIRENT64_MIN_RECLEN {
+        return Err(Error::InvalidArgs);
+    }
+
+    let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
+
+    let mut handle = {
+        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+        process.fds.remove(&fd).ok_or(Error::InvalidSlot)?
+    };
+
+    let result = (|| {
+        let entries = match &mut handle.file_type {
+            FileType::Normal(normal) => normal.fs_client.getdents(Badge::null(), count)?,
+            _ => return Err(Error::InvalidType),
+        };
+
+        let mut packed = Vec::new();
+        for entry in entries {
+            let name_len = entry
+                .d_name
+                .iter()
+                .position(|b| *b == 0)
+                .unwrap_or(entry.d_name.len());
+
+            let reclen = align_up_8(DIRENT64_FIXED_SIZE + name_len + 1);
+            if reclen > u16::MAX as usize {
+                return Err(Error::OutOfMemory);
+            }
+            if packed.len().saturating_add(reclen) > count {
+                break;
+            }
+
+            let start = packed.len();
+            packed.extend_from_slice(&(entry.d_ino as u64).to_ne_bytes());
+            packed.extend_from_slice(&entry.d_off.to_ne_bytes());
+            packed.extend_from_slice(&(reclen as u16).to_ne_bytes());
+            packed.push(entry.d_type);
+            packed.extend_from_slice(&entry.d_name[..name_len]);
+            packed.push(0);
+            packed.resize(start + reclen, 0);
+        }
+
+        if !packed.is_empty() {
+            mgr.copy_to_user(pid, dirp, &packed)?;
+        }
+
+        Ok(packed.len() as isize)
+    })();
+
+    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+    process.fds.insert(fd, handle);
+    result
+}
+
+pub(crate) fn do_pipe2<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    pipefd: usize,
+    flags: usize,
+) -> Result<isize, Error> {
+    if pipefd == 0 {
+        return Err(Error::InvalidAddress);
+    }
+
+    let flags = u32::try_from(flags).map_err(|_| Error::InvalidArgs)?;
+    if flags & !PIPE2_ALLOWED_FLAGS != 0 {
+        return Err(Error::InvalidArgs);
+    }
+
+    let pipe_id = mgr.create_pipe();
+    let cloexec = (flags & O_CLOEXEC) != 0;
+
+    let (read_fd, write_fd) = {
+        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+
+        let mut read_fd = process.next_fd;
+        while process.fds.contains_key(&read_fd) {
+            read_fd = read_fd.checked_add(1).ok_or(Error::OutOfMemory)?;
+        }
+
+        let mut write_fd = read_fd.checked_add(1).ok_or(Error::OutOfMemory)?;
+        while process.fds.contains_key(&write_fd) {
+            write_fd = write_fd.checked_add(1).ok_or(Error::OutOfMemory)?;
+        }
+
+        process.fds.insert(
+            read_fd,
+            FileHandle { file_type: FileType::PipeRead(PipeEndHandle { pipe_id }) },
+        );
+        process.fds.insert(
+            write_fd,
+            FileHandle { file_type: FileType::PipeWrite(PipeEndHandle { pipe_id }) },
+        );
+        process.fd_cloexec.insert(read_fd, cloexec);
+        process.fd_cloexec.insert(write_fd, cloexec);
+        process.next_fd = write_fd.saturating_add(1);
+
+        (read_fd, write_fd)
+    };
+
+    let read_i32 = i32::try_from(read_fd).map_err(|_| Error::OutOfMemory)?;
+    let write_i32 = i32::try_from(write_fd).map_err(|_| Error::OutOfMemory)?;
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&read_i32.to_ne_bytes());
+    out[4..].copy_from_slice(&write_i32.to_ne_bytes());
+
+    if let Err(e) = mgr.copy_to_user(pid, pipefd, &out) {
+        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+        process.fds.remove(&read_fd);
+        process.fds.remove(&write_fd);
+        process.fd_cloexec.remove(&read_fd);
+        process.fd_cloexec.remove(&write_fd);
+        mgr.close_pipe_read_end(pipe_id);
+        mgr.close_pipe_write_end(pipe_id);
+        return Err(e);
+    }
+
+    mgr.ledger_record_fd_open(pid);
+    mgr.ledger_record_fd_open(pid);
+    Ok(0)
 }

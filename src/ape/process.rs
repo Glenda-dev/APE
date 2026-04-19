@@ -98,6 +98,11 @@ pub struct PtySlaveHandle {
     pub ep_slot: CapPtr,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PipeEndHandle {
+    pub pipe_id: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PseudoCharDevice {
     Null,
@@ -113,6 +118,8 @@ pub enum FileType {
     PtyMaster(PtyMasterHandle),
     PtySlave(PtySlaveHandle),
     PseudoChar(PseudoCharDevice),
+    PipeRead(PipeEndHandle),
+    PipeWrite(PipeEndHandle),
 }
 
 #[derive(Debug, Clone)]

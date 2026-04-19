@@ -11,12 +11,26 @@ pub(crate) fn route_syscall<'a>(
     args: [usize; 6],
 ) -> Result<isize, Error> {
     match decode_ape_syscall(sys_num) {
+        ApeSyscall::Dup => fs::sys_dup(mgr, pid, args[0]),
+        ApeSyscall::Dup3 => fs::sys_dup3(mgr, pid, args[0], args[1], args[2]),
         ApeSyscall::Read => io::sys_read(mgr, pid, args[0], args[1], args[2]),
         ApeSyscall::Write => io::sys_write(mgr, pid, args[0], args[1], args[2]),
         ApeSyscall::Readv => io::sys_readv(mgr, pid, args[0], args[1], args[2]),
         ApeSyscall::Writev => io::sys_writev(mgr, pid, args[0], args[1], args[2]),
         ApeSyscall::OpenAt => fs::sys_openat(mgr, pid, args[0], args[1], args[2], args[3]),
         ApeSyscall::NewFstatAt => fs::sys_newfstatat(mgr, pid, args[0], args[1], args[2], args[3]),
+        ApeSyscall::Fstat => fs::sys_fstat(mgr, pid, args[0], args[1]),
+        ApeSyscall::Getdents64 => fs::sys_getdents64(mgr, pid, args[0], args[1], args[2]),
+        ApeSyscall::MkdirAt => fs::sys_mkdirat(mgr, pid, args[0], args[1], args[2]),
+        ApeSyscall::UnlinkAt => fs::sys_unlinkat(mgr, pid, args[0], args[1], args[2]),
+        ApeSyscall::LinkAt => {
+            fs::sys_linkat(mgr, pid, args[0], args[1], args[2], args[3], args[4])
+        }
+        ApeSyscall::Mount => {
+            fs::sys_mount(mgr, pid, args[0], args[1], args[2], args[3], args[4])
+        }
+        ApeSyscall::Umount2 => fs::sys_umount2(mgr, pid, args[0], args[1]),
+        ApeSyscall::Pipe2 => fs::sys_pipe2(mgr, pid, args[0], args[1]),
         ApeSyscall::Close => fs::sys_close(mgr, pid, args[0]),
         ApeSyscall::GetCwd => system::sys_getcwd(mgr, pid, args[0], args[1]),
         ApeSyscall::Chdir => system::sys_chdir(mgr, pid, args[0]),
@@ -67,6 +81,7 @@ pub(crate) fn route_syscall<'a>(
         }
         ApeSyscall::ClockGettime => system::sys_clock_gettime(mgr, pid, args[0], args[1]),
         ApeSyscall::Gettimeofday => system::sys_gettimeofday(mgr, pid, args[0], args[1]),
+        ApeSyscall::Times => system::sys_times(mgr, pid, args[0]),
         ApeSyscall::Nanosleep => system::sys_nanosleep(mgr, pid, args[0], args[1]),
         ApeSyscall::Ppoll => {
             system::sys_ppoll(mgr, pid, args[0], args[1], args[2], args[3], args[4])

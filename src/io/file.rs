@@ -1,5 +1,6 @@
 use crate::ApeManager;
 use crate::ape::process::{FileHandle, FileType, PseudoCharDevice};
+use alloc::vec;
 use core::cmp::min;
 use core::mem::size_of;
 use glenda::client::FsClient;
@@ -9,6 +10,7 @@ use glenda::io::uring::{IOURING_OP_READ, IOURING_OP_WRITE, IoUringClient, IoUrin
 use glenda::ipc::Badge;
 use glenda::ipc::IPC_BUFFER_SIZE;
 use linux_raw_sys::ctypes::c_uint;
+use linux_raw_sys::errno::{EAGAIN, EBADF, EPIPE};
 use linux_raw_sys::general::{SEEK_CUR, SEEK_END, SEEK_SET, iovec};
 
 pub(crate) fn do_read<'a>(
@@ -36,6 +38,20 @@ pub(crate) fn do_read<'a>(
                 Ok(len as isize)
             }
         },
+        FileType::PipeRead(pipe) => {
+            let chunk = min(len, IPC_BUFFER_SIZE);
+            let mut tmp = vec![0u8; chunk];
+            let (n, writers_closed) = mgr.pipe_read(pipe.pipe_id, &mut tmp).ok_or(Error::InvalidSlot)?;
+            if n == 0 {
+                if writers_closed {
+                    return Ok(0);
+                }
+                return Ok(-(EAGAIN as isize));
+            }
+            mgr.copy_to_user(pid, buf_ptr, &tmp[..n])?;
+            Ok(n as isize)
+        }
+        FileType::PipeWrite(_) => Ok(-(EBADF as isize)),
         FileType::Terminal(term) => crate::io::tty::do_read_terminal(mgr, pid, *term, buf_ptr, len),
         FileType::Normal(normal) => {
             if normal.async_io.is_none() {
@@ -139,6 +155,20 @@ pub(crate) fn do_write<'a>(
             crate::io::tty::do_write_terminal(mgr, pid, slave.term, buf_ptr, len)
         }
         FileType::PseudoChar(_) => Ok(len as isize),
+        FileType::PipeRead(_) => Ok(-(EBADF as isize)),
+        FileType::PipeWrite(pipe) => {
+            let chunk = min(len, IPC_BUFFER_SIZE);
+            let mut tmp = vec![0u8; chunk];
+            mgr.copy_from_user(pid, buf_ptr, &mut tmp)?;
+            let (n, no_readers) = mgr.pipe_write(pipe.pipe_id, &tmp).ok_or(Error::InvalidSlot)?;
+            if no_readers {
+                return Ok(-(EPIPE as isize));
+            }
+            if n == 0 {
+                return Ok(-(EAGAIN as isize));
+            }
+            Ok(n as isize)
+        }
         FileType::Terminal(term) => {
             crate::io::tty::do_write_terminal(mgr, pid, *term, buf_ptr, len)
         }
@@ -244,6 +274,7 @@ pub(crate) fn do_lseek<'a>(
     with_fd_handle_mut(mgr, pid, fd, |_mgr, handle| match &mut handle.file_type {
         FileType::PtyMaster(_) | FileType::PtySlave(_) => Err(Error::InvalidArgs),
         FileType::PseudoChar(_) => Ok(0),
+        FileType::PipeRead(_) | FileType::PipeWrite(_) => Err(Error::InvalidArgs),
         FileType::Terminal(_) => Err(Error::InvalidArgs),
         FileType::Normal(normal) => {
             let base: isize = match whence as u32 {
@@ -289,6 +320,7 @@ pub(crate) fn do_ioctl<'a>(
         FileType::PtySlave(slave) => {
             crate::io::tty::do_ioctl_terminal(mgr, pid, slave.term, req, argp)
         }
+        FileType::PipeRead(_) | FileType::PipeWrite(_) => Err(Error::InvalidType),
         FileType::PseudoChar(_) => Err(Error::InvalidType),
         FileType::Terminal(term) => crate::io::tty::do_ioctl_terminal(mgr, pid, *term, req, argp),
         FileType::Normal(_) => Err(Error::InvalidType),

@@ -13,12 +13,23 @@ use linux_raw_sys::general::{
     CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID,
     RLIM64_INFINITY, rlimit64, timeval,
 };
+use linux_raw_sys::ctypes::c_long;
 use linux_raw_sys::system::{__NEW_UTS_LEN, new_utsname};
 
 const UTS_STR_LEN: usize = (__NEW_UTS_LEN as usize) + 1;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 const NSEC_PER_USEC: u64 = 1_000;
 const SLEEP_POLL_MS: usize = 4;
+const TIMES_CLK_TCK: u64 = 100;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxTms {
+    tms_utime: c_long,
+    tms_stime: c_long,
+    tms_cutime: c_long,
+    tms_cstime: c_long,
+}
 
 #[inline]
 fn ns_to_timespec(ns: u64) -> __kernel_timespec {
@@ -167,6 +178,26 @@ pub(crate) fn do_gettimeofday(
         mgr.write_obj_to_user(pid, tv, &tv_obj)?;
     }
     Ok(0)
+}
+
+pub(crate) fn do_times(
+    mgr: &mut ApeManager<'_>,
+    pid: usize,
+    tms_ptr: usize,
+) -> Result<isize, Error> {
+    let mono_ns = mgr.time_client.mono_now(Badge::null())?;
+    let ticks = mono_ns
+        .checked_mul(TIMES_CLK_TCK)
+        .and_then(|v| v.checked_div(NSEC_PER_SEC))
+        .unwrap_or(u64::MAX);
+
+    if tms_ptr != 0 {
+        // TODO(ape): 基于任务统计填充 utime/stime/cutime/cstime。
+        let tms = LinuxTms::default();
+        mgr.write_obj_to_user(pid, tms_ptr, &tms)?;
+    }
+
+    Ok(i64::try_from(ticks).unwrap_or(i64::MAX) as isize)
 }
 
 pub(crate) fn do_nanosleep(

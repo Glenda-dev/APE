@@ -289,6 +289,16 @@ pub struct ApeFsState {
     next_async_vaddr: usize,
     next_handle_badge: usize,
     iouring_supported: Option<bool>,
+    pipes: BTreeMap<usize, PipeState>,
+    next_pipe_id: usize,
+}
+
+const PIPE_DEFAULT_CAPACITY: usize = 64 * 1024;
+
+struct PipeState {
+    buf: VecDeque<u8>,
+    readers: usize,
+    writers: usize,
 }
 
 impl ApeFsState {
@@ -299,6 +309,84 @@ impl ApeFsState {
             next_async_vaddr,
             next_handle_badge,
             iouring_supported: None,
+            pipes: BTreeMap::new(),
+            next_pipe_id: 1,
+        }
+    }
+
+    pub fn create_pipe(&mut self) -> usize {
+        let pipe_id = self.next_pipe_id;
+        self.next_pipe_id = self.next_pipe_id.wrapping_add(1);
+        self.pipes.insert(
+            pipe_id,
+            PipeState {
+                buf: VecDeque::with_capacity(PIPE_DEFAULT_CAPACITY),
+                readers: 1,
+                writers: 1,
+            },
+        );
+        pipe_id
+    }
+
+    pub fn pipe_read(&mut self, pipe_id: usize, dst: &mut [u8]) -> Option<(usize, bool)> {
+        let pipe = self.pipes.get_mut(&pipe_id)?;
+        let mut n = 0usize;
+        while n < dst.len() {
+            if let Some(b) = pipe.buf.pop_front() {
+                dst[n] = b;
+                n += 1;
+            } else {
+                break;
+            }
+        }
+        Some((n, pipe.writers == 0))
+    }
+
+    pub fn pipe_write(&mut self, pipe_id: usize, src: &[u8]) -> Option<(usize, bool)> {
+        let pipe = self.pipes.get_mut(&pipe_id)?;
+        if pipe.readers == 0 {
+            return Some((0, true));
+        }
+
+        let free = PIPE_DEFAULT_CAPACITY.saturating_sub(pipe.buf.len());
+        let write_len = core::cmp::min(free, src.len());
+        for &b in &src[..write_len] {
+            pipe.buf.push_back(b);
+        }
+        Some((write_len, false))
+    }
+
+    pub fn close_pipe_read_end(&mut self, pipe_id: usize) {
+        let mut remove = false;
+        if let Some(pipe) = self.pipes.get_mut(&pipe_id) {
+            pipe.readers = pipe.readers.saturating_sub(1);
+            remove = pipe.readers == 0 && pipe.writers == 0;
+        }
+        if remove {
+            let _ = self.pipes.remove(&pipe_id);
+        }
+    }
+
+    pub fn close_pipe_write_end(&mut self, pipe_id: usize) {
+        let mut remove = false;
+        if let Some(pipe) = self.pipes.get_mut(&pipe_id) {
+            pipe.writers = pipe.writers.saturating_sub(1);
+            remove = pipe.readers == 0 && pipe.writers == 0;
+        }
+        if remove {
+            let _ = self.pipes.remove(&pipe_id);
+        }
+    }
+
+    pub fn clone_pipe_read_end(&mut self, pipe_id: usize) {
+        if let Some(pipe) = self.pipes.get_mut(&pipe_id) {
+            pipe.readers = pipe.readers.saturating_add(1);
+        }
+    }
+
+    pub fn clone_pipe_write_end(&mut self, pipe_id: usize) {
+        if let Some(pipe) = self.pipes.get_mut(&pipe_id) {
+            pipe.writers = pipe.writers.saturating_add(1);
         }
     }
 

@@ -348,6 +348,34 @@ impl<'a> ApeManager<'a> {
         self.fs_state.should_try_iouring()
     }
 
+    pub fn create_pipe(&mut self) -> usize {
+        self.fs_state.create_pipe()
+    }
+
+    pub fn pipe_read(&mut self, pipe_id: usize, dst: &mut [u8]) -> Option<(usize, bool)> {
+        self.fs_state.pipe_read(pipe_id, dst)
+    }
+
+    pub fn pipe_write(&mut self, pipe_id: usize, src: &[u8]) -> Option<(usize, bool)> {
+        self.fs_state.pipe_write(pipe_id, src)
+    }
+
+    pub fn close_pipe_read_end(&mut self, pipe_id: usize) {
+        self.fs_state.close_pipe_read_end(pipe_id);
+    }
+
+    pub fn close_pipe_write_end(&mut self, pipe_id: usize) {
+        self.fs_state.close_pipe_write_end(pipe_id);
+    }
+
+    pub fn clone_pipe_read_end(&mut self, pipe_id: usize) {
+        self.fs_state.clone_pipe_read_end(pipe_id);
+    }
+
+    pub fn clone_pipe_write_end(&mut self, pipe_id: usize) {
+        self.fs_state.clone_pipe_write_end(pipe_id);
+    }
+
     pub fn mark_fs_iouring_supported(&mut self) {
         self.fs_state.mark_iouring_supported();
     }

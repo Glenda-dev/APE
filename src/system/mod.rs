@@ -15,4 +15,6 @@ pub(crate) use signal::{
     do_rt_sigaction, do_rt_sigpending, do_rt_sigprocmask, do_rt_sigreturn, do_rt_sigsuspend,
     do_rt_sigtimedwait, do_set_robust_list,
 };
-pub(crate) use time::{do_clock_gettime, do_gettimeofday, do_nanosleep, do_prlimit64, do_uname};
+pub(crate) use time::{
+    do_clock_gettime, do_gettimeofday, do_nanosleep, do_prlimit64, do_times, do_uname,
+};

@@ -1,5 +1,5 @@
 use crate::ApeManager;
-use crate::ape::process::MemoryMap;
+use crate::ape::process::{FileType, MemoryMap};
 use crate::layout::APE_SLOT;
 use alloc::format;
 use alloc::vec::Vec;
@@ -254,6 +254,26 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         }
         for map in parent_lazy_maps {
             child.add_lazy_memory_map(map);
+        }
+    }
+
+    let pipe_clones: Vec<(bool, usize)> = {
+        let child = mgr.get_process(child_pid).ok_or(Error::NotFound)?;
+        child
+            .fds
+            .values()
+            .filter_map(|handle| match handle.file_type {
+                FileType::PipeRead(pipe) => Some((true, pipe.pipe_id)),
+                FileType::PipeWrite(pipe) => Some((false, pipe.pipe_id)),
+                _ => None,
+            })
+            .collect()
+    };
+    for (is_read, pipe_id) in pipe_clones {
+        if is_read {
+            mgr.clone_pipe_read_end(pipe_id);
+        } else {
+            mgr.clone_pipe_write_end(pipe_id);
         }
     }
 
