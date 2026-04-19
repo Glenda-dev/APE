@@ -267,8 +267,13 @@ pub(crate) fn consume_deliverable_signal_on_syscall_return(
     }
 
     if action.handler != SIG_DFL_HANDLER {
-        // TODO(ape/signal,phase4): 接入用户态 signal trampoline + sigframe，
-        // 让用户 handler 真正执行；当前仅返回 Interrupt 进行最小兼容。
+        let tcb = mgr.get_process(pid).ok_or(Error::NotFound)?.tcb();
+        if let Err(e) = tcb.deliver_upcall(action.handler, signum, 0, 0, 0) {
+            warn!(
+                "signal: failed to deliver handler pid={} signo={} handler={:#x}: {:?}",
+                pid, signum, action.handler, e
+            );
+        }
         let restart = (action.flags & SA_RESTART as usize) != 0;
         return Ok(PendingSignalAction::Interrupt { restart });
     }
