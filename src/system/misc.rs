@@ -2,11 +2,8 @@ use crate::ApeManager;
 use glenda::error::Error;
 use glenda::interface::auth::AuthService;
 use glenda::protocol::auth::IdentityInfo;
+use libape::policy::{FutexOpClass, classify_futex_op};
 use linux_raw_sys::errno::EAGAIN;
-use linux_raw_sys::general::{
-    FUTEX_CMD_MASK, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAIT_BITSET_PRIVATE, FUTEX_WAIT_PRIVATE,
-    FUTEX_WAKE, FUTEX_WAKE_PRIVATE,
-};
 
 fn load_identity(mgr: &mut ApeManager<'_>, pid: usize) -> Result<IdentityInfo, Error> {
     match mgr.auth_client.get_identity(pid) {
@@ -80,12 +77,9 @@ pub(crate) fn do_futex(
     _val3: usize,
 ) -> Result<isize, Error> {
     // TODO(ape): 实现 futex 等待队列与唤醒匹配，补齐 FUTEX_* 完整语义。
-    let cmd = futex_op & FUTEX_CMD_MASK as usize;
-    match cmd as u32 {
-        FUTEX_WAKE | FUTEX_WAKE_PRIVATE => Ok(0),
-        FUTEX_WAIT | FUTEX_WAIT_PRIVATE | FUTEX_WAIT_BITSET | FUTEX_WAIT_BITSET_PRIVATE => {
-            Ok(-(EAGAIN as isize))
-        }
-        _ => Ok(0),
+    match classify_futex_op(futex_op) {
+        FutexOpClass::Wake => Ok(0),
+        FutexOpClass::Wait => Ok(-(EAGAIN as isize)),
+        FutexOpClass::Other => Ok(0),
     }
 }
