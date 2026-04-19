@@ -35,13 +35,17 @@ fn default_termios() -> [u8; TTY_TERMIOS_SIZE] {
     t
 }
 
-#[derive(Debug, Clone)]
 pub struct TtyCompatState {
     pub termios: [u8; TTY_TERMIOS_SIZE],
     pub winsize: WindowSize,
     pub pgrp: i32,
     pub canonical_line_buf: VecDeque<u8>,
     pub readable_buf: VecDeque<u8>,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub saved_cursor_row: u16,
+    pub saved_cursor_col: u16,
+    pub ansi_parser: anstyle_parse::Parser<anstyle_parse::DefaultCharAccumulator>,
 }
 
 impl Default for TtyCompatState {
@@ -52,6 +56,11 @@ impl Default for TtyCompatState {
             pgrp: 0,
             canonical_line_buf: VecDeque::new(),
             readable_buf: VecDeque::new(),
+            cursor_row: 1,
+            cursor_col: 1,
+            saved_cursor_row: 1,
+            saved_cursor_col: 1,
+            ansi_parser: anstyle_parse::Parser::<anstyle_parse::DefaultCharAccumulator>::new(),
         }
     }
 }

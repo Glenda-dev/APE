@@ -1,5 +1,5 @@
 use crate::ApeManager;
-use crate::ape::tty::{TTY_TERMIOS_SIZE, TtyCompatState, ldisc};
+use crate::ape::tty::{TTY_TERMIOS_SIZE, TtyCompatState, ansi, ldisc};
 use crate::ape::utils::linux_conv::{
     host_window_size_to_linux_winsize, linux_winsize_to_host_window_size,
 };
@@ -278,6 +278,11 @@ pub(crate) fn do_write_terminal<'a>(
     ensure_prism_stream_mode(term);
     let mut kbuf = alloc::vec![0u8; len];
     mgr.copy_from_user(pid, buf_ptr, &mut kbuf)?;
+
+    ensure_tty_state(mgr, term);
+    if let Some(state) = mgr.tty_registry_mut().get_mut(term) {
+        ansi::process_output(state, &kbuf);
+    }
 
     let mut utcb = unsafe { UTCB::new() };
     let tag = MsgTag::new(

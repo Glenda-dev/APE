@@ -77,9 +77,7 @@ pub(crate) fn route_syscall<'a>(
         ApeSyscall::Getgid => system::sys_getgid(mgr, pid),
         ApeSyscall::Getegid => system::sys_getegid(mgr, pid),
         ApeSyscall::Clone => task::sys_clone(mgr, pid, args[0], args[1], args[2], args[3], args[4]),
-        ApeSyscall::Wait4 => {
-            task::sys_wait4(mgr, pid, args[0] as isize, args[1], args[2], args[3])
-        }
+        ApeSyscall::Wait4 => task::sys_wait4(mgr, pid, args[0] as isize, args[1], args[2], args[3]),
         ApeSyscall::Setsid => task::sys_setsid(mgr, pid),
         ApeSyscall::Getsid => task::sys_getsid(mgr, pid, args[0]),
         ApeSyscall::Setpgid => task::sys_setpgid(mgr, pid, args[0], args[1]),

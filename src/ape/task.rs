@@ -130,13 +130,7 @@ impl<'a> ApeManager<'a> {
                 let entry = frame_pages.entry(slot).or_insert(0usize);
                 *entry = core::cmp::max(*entry, pages);
             }
-            (
-                fd_list,
-                mapped_pages,
-                frame_pages,
-                process.parent_pid,
-                process.process_group_id,
-            )
+            (fd_list, mapped_pages, frame_pages, process.parent_pid, process.process_group_id)
         };
 
         for fd in fd_list {

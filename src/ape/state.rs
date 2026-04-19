@@ -193,7 +193,12 @@ impl ApeTaskState {
     ) -> bool {
         self.processes.values().any(|proc| {
             proc.parent_pid == parent_pid
-                && Self::matches_wait_target(proc.pid, proc.process_group_id, target_pid, caller_pgid)
+                && Self::matches_wait_target(
+                    proc.pid,
+                    proc.process_group_id,
+                    target_pid,
+                    caller_pgid,
+                )
         })
     }
 

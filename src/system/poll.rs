@@ -80,7 +80,10 @@ pub(crate) fn do_ppoll(
             }
 
             let out = unsafe {
-                core::slice::from_raw_parts((&pfd as *const pollfd) as *const u8, size_of::<pollfd>())
+                core::slice::from_raw_parts(
+                    (&pfd as *const pollfd) as *const u8,
+                    size_of::<pollfd>(),
+                )
             };
             mgr.copy_to_user(pid, p, out)?;
         }

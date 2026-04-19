@@ -6,15 +6,16 @@ use alloc::vec::Vec;
 use glenda::arch::mem::PGSIZE;
 use glenda::cap::{CapPtr, CapType, Endpoint, Page};
 use glenda::error::Error;
-use glenda::interface::{AuthService, CSpaceService, ProcessService, ResourceService, VSpaceService};
+use glenda::interface::{
+    AuthService, CSpaceService, ProcessService, ResourceService, VSpaceService,
+};
 use glenda::ipc::Badge;
 use glenda::mem::Perms;
 use glenda::protocol::auth::IdentityInfo;
 use glenda::utils::align::align_up;
 use linux_raw_sys::errno::{ECHILD, ENOSYS};
 use linux_raw_sys::general::{
-    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, CLONE_VFORK, CLONE_VM,
-    WNOHANG,
+    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, CLONE_VFORK, CLONE_VM, WNOHANG,
 };
 
 pub(crate) fn do_getpid(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Error> {
@@ -162,9 +163,13 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
 
         if map.flags.contains(Perms::WRITE) {
             let new_frame_slot = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
-            mgr.res_client
-                .alloc(Badge::null(), CapType::Page, pages, new_frame_slot)?;
-            mgr.ledger_record_frame_alloc(child_pid, new_frame_slot, pages, "fork_private_writable_map");
+            mgr.res_client.alloc(Badge::null(), CapType::Page, pages, new_frame_slot)?;
+            mgr.ledger_record_frame_alloc(
+                child_pid,
+                new_frame_slot,
+                pages,
+                "fork_private_writable_map",
+            );
 
             let old_frame = Page::from(CapPtr::from(map.frame_cap));
             let new_frame = Page::from(new_frame_slot);
@@ -260,10 +265,7 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         let parent_tcb = mgr.get_process(pid).ok_or(Error::NotFound)?.tcb();
         let child_tcb = mgr.get_process(child_pid).ok_or(Error::NotFound)?.tcb();
         let fault_ep = Endpoint::from(CapPtr::concat(
-            mgr.get_process(child_pid)
-                .ok_or(Error::NotFound)?
-                .cspace()
-                .cap(),
+            mgr.get_process(child_pid).ok_or(Error::NotFound)?.cspace().cap(),
             APE_SLOT,
         ));
         child_tcb.set_fault_handler(fault_ep)?;
@@ -318,7 +320,8 @@ pub(crate) fn do_wait4(
 ) -> Result<isize, Error> {
     let caller_pgid = mgr.get_process(pid).ok_or(Error::NotFound)?.process_group_id;
 
-    if let Some((reaped_pid, status)) = mgr.pop_waitable_exited_child(pid, target_pid, caller_pgid) {
+    if let Some((reaped_pid, status)) = mgr.pop_waitable_exited_child(pid, target_pid, caller_pgid)
+    {
         if wstatus != 0 {
             mgr.copy_to_user(pid, wstatus, &status.to_ne_bytes())?;
         }

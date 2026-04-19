@@ -37,10 +37,7 @@ fn do_reboot_runtime(mgr: &mut ApeManager<'_>, caller_pid: usize) -> Result<(), 
             continue;
         }
         if let Err(e) = mgr.terminate_process_preserve_reply(victim, 0, false) {
-            warn!(
-                "sys_reboot: failed to terminate pid {} during APE reboot: {:?}",
-                victim, e
-            );
+            warn!("sys_reboot: failed to terminate pid {} during APE reboot: {:?}", victim, e);
         }
     }
 
