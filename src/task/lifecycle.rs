@@ -1,23 +1,21 @@
 use crate::ApeManager;
 use crate::ape::process::MemoryMap;
+use crate::layout::APE_SLOT;
 use alloc::format;
 use alloc::vec::Vec;
-use glenda::cap::{CapPtr, Page};
+use glenda::arch::mem::PGSIZE;
+use glenda::cap::{CapPtr, CapType, Endpoint, Page};
 use glenda::error::Error;
-use glenda::interface::{AuthService, CSpaceService, ProcessService, ResourceService};
+use glenda::interface::{AuthService, CSpaceService, ProcessService, ResourceService, VSpaceService};
 use glenda::ipc::Badge;
 use glenda::mem::Perms;
 use glenda::protocol::auth::IdentityInfo;
+use glenda::utils::align::align_up;
 use linux_raw_sys::errno::{ECHILD, ENOSYS};
 use linux_raw_sys::general::{
     CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, CLONE_VFORK, CLONE_VM,
+    WNOHANG,
 };
-
-fn cow_fault_perms(perms: Perms) -> Perms {
-    let mut p = perms;
-    p.remove(Perms::WRITE);
-    p
-}
 
 pub(crate) fn do_getpid(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Error> {
     let _ = mgr;
@@ -40,7 +38,7 @@ pub(crate) fn do_set_tid_address(
 }
 
 pub(crate) fn do_exit(mgr: &mut ApeManager<'_>, pid: usize, code: usize) -> Result<(), Error> {
-    mgr.terminate_process(pid, code, false)
+    mgr.terminate_process_preserve_reply(pid, code, false)
 }
 
 pub(crate) fn do_exit_group(
@@ -48,7 +46,7 @@ pub(crate) fn do_exit_group(
     pid: usize,
     code: usize,
 ) -> Result<(), Error> {
-    do_exit(mgr, pid, code)
+    mgr.terminate_process_preserve_reply(pid, code, false)
 }
 
 pub(crate) fn do_getppid(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Error> {
@@ -146,29 +144,71 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         )
     };
 
-    let mut parent_ro_remaps: Vec<(usize, usize, Perms)> = Vec::new();
     let mut child_maps = Vec::with_capacity(parent_maps.len());
 
     for mut map in parent_maps {
-        if map.frame_cap != 0 && map.flags.contains(Perms::WRITE) {
-            map.cow = true;
-            parent_ro_remaps.push((map.vaddr, map.frame_cap, cow_fault_perms(map.flags)));
-        }
+        map.cow = false;
         child_maps.push(map);
     }
 
-    {
-        let parent = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-        for map in parent.memory_maps.values_mut() {
-            if map.frame_cap != 0 && map.flags.contains(Perms::WRITE) {
-                map.cow = true;
-            }
+    for map in &mut child_maps {
+        if map.frame_cap == 0 {
+            continue;
         }
-    }
+        let pages = align_up(map.size, PGSIZE) / PGSIZE;
+        if pages == 0 {
+            continue;
+        }
 
-    for (vaddr, frame_cap, ro_perms) in parent_ro_remaps {
-        let _ = mgr.unmap_process_pages(pid, vaddr, 1);
-        mgr.map_process_frame(pid, Page::from(CapPtr::from(frame_cap)), vaddr, ro_perms, 1)?;
+        if map.flags.contains(Perms::WRITE) {
+            let new_frame_slot = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
+            mgr.res_client
+                .alloc(Badge::null(), CapType::Page, pages, new_frame_slot)?;
+            mgr.ledger_record_frame_alloc(child_pid, new_frame_slot, pages, "fork_private_writable_map");
+
+            let old_frame = Page::from(CapPtr::from(map.frame_cap));
+            let new_frame = Page::from(new_frame_slot);
+
+            let src = mgr.vspace_mgr.map_scratch(
+                old_frame,
+                Perms::READ,
+                pages,
+                &mut *mgr.res_client,
+                &mut *mgr.cspace_mgr,
+            )?;
+
+            let dst = match mgr.vspace_mgr.map_scratch(
+                new_frame,
+                Perms::READ | Perms::WRITE,
+                pages,
+                &mut *mgr.res_client,
+                &mut *mgr.cspace_mgr,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = mgr.vspace_mgr.unmap(src, pages);
+                    return Err(e);
+                }
+            };
+
+            unsafe {
+                core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, pages * PGSIZE);
+            }
+
+            let _ = mgr.vspace_mgr.unmap(src, pages);
+            let _ = mgr.vspace_mgr.unmap(dst, pages);
+
+            map.frame_cap = new_frame_slot.bits();
+            map.cow = false;
+        }
+
+        mgr.map_process_frame(
+            child_pid,
+            Page::from(CapPtr::from(map.frame_cap)),
+            map.vaddr,
+            map.flags,
+            pages,
+        )?;
     }
 
     {
@@ -216,6 +256,21 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         let _ = mgr.auth_client.set_identity(child_pid, child.identity);
     }
 
+    {
+        let parent_tcb = mgr.get_process(pid).ok_or(Error::NotFound)?.tcb();
+        let child_tcb = mgr.get_process(child_pid).ok_or(Error::NotFound)?.tcb();
+        let fault_ep = Endpoint::from(CapPtr::concat(
+            mgr.get_process(child_pid)
+                .ok_or(Error::NotFound)?
+                .cspace()
+                .cap(),
+            APE_SLOT,
+        ));
+        child_tcb.set_fault_handler(fault_ep)?;
+        child_tcb.fork_from(parent_tcb)?;
+        child_tcb.resume()?;
+    }
+
     Ok(child_pid)
 }
 
@@ -254,13 +309,28 @@ pub(crate) fn do_clone(
 }
 
 pub(crate) fn do_wait4(
-    _mgr: &mut ApeManager<'_>,
-    _pid: usize,
-    _target_pid: usize,
-    _wstatus: usize,
-    _options: usize,
+    mgr: &mut ApeManager<'_>,
+    pid: usize,
+    target_pid: isize,
+    wstatus: usize,
+    options: usize,
     _rusage: usize,
 ) -> Result<isize, Error> {
-    // TODO(ape): 实现 wait4(2) 子进程回收、状态写回与 options 语义。
-    Ok(-(ECHILD as isize))
+    let caller_pgid = mgr.get_process(pid).ok_or(Error::NotFound)?.process_group_id;
+
+    if let Some((reaped_pid, status)) = mgr.pop_waitable_exited_child(pid, target_pid, caller_pgid) {
+        if wstatus != 0 {
+            mgr.copy_to_user(pid, wstatus, &status.to_ne_bytes())?;
+        }
+        return Ok(reaped_pid as isize);
+    }
+
+    if !mgr.has_waitable_child(pid, target_pid, caller_pgid) {
+        return Ok(-(ECHILD as isize));
+    }
+
+    // APE 当前为单线程事件循环：在这里阻塞会阻断子进程 fault/syscall 处理并导致死锁。
+    // 因此即使是阻塞 wait4，也先协作式返回 0，让调用方重试。
+    let _ = options;
+    Ok(0)
 }

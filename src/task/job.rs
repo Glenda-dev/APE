@@ -43,22 +43,32 @@ pub(crate) fn do_setpgid(
     pgid: usize,
 ) -> Result<isize, Error> {
     let target_pid = if target == 0 { pid } else { target };
+    let caller = mgr.get_process(pid).ok_or(Error::NotFound)?;
+    let caller_session = caller.session_id;
+    let caller_pgid = caller.process_group_id;
+
+    let (target_session_id, default_pgid, target_parent_pid) = {
+        let proc = mgr.get_process(target_pid).ok_or(Error::NotFound)?;
+        (proc.session_id, proc.pid, proc.parent_pid)
+    };
+
     if target_pid != pid {
-        // Minimal compatibility scope for now: only allow self setpgid.
-        return Err(Error::PermissionDenied);
+        if target_parent_pid != pid || target_session_id != caller_session {
+            return Err(Error::PermissionDenied);
+        }
     }
 
-    let (session_id, default_pgid) = {
-        let proc = mgr.get_process(target_pid).ok_or(Error::NotFound)?;
-        (proc.session_id, proc.pid)
-    };
     let new_pgid = if pgid == 0 { default_pgid } else { pgid };
 
     if new_pgid != target_pid {
         let group_leader = mgr.get_process(new_pgid).ok_or(Error::NotFound)?;
-        if group_leader.session_id != session_id {
+        if group_leader.session_id != target_session_id {
             return Err(Error::PermissionDenied);
         }
+    }
+
+    if target_pid == pid && new_pgid == caller_pgid {
+        return Ok(0);
     }
 
     let proc = mgr.get_process_mut(target_pid).ok_or(Error::NotFound)?;

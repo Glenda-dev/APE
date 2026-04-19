@@ -62,18 +62,24 @@ pub(crate) fn route_syscall<'a>(
         }
         ApeSyscall::RtSigreturn => system::sys_rt_sigreturn(mgr, pid),
         ApeSyscall::SetRobustList => system::sys_set_robust_list(mgr, pid, args[0], args[1]),
-        ApeSyscall::Prlimit64 => system::sys_prlimit64(mgr, pid, args[0], args[1], args[2], args[3]),
+        ApeSyscall::Prlimit64 => {
+            system::sys_prlimit64(mgr, pid, args[0], args[1], args[2], args[3])
+        }
         ApeSyscall::ClockGettime => system::sys_clock_gettime(mgr, pid, args[0], args[1]),
         ApeSyscall::Gettimeofday => system::sys_gettimeofday(mgr, pid, args[0], args[1]),
         ApeSyscall::Nanosleep => system::sys_nanosleep(mgr, pid, args[0], args[1]),
-        ApeSyscall::Ppoll => system::sys_ppoll(mgr, pid, args[0], args[1], args[2], args[3], args[4]),
+        ApeSyscall::Ppoll => {
+            system::sys_ppoll(mgr, pid, args[0], args[1], args[2], args[3], args[4])
+        }
         ApeSyscall::Getrandom => system::sys_getrandom(mgr, pid, args[0], args[1], args[2]),
         ApeSyscall::Getuid => system::sys_getuid(mgr, pid),
         ApeSyscall::Geteuid => system::sys_geteuid(mgr, pid),
         ApeSyscall::Getgid => system::sys_getgid(mgr, pid),
         ApeSyscall::Getegid => system::sys_getegid(mgr, pid),
         ApeSyscall::Clone => task::sys_clone(mgr, pid, args[0], args[1], args[2], args[3], args[4]),
-        ApeSyscall::Wait4 => task::sys_wait4(mgr, pid, args[0], args[1], args[2], args[3]),
+        ApeSyscall::Wait4 => {
+            task::sys_wait4(mgr, pid, args[0] as isize, args[1], args[2], args[3])
+        }
         ApeSyscall::Setsid => task::sys_setsid(mgr, pid),
         ApeSyscall::Getsid => task::sys_getsid(mgr, pid, args[0]),
         ApeSyscall::Setpgid => task::sys_setpgid(mgr, pid, args[0], args[1]),
@@ -81,7 +87,9 @@ pub(crate) fn route_syscall<'a>(
         ApeSyscall::Kill => task::sys_kill(mgr, pid, args[0] as isize, args[1] as isize),
         ApeSyscall::Reboot => system::sys_reboot(mgr, pid, args[0], args[1], args[2], args[3]),
         ApeSyscall::SchedYield => system::sys_sched_yield(mgr, pid),
-        ApeSyscall::Prctl => system::sys_prctl(mgr, pid, args[0], args[1], args[2], args[3], args[4]),
+        ApeSyscall::Prctl => {
+            system::sys_prctl(mgr, pid, args[0], args[1], args[2], args[3], args[4])
+        }
         ApeSyscall::Futex => {
             system::sys_futex(mgr, pid, args[0], args[1], args[2], args[3], args[4], args[5])
         }

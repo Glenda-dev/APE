@@ -55,7 +55,7 @@ pub fn sys_clone<'a>(
 pub fn sys_wait4<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,
-    target_pid: usize,
+    target_pid: isize,
     wstatus: usize,
     options: usize,
     rusage: usize,

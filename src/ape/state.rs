@@ -2,6 +2,7 @@ use crate::ape::process::{AsyncIoRegion, SubProcess};
 use crate::ape::tty::TtyRegistry;
 use crate::config::ApeConfig;
 use alloc::collections::BTreeMap;
+use alloc::collections::VecDeque;
 use alloc::collections::btree_set::BTreeSet;
 use alloc::vec::Vec;
 use glenda::cap::CapPtr;
@@ -88,15 +89,28 @@ impl ApeResourceLedger {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ChildExitEvent {
+    pub child_pid: usize,
+    pub wait_status: i32,
+    pub process_group_id: usize,
+}
+
 pub struct ApeTaskState {
     processes: BTreeMap<usize, SubProcess>,
     host_pid_map: BTreeMap<usize, usize>, // host_pid -> local pid
+    exited_children: BTreeMap<usize, VecDeque<ChildExitEvent>>, // parent_pid -> child exits
     next_pid: usize,
 }
 
 impl ApeTaskState {
     pub fn new(next_pid: usize) -> Self {
-        Self { processes: BTreeMap::new(), host_pid_map: BTreeMap::new(), next_pid }
+        Self {
+            processes: BTreeMap::new(),
+            host_pid_map: BTreeMap::new(),
+            exited_children: BTreeMap::new(),
+            next_pid,
+        }
     }
 
     pub fn alloc_pid(&mut self) -> usize {
@@ -138,6 +152,93 @@ impl ApeTaskState {
 
     pub fn list_pids(&self) -> Vec<usize> {
         self.processes.keys().copied().collect()
+    }
+
+    pub fn record_child_exit(
+        &mut self,
+        parent_pid: usize,
+        child_pid: usize,
+        wait_status: i32,
+        process_group_id: usize,
+    ) {
+        let queue = self.exited_children.entry(parent_pid).or_default();
+        queue.push_back(ChildExitEvent { child_pid, wait_status, process_group_id });
+    }
+
+    fn matches_wait_target(
+        child_pid: usize,
+        child_pgid: usize,
+        target_pid: isize,
+        caller_pgid: usize,
+    ) -> bool {
+        if target_pid == -1 {
+            return true;
+        }
+        if target_pid > 0 {
+            return child_pid == target_pid as usize;
+        }
+        if target_pid == 0 {
+            return child_pgid == caller_pgid;
+        }
+
+        let target_pgid = target_pid.unsigned_abs();
+        child_pgid == target_pgid
+    }
+
+    pub fn has_live_child_matching(
+        &self,
+        parent_pid: usize,
+        target_pid: isize,
+        caller_pgid: usize,
+    ) -> bool {
+        self.processes.values().any(|proc| {
+            proc.parent_pid == parent_pid
+                && Self::matches_wait_target(proc.pid, proc.process_group_id, target_pid, caller_pgid)
+        })
+    }
+
+    pub fn has_exited_child_matching(
+        &self,
+        parent_pid: usize,
+        target_pid: isize,
+        caller_pgid: usize,
+    ) -> bool {
+        self.exited_children
+            .get(&parent_pid)
+            .map(|queue| {
+                queue.iter().any(|event| {
+                    Self::matches_wait_target(
+                        event.child_pid,
+                        event.process_group_id,
+                        target_pid,
+                        caller_pgid,
+                    )
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn pop_exited_child_matching(
+        &mut self,
+        parent_pid: usize,
+        target_pid: isize,
+        caller_pgid: usize,
+    ) -> Option<(usize, i32)> {
+        let queue = self.exited_children.get_mut(&parent_pid)?;
+        let pos = queue.iter().position(|event| {
+            Self::matches_wait_target(
+                event.child_pid,
+                event.process_group_id,
+                target_pid,
+                caller_pgid,
+            )
+        })?;
+
+        let event = queue.remove(pos)?;
+        if queue.is_empty() {
+            let _ = self.exited_children.remove(&parent_pid);
+        }
+        Some((event.child_pid, event.wait_status))
     }
 }
 

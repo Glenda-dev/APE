@@ -22,6 +22,7 @@ use glenda::utils::align::{align_down, align_up};
 use linux_raw_sys::auxvec::{AT_BASE, AT_ENTRY, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM};
 use linux_raw_sys::elf::{ET_DYN, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
 use linux_raw_sys::elf_uapi::ET_EXEC;
+use linux_raw_sys::general::SIGCHLD;
 
 const INITIAL_STACK_ALIGN: usize = 16;
 const PIE_LOAD_BIAS: usize = 0;
@@ -36,6 +37,10 @@ struct LoadedElfInfo {
 }
 
 impl<'a> ApeManager<'a> {
+    fn encode_wait_status(exit_code: usize) -> i32 {
+        ((exit_code & 0xff) as i32) << 8
+    }
+
     pub(crate) fn release_process_frame_slot(
         &mut self,
         pid: usize,
@@ -107,7 +112,7 @@ impl<'a> ApeManager<'a> {
         panic_if_init: bool,
         clear_reply: bool,
     ) -> Result<(), Error> {
-        let (fd_list, mapped_pages, frame_pages) = {
+        let (fd_list, mapped_pages, frame_pages, parent_pid, process_group_id) = {
             let process = self.get_process(pid).ok_or(Error::NotFound)?;
             let fd_list = process.fds.keys().copied().collect::<Vec<u32>>();
             let mapped_pages = process
@@ -125,7 +130,13 @@ impl<'a> ApeManager<'a> {
                 let entry = frame_pages.entry(slot).or_insert(0usize);
                 *entry = core::cmp::max(*entry, pages);
             }
-            (fd_list, mapped_pages, frame_pages)
+            (
+                fd_list,
+                mapped_pages,
+                frame_pages,
+                process.parent_pid,
+                process.process_group_id,
+            )
         };
 
         for fd in fd_list {
@@ -153,6 +164,19 @@ impl<'a> ApeManager<'a> {
         let _ = self.ledger_take_process(pid);
 
         self.remove_process_record(pid);
+
+        if parent_pid != 0 {
+            self.record_child_exit(
+                parent_pid,
+                pid,
+                Self::encode_wait_status(exit_code),
+                process_group_id,
+            );
+
+            if let Some(parent) = self.get_process_mut(parent_pid) {
+                let _ = parent.queue_signal(SIGCHLD as usize);
+            }
+        }
 
         if panic_if_init && pid == 1 {
             panic!(

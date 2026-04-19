@@ -150,6 +150,35 @@ impl<'a> ApeManager<'a> {
         self.task_state.list_pids()
     }
 
+    pub fn record_child_exit(
+        &mut self,
+        parent_pid: usize,
+        child_pid: usize,
+        wait_status: i32,
+        process_group_id: usize,
+    ) {
+        self.task_state.record_child_exit(parent_pid, child_pid, wait_status, process_group_id);
+    }
+
+    pub fn has_waitable_child(
+        &self,
+        parent_pid: usize,
+        target_pid: isize,
+        caller_pgid: usize,
+    ) -> bool {
+        self.task_state.has_live_child_matching(parent_pid, target_pid, caller_pgid)
+            || self.task_state.has_exited_child_matching(parent_pid, target_pid, caller_pgid)
+    }
+
+    pub fn pop_waitable_exited_child(
+        &mut self,
+        parent_pid: usize,
+        target_pid: isize,
+        caller_pgid: usize,
+    ) -> Option<(usize, i32)> {
+        self.task_state.pop_exited_child_matching(parent_pid, target_pid, caller_pgid)
+    }
+
     pub fn host_pid_by_local(&self, local_pid: usize) -> Option<usize> {
         self.task_state.host_pid_by_local(local_pid)
     }
