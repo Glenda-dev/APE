@@ -36,6 +36,7 @@ pub enum MemoryType {
     Stack,
     Heap,
     Anonymous,
+    FileBacked,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,8 @@ pub struct MemoryMap {
     pub mem_type: MemoryType,
     pub cow: bool,
     pub frame_cap: usize, // Required for translate and map_scratch
+    pub file_backing_fd: Option<u32>,
+    pub file_backing_offset: usize,
 }
 
 #[derive(Debug, Clone, Copy)]

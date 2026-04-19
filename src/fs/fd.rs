@@ -94,20 +94,24 @@ pub(crate) fn do_openat<'a>(
                 let term = TerminalClient::new(vt_ep);
                 set_terminal_pgrp_local(mgr, term, pid as i32);
 
-                let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-                let fd = process.next_fd;
-                process.next_fd += 1;
-                process.fds.insert(
-                    fd,
-                    FileHandle {
-                        file_type: FileType::PtyMaster(PtyMasterHandle {
-                            term,
-                            vt_id,
-                            ep_slot,
-                            locked: true,
-                        }),
-                    },
-                );
+                let fd = {
+                    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+                    let fd = process.next_fd;
+                    process.next_fd += 1;
+                    process.fds.insert(
+                        fd,
+                        FileHandle {
+                            file_type: FileType::PtyMaster(PtyMasterHandle {
+                                term,
+                                vt_id,
+                                ep_slot,
+                                locked: true,
+                            }),
+                        },
+                    );
+                    fd
+                };
+                mgr.ledger_record_fd_open(pid);
                 return Ok(fd as isize);
             }
             DevicePathKind::PtySlave(vt_id) => {
@@ -125,34 +129,46 @@ pub(crate) fn do_openat<'a>(
                     }
                 };
 
-                let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-                let fd = process.next_fd;
-                process.next_fd += 1;
-                process.fds.insert(
-                    fd,
-                    FileHandle {
-                        file_type: FileType::PtySlave(PtySlaveHandle {
-                            term: TerminalClient::new(vt_ep),
-                            vt_id,
-                            ep_slot: slave_ep_slot,
-                        }),
-                    },
-                );
+                let fd = {
+                    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+                    let fd = process.next_fd;
+                    process.next_fd += 1;
+                    process.fds.insert(
+                        fd,
+                        FileHandle {
+                            file_type: FileType::PtySlave(PtySlaveHandle {
+                                term: TerminalClient::new(vt_ep),
+                                vt_id,
+                                ep_slot: slave_ep_slot,
+                            }),
+                        },
+                    );
+                    fd
+                };
+                mgr.ledger_record_fd_open(pid);
                 return Ok(fd as isize);
             }
             DevicePathKind::StdioTty => {
                 let term = mgr.stdio_term().ok_or(Error::NotFound)?;
-                let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-                let fd = process.next_fd;
-                process.next_fd += 1;
-                process.fds.insert(fd, FileHandle { file_type: FileType::Terminal(term) });
+                let fd = {
+                    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+                    let fd = process.next_fd;
+                    process.next_fd += 1;
+                    process.fds.insert(fd, FileHandle { file_type: FileType::Terminal(term) });
+                    fd
+                };
+                mgr.ledger_record_fd_open(pid);
                 return Ok(fd as isize);
             }
             DevicePathKind::Pseudo(dev) => {
-                let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-                let fd = process.next_fd;
-                process.next_fd += 1;
-                process.fds.insert(fd, FileHandle { file_type: FileType::PseudoChar(dev) });
+                let fd = {
+                    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+                    let fd = process.next_fd;
+                    process.next_fd += 1;
+                    process.fds.insert(fd, FileHandle { file_type: FileType::PseudoChar(dev) });
+                    fd
+                };
+                mgr.ledger_record_fd_open(pid);
                 return Ok(fd as isize);
             }
         }
@@ -173,7 +189,7 @@ pub(crate) fn do_openat<'a>(
 
     let mut async_io = None;
     if ENABLE_FS_ASYNC_IO && mgr.should_try_fs_iouring() {
-        if let Ok(region) = mgr.allocate_fs_async_region(FS_ASYNC_REGION_SIZE) {
+        if let Ok(region) = mgr.allocate_fs_async_region(pid, FS_ASYNC_REGION_SIZE) {
             let ring_buf = unsafe {
                 IoUringBuffer::new(
                     region.vaddr as *mut u8,
@@ -220,31 +236,34 @@ pub(crate) fn do_openat<'a>(
                 }
                 Err(e) => {
                     warn!(
-                        "sys_openat: setup_iouring failed pid={}, path={}, err={:?}; disable async probe and fallback sync",
+                        "sys_openat: setup_iouring failed pid={}, path={}, err={:?}; fallback sync and keep async probe enabled",
                         pid, path, e
                     );
-                    mgr.mark_fs_iouring_unsupported();
                     mgr.recycle_fs_async_region(region.id);
                 }
             }
         }
     }
 
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    let fd = process.next_fd;
-    process.next_fd += 1;
-    process.fds.insert(
-        fd,
-        FileHandle {
-            file_type: FileType::Normal(NormalFileHandle {
-                fs_client,
-                fs_ep_slot,
-                offset: 0,
-                async_io,
-            }),
-        },
-    );
-    process.fd_paths.insert(fd, path);
+    let fd = {
+        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+        let fd = process.next_fd;
+        process.next_fd += 1;
+        process.fds.insert(
+            fd,
+            FileHandle {
+                file_type: FileType::Normal(NormalFileHandle {
+                    fs_client,
+                    fs_ep_slot,
+                    offset: 0,
+                    async_io,
+                }),
+            },
+        );
+        process.fd_paths.insert(fd, path);
+        fd
+    };
+    mgr.ledger_record_fd_open(pid);
 
     Ok(fd as isize)
 }
@@ -284,6 +303,8 @@ pub(crate) fn do_close<'a>(
             }
         }
     }
+
+    mgr.ledger_record_fd_close(pid);
 
     Ok(0)
 }

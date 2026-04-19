@@ -2,8 +2,91 @@ use crate::ape::process::{AsyncIoRegion, SubProcess};
 use crate::ape::tty::TtyRegistry;
 use crate::config::ApeConfig;
 use alloc::collections::BTreeMap;
+use alloc::collections::btree_set::BTreeSet;
 use alloc::vec::Vec;
+use glenda::cap::CapPtr;
 use glenda::client::TerminalClient;
+
+#[derive(Debug, Clone, Default)]
+pub struct ApeProcessLedger {
+    pub alloc_frames: usize,
+    pub free_frames: usize,
+    pub alloc_pages: usize,
+    pub free_pages: usize,
+    pub alloc_pagetables: usize,
+    pub free_pagetables: usize,
+    pub fd_opened: usize,
+    pub fd_closed: usize,
+    pub async_regions_allocated: usize,
+    pub async_regions_reused: usize,
+    pub peak_live_frames: usize,
+    pub live_frames: BTreeSet<CapPtr>,
+    pub live_pagetables: BTreeSet<CapPtr>,
+}
+
+impl ApeProcessLedger {
+    fn touch_peak(&mut self) {
+        self.peak_live_frames = core::cmp::max(self.peak_live_frames, self.live_frames.len());
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ApeResourceLedger {
+    per_process: BTreeMap<usize, ApeProcessLedger>,
+}
+
+impl ApeResourceLedger {
+    fn process_mut(&mut self, pid: usize) -> &mut ApeProcessLedger {
+        self.per_process.entry(pid).or_default()
+    }
+
+    pub fn record_frame_alloc(&mut self, pid: usize, slot: CapPtr, pages: usize) {
+        let p = self.process_mut(pid);
+        p.alloc_frames += 1;
+        p.alloc_pages = p.alloc_pages.saturating_add(pages);
+        p.live_frames.insert(slot);
+        p.touch_peak();
+    }
+
+    pub fn record_frame_free(&mut self, pid: usize, slot: CapPtr, pages: usize) {
+        let p = self.process_mut(pid);
+        p.free_frames += 1;
+        p.free_pages = p.free_pages.saturating_add(pages);
+        p.live_frames.remove(&slot);
+    }
+
+    pub fn record_pagetable_alloc(&mut self, pid: usize, slot: CapPtr) {
+        let p = self.process_mut(pid);
+        p.alloc_pagetables += 1;
+        p.live_pagetables.insert(slot);
+    }
+
+    pub fn record_pagetable_free(&mut self, pid: usize, slot: CapPtr) {
+        let p = self.process_mut(pid);
+        p.free_pagetables += 1;
+        p.live_pagetables.remove(&slot);
+    }
+
+    pub fn record_fd_open(&mut self, pid: usize) {
+        self.process_mut(pid).fd_opened += 1;
+    }
+
+    pub fn record_fd_close(&mut self, pid: usize) {
+        self.process_mut(pid).fd_closed += 1;
+    }
+
+    pub fn record_async_region_allocated(&mut self, pid: usize) {
+        self.process_mut(pid).async_regions_allocated += 1;
+    }
+
+    pub fn record_async_region_reused(&mut self, pid: usize) {
+        self.process_mut(pid).async_regions_reused += 1;
+    }
+
+    pub fn take_process(&mut self, pid: usize) -> ApeProcessLedger {
+        self.per_process.remove(&pid).unwrap_or_default()
+    }
+}
 
 pub struct ApeTaskState {
     processes: BTreeMap<usize, SubProcess>,

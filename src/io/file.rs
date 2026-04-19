@@ -38,6 +38,9 @@ pub(crate) fn do_read<'a>(
         },
         FileType::Terminal(term) => crate::io::tty::do_read_terminal(mgr, pid, *term, buf_ptr, len),
         FileType::Normal(normal) => {
+            if normal.async_io.is_none() {
+                let _ = mgr.try_enable_fs_async_io(pid, normal);
+            }
             if let Some(async_io) = normal.async_io.as_mut() {
                 let fs_client = &mut normal.fs_client;
                 let ring = &mut async_io.ring;
@@ -140,6 +143,9 @@ pub(crate) fn do_write<'a>(
             crate::io::tty::do_write_terminal(mgr, pid, *term, buf_ptr, len)
         }
         FileType::Normal(normal) => {
+            if normal.async_io.is_none() {
+                let _ = mgr.try_enable_fs_async_io(pid, normal);
+            }
             if let Some(async_io) = normal.async_io.as_mut() {
                 let fs_client = &mut normal.fs_client;
                 let ring = &mut async_io.ring;

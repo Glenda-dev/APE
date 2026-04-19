@@ -222,7 +222,7 @@ pub fn trace_syscall_exit<'a>(
         _ => trace_default(sys_num, args),
     };
 
-    log!("[pid {}] {} = {}", pid, call, format_result(sys_num, ret));
+    debug!("[pid {}] {} = {}", pid, call, format_result(sys_num, ret));
 }
 
 fn enter_or_fallback<F>(state: &TraceState, fallback: F) -> String

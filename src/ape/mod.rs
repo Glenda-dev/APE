@@ -1,5 +1,6 @@
 pub mod bootstrap;
 pub mod fault;
+pub mod fault_policy;
 pub mod path;
 pub mod policy;
 pub mod process;
@@ -17,13 +18,15 @@ use glenda::arch::mem::{PGSIZE, SHIFTS};
 use glenda::cap::{CNode, CSPACE_CAP, CapPtr, CapType, Endpoint, Page, Reply, Rights};
 use glenda::client::*;
 use glenda::error::Error;
-use glenda::interface::{AuthService, CSpaceService, ResourceService, VSpaceService};
+use glenda::interface::{
+    AuthService, CSpaceService, FileHandleService, ResourceService, VSpaceService,
+};
 use glenda::ipc::Badge;
 use glenda::mem::{Perms, TRAMPOLINE_VA, get_trapframe_va, get_utcb_va};
 use glenda::utils::align::align_up;
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
-use process::{AsyncIoRegion, SubProcess};
-use state::{ApeFsState, ApeRuntimeState, ApeTaskState};
+use process::{AsyncIoRegion, AsyncIoState, NormalFileHandle, SubProcess};
+use state::{ApeFsState, ApeProcessLedger, ApeResourceLedger, ApeRuntimeState, ApeTaskState};
 
 pub struct ApeIpc {
     pub running: bool,
@@ -37,6 +40,7 @@ pub struct ApeManager<'a> {
     task_state: ApeTaskState,
     runtime_state: ApeRuntimeState,
     fs_state: ApeFsState,
+    resource_ledger: ApeResourceLedger,
     pub init_client: &'a mut InitClient,
     pub proc_client: &'a mut ProcessClient,
     pub res_client: &'a mut ResourceClient,
@@ -50,6 +54,11 @@ pub struct ApeManager<'a> {
 }
 
 impl<'a> ApeManager<'a> {
+    const FS_ASYNC_RING_SIZE: usize = 4096;
+    const FS_ASYNC_DATA_OFFSET: usize = Self::FS_ASYNC_RING_SIZE;
+    const FS_ASYNC_SQ_ENTRIES: u32 = 16;
+    const FS_ASYNC_CQ_ENTRIES: u32 = 16;
+
     fn seed_initial_pagetable_paths(proc: &mut SubProcess) {
         for vaddr in [TRAMPOLINE_VA, get_utcb_va(0), get_trapframe_va(0)] {
             for level in (1..SHIFTS.len()).rev() {
@@ -81,6 +90,7 @@ impl<'a> ApeManager<'a> {
             task_state: ApeTaskState::new(1),
             runtime_state: ApeRuntimeState::new(ApeConfig::default()),
             fs_state: ApeFsState::new(FS_ASYNC_POOL_BASE_VADDR, 0x10000),
+            resource_ledger: ApeResourceLedger::default(),
             init_client,
             proc_client,
             res_client,
@@ -114,6 +124,7 @@ impl<'a> ApeManager<'a> {
         Self::seed_initial_pagetable_paths(&mut proc);
         let identity = proc.identity;
         self.task_state.register_process(pid, host_pid, proc);
+        let _ = self.resource_ledger.take_process(pid);
         let _ = self.auth_client.set_identity(pid, identity);
         pid
     }
@@ -179,10 +190,15 @@ impl<'a> ApeManager<'a> {
         self.fs_state.take_next_handle_badge()
     }
 
-    pub fn allocate_fs_async_region(&mut self, size: usize) -> Result<AsyncIoRegion, Error> {
+    pub fn allocate_fs_async_region(
+        &mut self,
+        pid: usize,
+        size: usize,
+    ) -> Result<AsyncIoRegion, Error> {
         let size_aligned = align_up(size, PGSIZE);
 
         if let Some(region) = self.fs_state.try_reuse_region() {
+            self.resource_ledger.record_async_region_reused(pid);
             return Ok(region);
         }
 
@@ -195,6 +211,7 @@ impl<'a> ApeManager<'a> {
         let page_level = CapType::page_pages_to_level(pages).ok_or(Error::InvalidArgs)?;
         self.res_client.alloc(Badge::null(), CapType::Page, page_level, frame_slot)?;
         let frame = Page::from(frame_slot);
+        self.resource_ledger.record_async_region_allocated(pid);
 
         let vaddr = self.fs_state.reserve_async_vaddr(size_aligned).ok_or(Error::OutOfMemory)?;
 
@@ -221,6 +238,50 @@ impl<'a> ApeManager<'a> {
         self.fs_state.recycle_region(region_id);
     }
 
+    pub(crate) fn ledger_record_frame_alloc(
+        &mut self,
+        pid: usize,
+        slot: CapPtr,
+        pages: usize,
+        reason: &str,
+    ) {
+        self.resource_ledger.record_frame_alloc(pid, slot, pages);
+        let _ = (pid, slot, pages, reason);
+    }
+
+    pub(crate) fn ledger_record_frame_free(
+        &mut self,
+        pid: usize,
+        slot: CapPtr,
+        pages: usize,
+        reason: &str,
+    ) {
+        self.resource_ledger.record_frame_free(pid, slot, pages);
+        let _ = (pid, slot, pages, reason);
+    }
+
+    pub(crate) fn ledger_record_pagetable_alloc(&mut self, pid: usize, slot: CapPtr, reason: &str) {
+        self.resource_ledger.record_pagetable_alloc(pid, slot);
+        let _ = (pid, slot, reason);
+    }
+
+    pub(crate) fn ledger_record_pagetable_free(&mut self, pid: usize, slot: CapPtr, reason: &str) {
+        self.resource_ledger.record_pagetable_free(pid, slot);
+        let _ = (pid, slot, reason);
+    }
+
+    pub(crate) fn ledger_record_fd_open(&mut self, pid: usize) {
+        self.resource_ledger.record_fd_open(pid);
+    }
+
+    pub(crate) fn ledger_record_fd_close(&mut self, pid: usize) {
+        self.resource_ledger.record_fd_close(pid);
+    }
+
+    pub(crate) fn ledger_take_process(&mut self, pid: usize) -> ApeProcessLedger {
+        self.resource_ledger.take_process(pid)
+    }
+
     pub fn should_try_fs_iouring(&self) -> bool {
         self.fs_state.should_try_iouring()
     }
@@ -231,5 +292,67 @@ impl<'a> ApeManager<'a> {
 
     pub fn mark_fs_iouring_unsupported(&mut self) {
         self.fs_state.mark_iouring_unsupported();
+    }
+
+    pub(crate) fn try_enable_fs_async_io(
+        &mut self,
+        pid: usize,
+        normal: &mut NormalFileHandle,
+    ) -> Result<bool, Error> {
+        if normal.async_io.is_some() || !self.should_try_fs_iouring() {
+            return Ok(normal.async_io.is_some());
+        }
+
+        let region = match self.allocate_fs_async_region(pid, 16 * 1024) {
+            Ok(r) => r,
+            Err(Error::OutOfMemory) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+
+        let ring_buf = unsafe {
+            glenda::io::uring::IoUringBuffer::new(
+                region.vaddr as *mut u8,
+                Self::FS_ASYNC_RING_SIZE,
+                Self::FS_ASYNC_SQ_ENTRIES,
+                Self::FS_ASYNC_CQ_ENTRIES,
+            )
+        };
+        let ring = glenda::io::uring::IoUringClient::new(ring_buf);
+
+        match normal.fs_client.setup_iouring(
+            Badge::null(),
+            region.vaddr,
+            region.size,
+            Some(Page::from(region.frame_slot)),
+        ) {
+            Ok(()) => {
+                self.mark_fs_iouring_supported();
+                let data_vaddr = region.vaddr + Self::FS_ASYNC_DATA_OFFSET;
+                if data_vaddr < region.vaddr + region.size {
+                    let data_len = region.size - Self::FS_ASYNC_DATA_OFFSET;
+                    normal.async_io = Some(AsyncIoState {
+                        region_id: region.id,
+                        ring,
+                        data_vaddr,
+                        data_len,
+                        next_user_data: 1,
+                    });
+                    Ok(true)
+                } else {
+                    self.recycle_fs_async_region(region.id);
+                    Ok(false)
+                }
+            }
+            Err(Error::NotSupported) => {
+                self.mark_fs_iouring_unsupported();
+                self.recycle_fs_async_region(region.id);
+                Ok(false)
+            }
+            Err(_) => {
+                // 对于瞬时失败（例如后端尚未就绪）不全局禁用，后续仍允许重试。
+                self.recycle_fs_async_region(region.id);
+                Ok(false)
+            }
+        }
     }
 }

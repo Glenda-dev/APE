@@ -2,6 +2,7 @@ use crate::ApeManager;
 use crate::ape::process::{MemoryMap, MemoryType};
 use crate::elf::ElfFile;
 use crate::layout::APE_SLOT;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp::{max, min};
@@ -35,6 +36,38 @@ struct LoadedElfInfo {
 }
 
 impl<'a> ApeManager<'a> {
+    pub(crate) fn release_process_frame_slot(
+        &mut self,
+        pid: usize,
+        slot: CapPtr,
+        pages: usize,
+        reason: &str,
+    ) {
+        let released = match self.res_client.free(Badge::null(), slot) {
+            Ok(()) => true,
+            Err(e)
+                if e == Error::InvalidCapability
+                    || e == Error::InvalidSlot
+                    || e == Error::NotSupported =>
+            {
+                true
+            }
+            Err(e) => {
+                warn!(
+                    "exit: failed to free frame cap {:?} (pid={}, reason={}): {:?}",
+                    slot, pid, reason, e
+                );
+                false
+            }
+        };
+
+        if released {
+            let _ = CSPACE_CAP.delete(slot);
+            self.cspace_mgr.free(slot);
+            self.ledger_record_frame_free(pid, slot, pages, reason);
+        }
+    }
+
     fn clear_reply_cap_for_exit(&mut self) {
         if let Err(e) = CSPACE_CAP.delete(self.ipc.reply.cap())
             && e != Error::InvalidCapability
@@ -74,6 +107,41 @@ impl<'a> ApeManager<'a> {
         panic_if_init: bool,
         clear_reply: bool,
     ) -> Result<(), Error> {
+        let (fd_list, mapped_pages, frame_pages) = {
+            let process = self.get_process(pid).ok_or(Error::NotFound)?;
+            let fd_list = process.fds.keys().copied().collect::<Vec<u32>>();
+            let mapped_pages = process
+                .memory_maps
+                .values()
+                .map(|m| (m.vaddr, align_up(m.size, PGSIZE) / PGSIZE))
+                .collect::<Vec<(usize, usize)>>();
+            let mut frame_pages = BTreeMap::new();
+            for map in process.memory_maps.values() {
+                if map.frame_cap == 0 {
+                    continue;
+                }
+                let slot = CapPtr::from(map.frame_cap);
+                let pages = align_up(map.size, PGSIZE) / PGSIZE;
+                let entry = frame_pages.entry(slot).or_insert(0usize);
+                *entry = core::cmp::max(*entry, pages);
+            }
+            (fd_list, mapped_pages, frame_pages)
+        };
+
+        for fd in fd_list {
+            let _ = crate::fs::fd::do_close(self, pid, fd as usize);
+        }
+
+        for (vaddr, pages) in mapped_pages {
+            if pages > 0 {
+                let _ = self.unmap_process_pages(pid, vaddr, pages);
+            }
+        }
+
+        for (slot, pages) in frame_pages {
+            self.release_process_frame_slot(pid, slot, pages, "process_exit_memory_map");
+        }
+
         if clear_reply {
             self.clear_reply_cap_for_exit();
         }
@@ -81,6 +149,9 @@ impl<'a> ApeManager<'a> {
         self.kill_host_process_by_local_pid(pid);
 
         let _ = self.release_process_intermediate_page_tables(pid);
+
+        let _ = self.ledger_take_process(pid);
+
         self.remove_process_record(pid);
 
         if panic_if_init && pid == 1 {
@@ -158,7 +229,8 @@ impl<'a> ApeManager<'a> {
         let mut elf_data = alloc::vec![0u8; size];
         let mut offset = 0;
         while offset < size {
-            let read_len = match handle_client.read(Badge::null(), offset, &mut elf_data[offset..]) {
+            let read_len = match handle_client.read(Badge::null(), offset, &mut elf_data[offset..])
+            {
                 Ok(v) => v,
                 Err(e) => {
                     error!(
@@ -209,6 +281,7 @@ impl<'a> ApeManager<'a> {
 
         let frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
         self.res_client.alloc(Badge::null(), CapType::Page, 1, frame_slot)?;
+        self.ledger_record_frame_alloc(pid, frame_slot, 1, "setup_initial_stack");
         let frame = Page::from(frame_slot);
 
         self.map_process_frame(pid, frame, stack_page_vaddr, perms, 1)?;
@@ -303,6 +376,8 @@ impl<'a> ApeManager<'a> {
                 mem_type: MemoryType::Stack,
                 cow: false,
                 frame_cap: frame_slot.bits(),
+                file_backing_fd: None,
+                file_backing_offset: 0,
             });
             process.stack_size = PGSIZE;
         }
@@ -317,8 +392,10 @@ impl<'a> ApeManager<'a> {
         let tls_size = INITIAL_TLS_PAGES * PGSIZE;
 
         let frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
-        let tls_level = CapType::page_pages_to_level(INITIAL_TLS_PAGES).ok_or(Error::InvalidArgs)?;
+        let tls_level =
+            CapType::page_pages_to_level(INITIAL_TLS_PAGES).ok_or(Error::InvalidArgs)?;
         self.res_client.alloc(Badge::null(), CapType::Page, tls_level, frame_slot)?;
+        self.ledger_record_frame_alloc(pid, frame_slot, INITIAL_TLS_PAGES, "setup_initial_tls");
         let frame = Page::from(frame_slot);
 
         self.map_process_frame(
@@ -350,6 +427,8 @@ impl<'a> ApeManager<'a> {
                 mem_type: MemoryType::Anonymous,
                 cow: false,
                 frame_cap: frame_slot.bits(),
+                file_backing_fd: None,
+                file_backing_offset: 0,
             });
         }
 
@@ -410,6 +489,7 @@ impl<'a> ApeManager<'a> {
 
                 let frame_cap = self.cspace_mgr.alloc(&mut *self.res_client)?;
                 self.res_client.alloc(Badge::null(), CapType::Page, 1, frame_cap)?;
+                self.ledger_record_frame_alloc(pid, frame_cap, 1, "load_elf_segment_page");
                 let frame = Page::from(frame_cap);
 
                 self.map_process_frame(pid, frame, page_vaddr, perms, 1)?;
@@ -423,6 +503,8 @@ impl<'a> ApeManager<'a> {
                         mem_type: MemoryType::Image,
                         cow: false,
                         frame_cap: frame_cap.bits(),
+                        file_backing_fd: None,
+                        file_backing_offset: 0,
                     });
                 }
 
@@ -484,19 +566,37 @@ impl<'a> ApeManager<'a> {
 
         let main_load_bias = if main_file_type == ET_DYN as u16 { PIE_LOAD_BIAS } else { 0 };
         let interp_path = main_elf.interpreter_path().map(String::from);
-        let old_maps: Vec<(usize, usize)> = {
+        let (old_maps, old_frame_caps): (Vec<(usize, usize)>, BTreeMap<CapPtr, usize>) = {
             let process = self.get_process(pid).ok_or(Error::NotFound)?;
-            process
-                .memory_maps
-                .values()
-                .map(|map| (map.vaddr, align_up(map.size, PGSIZE) / PGSIZE))
-                .collect()
+            let mut frame_caps = BTreeMap::new();
+            for map in process.memory_maps.values() {
+                if map.frame_cap == 0 {
+                    continue;
+                }
+                let slot = CapPtr::from(map.frame_cap);
+                let pages = align_up(map.size, PGSIZE) / PGSIZE;
+                let entry = frame_caps.entry(slot).or_insert(0usize);
+                *entry = core::cmp::max(*entry, pages);
+            }
+
+            (
+                process
+                    .memory_maps
+                    .values()
+                    .map(|map| (map.vaddr, align_up(map.size, PGSIZE) / PGSIZE))
+                    .collect(),
+                frame_caps,
+            )
         };
 
         for (vaddr, pages) in old_maps {
             if pages != 0 {
                 let _ = self.unmap_process_pages(pid, vaddr, pages);
             }
+        }
+
+        for (slot, pages) in old_frame_caps {
+            self.release_process_frame_slot(pid, slot, pages, "execve_replace_image");
         }
 
         if let Some(process) = self.get_process_mut(pid) {
