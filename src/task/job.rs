@@ -1,6 +1,7 @@
 use crate::ApeManager;
 use crate::ape::process::{SIGNAL_MAX, signal_bit};
 use crate::ape::utils::linux_conv::get_exit_code_for_signal;
+use crate::system::signal::queue_process_signal;
 use glenda::error::Error;
 use linux_raw_sys::errno::{EINVAL, ESRCH};
 use linux_raw_sys::general::{SIGCONT, SIGKILL, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU};
@@ -176,7 +177,9 @@ pub(crate) fn do_kill(
                         }
                     }
                     proc.stopped = false;
-                    let _ = proc.queue_signal(sig_num);
+                }
+                let _ = queue_process_signal(mgr, target, sig_num);
+                if let Some(proc) = mgr.get_process(target) {
                     let _ = proc.tcb().resume();
                 }
             }
@@ -185,8 +188,8 @@ pub(crate) fn do_kill(
 
         if is_stop_signal(sig_num) {
             for target in targets.iter().copied() {
+                let _ = queue_process_signal(mgr, target, sig_num);
                 if let Some(proc) = mgr.get_process_mut(target) {
-                    let _ = proc.queue_signal(sig_num);
                     if target != caller_pid {
                         let _ = proc.tcb().suspend();
                         proc.stopped = true;
@@ -197,9 +200,7 @@ pub(crate) fn do_kill(
         }
 
         for target in targets.iter().copied() {
-            if let Some(proc) = mgr.get_process_mut(target) {
-                let _ = proc.queue_signal(sig_num);
-            }
+            let _ = queue_process_signal(mgr, target, sig_num);
         }
     }
 

@@ -318,6 +318,10 @@ pub(crate) fn do_wait4(
     options: usize,
     _rusage: usize,
 ) -> Result<isize, Error> {
+    if let Some(proc) = mgr.get_process_mut(pid) {
+        proc.clear_wait4_block();
+    }
+
     let caller_pgid = mgr.get_process(pid).ok_or(Error::NotFound)?.process_group_id;
 
     if let Some((reaped_pid, status)) = mgr.pop_waitable_exited_child(pid, target_pid, caller_pgid)
@@ -332,8 +336,21 @@ pub(crate) fn do_wait4(
         return Ok(-(ECHILD as isize));
     }
 
-    // APE 当前为单线程事件循环：在这里阻塞会阻断子进程 fault/syscall 处理并导致死锁。
-    // 因此即使是阻塞 wait4，也先协作式返回 0，让调用方重试。
-    let _ = options;
+    if (options & WNOHANG as usize) != 0 {
+        return Ok(0);
+    }
+
+    if let Some(proc) = mgr.get_process_mut(pid) {
+        proc.arm_wait4_block(target_pid, caller_pgid);
+    }
+
+    let tcb = mgr.get_process(pid).ok_or(Error::NotFound)?.tcb();
+    if let Err(e) = tcb.suspend() {
+        warn!("wait4: failed to suspend pid={} in blocking wait4: {:?}", pid, e);
+        if let Some(proc) = mgr.get_process_mut(pid) {
+            proc.clear_wait4_block();
+        }
+    }
+
     Ok(0)
 }

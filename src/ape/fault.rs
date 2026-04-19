@@ -19,11 +19,27 @@ use glenda::ipc::{Badge, MsgArgs, MsgFlags, MsgTag, UTCB};
 use glenda::mem::Perms;
 use glenda::protocol;
 use glenda::utils::align::{align_down, align_up};
+use libape::policy::{ApeSyscall, decode_ape_syscall};
 use linux_raw_sys::errno::EINTR;
 use linux_raw_sys::general::{SIGBUS, SIGILL, SIGSEGV, SIGTRAP};
 
 const L1_HUGE_PAGES: usize = 1 << (SHIFTS[1] - SHIFTS[0]);
 const L1_HUGE_SIZE: usize = L1_HUGE_PAGES * PGSIZE;
+
+#[inline]
+fn is_restartable_syscall(sys_num: usize) -> bool {
+    matches!(
+        decode_ape_syscall(sys_num),
+        ApeSyscall::Read
+            | ApeSyscall::Write
+            | ApeSyscall::Readv
+            | ApeSyscall::Writev
+            | ApeSyscall::Wait4
+            | ApeSyscall::Nanosleep
+            | ApeSyscall::Ppoll
+            | ApeSyscall::Futex
+    )
+}
 
 impl<'a> ApeManager<'a> {
     fn cow_fault_perms(perms: Perms) -> Perms {
@@ -720,8 +736,10 @@ impl<'a> FaultService for ApeManager<'a> {
 
         match consume_deliverable_signal_on_syscall_return(self, pid) {
             Ok(PendingSignalAction::None) => {}
-            Ok(PendingSignalAction::Interrupt) => {
-                if ret >= 0 {
+            Ok(PendingSignalAction::Interrupt { restart }) => {
+                // TODO(ape/signal,phase4): 当前为 SA_RESTART 最小策略，
+                // 尚未覆盖所有可重启 syscall 及 restart_syscall 细粒度语义。
+                if ret >= 0 && !(restart && is_restartable_syscall(sys_num)) {
                     ret = -(EINTR as isize);
                 }
             }

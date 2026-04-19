@@ -2,6 +2,7 @@ use crate::ApeManager;
 use crate::ape::process::{MemoryMap, MemoryType};
 use crate::elf::ElfFile;
 use crate::layout::APE_SLOT;
+use crate::system::signal::queue_process_signal;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -96,7 +97,7 @@ impl<'a> ApeManager<'a> {
         }
     }
 
-    fn kill_host_process_by_local_pid(&mut self, pid: usize) {
+    pub(crate) fn kill_host_process_by_local_pid(&mut self, pid: usize) {
         let host_pid = self.host_pid_by_local(pid);
 
         if let Some(host_pid) = host_pid {
@@ -151,7 +152,12 @@ impl<'a> ApeManager<'a> {
             self.clear_reply_cap_for_exit();
         }
         self.release_process_cnode_cap(pid);
-        self.kill_host_process_by_local_pid(pid);
+        if self.ipc.active_caller_pid == Some(pid) {
+            self.mark_skip_reply_once();
+            self.defer_host_kill(pid);
+        } else {
+            self.kill_host_process_by_local_pid(pid);
+        }
 
         let _ = self.release_process_intermediate_page_tables(pid);
 
@@ -167,9 +173,26 @@ impl<'a> ApeManager<'a> {
                 process_group_id,
             );
 
-            if let Some(parent) = self.get_process_mut(parent_pid) {
-                let _ = parent.queue_signal(SIGCHLD as usize);
+            let should_resume_wait4 = self
+                .get_process(parent_pid)
+                .map(|parent| parent.wait4_block_matches(pid, process_group_id))
+                .unwrap_or(false);
+
+            if should_resume_wait4 {
+                if let Some(parent) = self.get_process_mut(parent_pid) {
+                    parent.clear_wait4_block();
+                }
+                if let Some(parent) = self.get_process(parent_pid)
+                    && let Err(e) = parent.tcb().resume()
+                {
+                    warn!(
+                        "wait4: failed to resume parent pid={} on child exit pid={}: {:?}",
+                        parent_pid, pid, e
+                    );
+                }
             }
+
+            let _ = queue_process_signal(self, parent_pid, SIGCHLD as usize);
         }
 
         if panic_if_init && pid == 1 {
@@ -210,7 +233,6 @@ impl<'a> ApeManager<'a> {
         };
 
         for fd in cloexec_fds {
-            log!("execve: closing cloexec fd {} for pid {}", fd, pid);
             let _ = crate::fs::fd::do_close(self, pid, fd as usize)?;
         }
 
@@ -218,7 +240,6 @@ impl<'a> ApeManager<'a> {
     }
 
     fn read_exec_image_from_fs(&mut self, pid: usize, path: &str) -> Result<Vec<u8>, Error> {
-        log!("execve: reading image pid={} path={}", pid, path);
         let stat = match self.fs_client.stat_path(Badge::null(), path) {
             Ok(stat) => stat,
             Err(e) => {
@@ -242,7 +263,6 @@ impl<'a> ApeManager<'a> {
         }
         let fs_ep = Endpoint::from(fs_ep_slot);
         let mut handle_client = glenda::client::FsClient::new(fs_ep);
-        log!("execve: open ok pid={} path={} size={} ep={:?}", pid, path, size, fs_ep);
 
         let mut elf_data = alloc::vec![0u8; size];
         let mut offset = 0;
@@ -280,7 +300,6 @@ impl<'a> ApeManager<'a> {
             self.cspace_mgr.free(fs_ep_slot);
             return Err(e);
         }
-        log!("execve: read complete pid={} path={} bytes={}", pid, path, size);
         let _ = CSPACE_CAP.delete(fs_ep_slot);
         self.cspace_mgr.free(fs_ep_slot);
         Ok(elf_data)

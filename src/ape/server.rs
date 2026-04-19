@@ -32,15 +32,21 @@ impl<'a> SystemService for ApeManager<'a> {
                 error!("Recv error: {:?}", e);
                 continue;
             }
-
+            self.set_active_caller_pid(utcb.get_badge().bits());
             match self.dispatch(&mut utcb) {
                 Ok(()) => {}
-                Err(Error::Success) => {}
+                Err(Error::Success) => {
+                    continue;
+                }
                 Err(e) => {
                     error!("Dispatch error: {:?}", e);
-                    utcb.set_msg_tag(glenda::ipc::MsgTag::err());
-                    utcb.set_mr(0, e as usize);
+                    continue;
                 }
+            }
+            self.clear_active_caller_pid();
+
+            for pid in self.take_deferred_host_kills() {
+                self.kill_host_process_by_local_pid(pid);
             }
             if let Err(e) = self.reply(&mut utcb) {
                 error!("Reply error: {:?}", e);

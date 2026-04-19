@@ -8,10 +8,10 @@ use core::mem::size_of;
 use glenda::error::Error;
 use glenda::interface::TimeService;
 use glenda::ipc::Badge;
-use linux_raw_sys::errno::{EAGAIN, EINTR, EINVAL, ENOSYS};
+use linux_raw_sys::errno::{EAGAIN, EINTR, EINVAL};
 use linux_raw_sys::general::{
-    __kernel_timespec, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SIGCHLD, SIGCONT, SIGKILL, SIGSTOP,
-    SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGWINCH,
+    __kernel_timespec, SA_RESTART, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SIGCHLD, SIGCONT, SIGKILL,
+    SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGWINCH,
 };
 
 const SIGACTION_HEAD_WORDS: usize = 3;
@@ -26,7 +26,7 @@ const SIG_IGN_HANDLER: usize = 1;
 
 pub(crate) enum PendingSignalAction {
     None,
-    Interrupt,
+    Interrupt { restart: bool },
     Terminate(usize),
 }
 
@@ -147,7 +147,8 @@ fn parse_timeout_deadline(
 ) -> Result<u64, Error> {
     let now = mono_now_ns(mgr)?;
     if timeout_ptr == 0 {
-        // 避免 APE 服务线程无限阻塞，暂以有限窗口模拟“无限等待”。
+        // TODO(ape/signal,phase4): 对齐 Linux 语义（NULL timeout => 无限等待），
+        // 需改为事件驱动等待而非有限窗口退化。
         return Ok(now.saturating_add(SIGNAL_WAIT_FALLBACK_NS));
     }
 
@@ -212,6 +213,40 @@ fn pop_lowest_signal(proc: &mut SubProcess, mask: u64) -> Option<usize> {
     proc.pop_pending_signal_from_mask(mask)
 }
 
+pub(crate) fn queue_process_signal(mgr: &mut ApeManager<'_>, pid: usize, signum: usize) -> bool {
+    let should_wake = {
+        let Some(proc) = mgr.get_process_mut(pid) else {
+            return false;
+        };
+        if !proc.queue_signal(signum) {
+            return false;
+        }
+        proc.is_waiting_sigsuspend() && (proc.signal_pending & !proc.signal_blocked) != 0
+    };
+
+    if should_wake {
+        let restored = {
+            let Some(proc) = mgr.get_process_mut(pid) else {
+                return true;
+            };
+            if proc.is_waiting_sigsuspend() && (proc.signal_pending & !proc.signal_blocked) != 0 {
+                proc.restore_mask_from_sigsuspend_wait()
+            } else {
+                false
+            }
+        };
+
+        if restored
+            && let Some(proc) = mgr.get_process(pid)
+            && let Err(e) = proc.tcb().resume()
+        {
+            warn!("signal: failed to resume pid={} from sigsuspend wait: {:?}", pid, e);
+        }
+    }
+
+    true
+}
+
 pub(crate) fn consume_deliverable_signal_on_syscall_return(
     mgr: &mut ApeManager<'_>,
     pid: usize,
@@ -232,8 +267,10 @@ pub(crate) fn consume_deliverable_signal_on_syscall_return(
     }
 
     if action.handler != SIG_DFL_HANDLER {
-        // TODO(ape/signal): 接入用户态 signal trampoline 与 rt_sigreturn 上下文恢复链路。
-        return Ok(PendingSignalAction::Interrupt);
+        // TODO(ape/signal,phase4): 接入用户态 signal trampoline + sigframe，
+        // 让用户 handler 真正执行；当前仅返回 Interrupt 进行最小兼容。
+        let restart = (action.flags & SA_RESTART as usize) != 0;
+        return Ok(PendingSignalAction::Interrupt { restart });
     }
 
     if default_ignored_signal(signum) {
@@ -247,7 +284,7 @@ pub(crate) fn consume_deliverable_signal_on_syscall_return(
         {
             proc.stopped = true;
         }
-        return Ok(PendingSignalAction::Interrupt);
+        return Ok(PendingSignalAction::Interrupt { restart: false });
     }
 
     if signum == SIGCONT as usize {
@@ -293,6 +330,15 @@ pub(crate) fn do_rt_sigaction(
 
         let mut new_action = read_sigaction(mgr, pid, act, sigsetsize)?;
         new_action.mask &= !SIGNAL_UNBLOCKABLE_MASK;
+        if signum == SIGCHLD as usize {
+            log!(
+                "signal: pid={} set SIGCHLD handler={:#x} flags={:#x} mask={:#x}",
+                pid,
+                new_action.handler,
+                new_action.flags,
+                new_action.mask
+            );
+        }
 
         let proc = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
         proc.signal_actions.insert(signum, new_action);
@@ -381,6 +427,8 @@ pub(crate) fn do_rt_sigtimedwait(
     }
 
     let deadline = parse_timeout_deadline(mgr, pid, timeout).map_err(|_| Error::InvalidArgs)?;
+    // TODO(ape/signal,phase4): 改为“登记等待 + 信号/超时事件唤醒”，
+    // 当前仍是 sleep 轮询，虽可工作但非最优事件驱动实现。
     let signum = loop {
         let candidate = {
             let proc = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
@@ -428,40 +476,44 @@ pub(crate) fn do_rt_sigsuspend(
         proc.signal_blocked
     };
 
-    {
+    let observed_signal = {
         let proc = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
         proc.set_signal_blocked(suspend_mask);
+        let deliverable = proc.signal_pending & !proc.signal_blocked;
+        let observed = pop_lowest_signal(proc, deliverable);
+        if observed.is_some() {
+            proc.set_signal_blocked(old_mask);
+        } else {
+            proc.arm_sigsuspend_wait(old_mask);
+        }
+        observed
+    };
+
+    if let Some(signum) = observed_signal {
+        log!("signal: pid={} sigsuspend observed signal {}", pid, signum);
+        return Ok(-(EINTR as isize));
     }
 
-    let deadline = mono_now_ns(mgr)?.saturating_add(SIGNAL_WAIT_FALLBACK_NS);
-    loop {
-        let has = {
-            let proc = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-            let deliverable = proc.signal_pending & !proc.signal_blocked;
-            pop_lowest_signal(proc, deliverable).is_some()
-        };
-        if has {
-            break;
+    // 关键修复：无可投递信号时不再协作式 wait_tick+立即 EINTR（会触发高频重试风暴），
+    // 而是挂起目标线程，待信号入队路径显式唤醒后再返回。
+    let tcb = mgr.get_process(pid).ok_or(Error::NotFound)?.tcb();
+    if let Err(e) = tcb.suspend() {
+        warn!("signal: failed to suspend pid={} in sigsuspend: {:?}", pid, e);
+        if let Some(proc) = mgr.get_process_mut(pid) {
+            let _ = proc.restore_mask_from_sigsuspend_wait();
         }
-
-        if mono_now_ns(mgr)? >= deadline {
-            break;
-        }
-        wait_tick(mgr);
-    }
-
-    {
-        let proc = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-        proc.set_signal_blocked(old_mask);
     }
 
     Ok(-(EINTR as isize))
 }
 
 pub(crate) fn do_rt_sigreturn(mgr: &mut ApeManager<'_>, pid: usize) -> Result<isize, Error> {
-    let _ = (mgr, pid);
-    // TODO(ape/signal): 实现 rt_sigreturn(2) 恢复用户态上下文与 signal mask。
-    Ok(-(ENOSYS as isize))
+    if let Some(proc) = mgr.get_process_mut(pid) {
+        let _ = proc.restore_mask_from_sigsuspend_wait();
+    }
+    // TODO(ape/signal,phase4): 当前是最小可用 rt_sigreturn，
+    // 尚未恢复完整用户态上下文（ucontext/sigframe/PC/SP/GPR）。
+    Ok(0)
 }
 
 pub(crate) fn do_set_robust_list(
@@ -470,6 +522,6 @@ pub(crate) fn do_set_robust_list(
     _head: usize,
     _len: usize,
 ) -> Result<isize, Error> {
-    // TODO(ape): 记录 robust_list 并在线程退出时执行健壮互斥修复。
+    // TODO(ape/signal,phase4): 记录 robust_list 并在线程退出时执行健壮互斥修复。
     Ok(0)
 }

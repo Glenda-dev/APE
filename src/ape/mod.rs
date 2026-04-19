@@ -14,6 +14,7 @@ pub mod utils;
 use crate::config::ApeConfig;
 use crate::layout::{APE_SLOT, FS_ASYNC_POOL_BASE_VADDR, FS_ASYNC_POOL_MAX_REGIONS};
 use alloc::string::String;
+use alloc::vec::Vec;
 use glenda::arch::mem::{PGSIZE, SHIFTS};
 use glenda::cap::{CNode, CSPACE_CAP, CapPtr, CapType, Endpoint, Page, Reply, Rights};
 use glenda::client::*;
@@ -33,6 +34,9 @@ pub struct ApeIpc {
     pub endpoint: Endpoint,
     pub reply: Reply,
     pub recv: CapPtr,
+    pub active_caller_pid: Option<usize>,
+    pub deferred_kill_pids: Vec<usize>,
+    pub skip_reply_once: bool,
 }
 
 pub struct ApeManager<'a> {
@@ -86,6 +90,9 @@ impl<'a> ApeManager<'a> {
                 endpoint: Endpoint::from(CapPtr::null()),
                 recv: CapPtr::null(),
                 reply: Reply::from(CapPtr::null()),
+                active_caller_pid: None,
+                deferred_kill_pids: Vec::new(),
+                skip_reply_once: false,
             },
             task_state: ApeTaskState::new(1),
             runtime_state: ApeRuntimeState::new(ApeConfig::default()),
@@ -189,6 +196,32 @@ impl<'a> ApeManager<'a> {
 
     pub fn remove_process_record(&mut self, pid: usize) {
         let _ = self.task_state.remove_process(pid);
+    }
+
+    pub fn set_active_caller_pid(&mut self, pid: usize) {
+        self.ipc.active_caller_pid = Some(pid);
+    }
+
+    pub fn clear_active_caller_pid(&mut self) {
+        self.ipc.active_caller_pid = None;
+    }
+
+    pub fn defer_host_kill(&mut self, pid: usize) {
+        if !self.ipc.deferred_kill_pids.contains(&pid) {
+            self.ipc.deferred_kill_pids.push(pid);
+        }
+    }
+
+    pub fn take_deferred_host_kills(&mut self) -> Vec<usize> {
+        core::mem::take(&mut self.ipc.deferred_kill_pids)
+    }
+
+    pub fn mark_skip_reply_once(&mut self) {
+        self.ipc.skip_reply_once = true;
+    }
+
+    pub fn take_skip_reply_once(&mut self) -> bool {
+        core::mem::replace(&mut self.ipc.skip_reply_once, false)
     }
 
     pub fn config(&self) -> &ApeConfig {

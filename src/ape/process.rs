@@ -39,6 +39,12 @@ pub enum MemoryType {
     FileBacked,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wait4BlockRequest {
+    pub target_pid: isize,
+    pub caller_pgid: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct MemoryMap {
     pub vaddr: usize,
@@ -145,6 +151,8 @@ pub struct SubProcess {
     pub signal_actions: BTreeMap<usize, SignalAction>, // signum -> disposition
     pub signal_blocked: u64,
     pub signal_pending: u64,
+    pub sigsuspend_saved_mask: Option<u64>,
+    pub wait4_blocked: Option<Wait4BlockRequest>,
     pub stopped: bool,
 }
 
@@ -180,6 +188,8 @@ impl SubProcess {
             signal_actions: BTreeMap::new(),
             signal_blocked: 0,
             signal_pending: 0,
+            sigsuspend_saved_mask: None,
+            wait4_blocked: None,
             stopped: false,
         }
     }
@@ -247,6 +257,50 @@ impl SubProcess {
         // SIGKILL/SIGSTOP 不可屏蔽。
         mask &= !SIGNAL_UNBLOCKABLE_MASK;
         self.signal_blocked = mask;
+    }
+
+    pub fn arm_sigsuspend_wait(&mut self, old_mask: u64) {
+        self.sigsuspend_saved_mask = Some(old_mask);
+    }
+
+    pub fn is_waiting_sigsuspend(&self) -> bool {
+        self.sigsuspend_saved_mask.is_some()
+    }
+
+    pub fn restore_mask_from_sigsuspend_wait(&mut self) -> bool {
+        if let Some(old_mask) = self.sigsuspend_saved_mask.take() {
+            self.set_signal_blocked(old_mask);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn arm_wait4_block(&mut self, target_pid: isize, caller_pgid: usize) {
+        self.wait4_blocked = Some(Wait4BlockRequest { target_pid, caller_pgid });
+    }
+
+    pub fn clear_wait4_block(&mut self) {
+        self.wait4_blocked = None;
+    }
+
+    fn matches_wait4_target(child_pid: usize, child_pgid: usize, req: Wait4BlockRequest) -> bool {
+        if req.target_pid == -1 {
+            return true;
+        }
+        if req.target_pid > 0 {
+            return child_pid == req.target_pid as usize;
+        }
+        if req.target_pid == 0 {
+            return child_pgid == req.caller_pgid;
+        }
+        child_pgid == req.target_pid.unsigned_abs()
+    }
+
+    pub fn wait4_block_matches(&self, child_pid: usize, child_pgid: usize) -> bool {
+        self.wait4_blocked
+            .map(|req| Self::matches_wait4_target(child_pid, child_pgid, req))
+            .unwrap_or(false)
     }
 
     pub fn queue_signal(&mut self, signum: usize) -> bool {

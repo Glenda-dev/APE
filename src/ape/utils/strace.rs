@@ -158,10 +158,7 @@ pub fn trace_syscall_enter<'a>(
         __NR_writev => Some(trace_writev(mgr, pid, args)),
         _ => None,
     };
-    TraceState {
-        enter_call,
-        start_ticks: now_ticks(),
-    }
+    TraceState { enter_call, start_ticks: now_ticks() }
 }
 
 pub fn trace_syscall_exit<'a>(
@@ -233,13 +230,7 @@ pub fn trace_syscall_exit<'a>(
         _ => trace_default(sys_num, args),
     };
 
-    debug!(
-        "[pid {}] {} = {} <{} ticks>",
-        pid,
-        call,
-        format_result(sys_num, ret),
-        elapsed_ticks
-    );
+    debug!("[pid {}] {} = {} <{} ticks>", pid, call, format_result(sys_num, ret), elapsed_ticks);
 }
 
 fn enter_or_fallback<F>(state: &TraceState, fallback: F) -> String

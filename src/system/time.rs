@@ -4,6 +4,7 @@ use core::mem::size_of;
 use glenda::error::Error;
 use glenda::interface::TimeService;
 use glenda::ipc::Badge;
+use libape::version::*;
 use linux_raw_sys::ctypes::c_char;
 use linux_raw_sys::errno::{EINTR, EINVAL};
 use linux_raw_sys::general::{
@@ -103,12 +104,12 @@ pub(crate) fn do_uname(
         domainname: [0; UTS_STR_LEN],
     };
 
-    write_cstr(&mut uts.sysname, "Linux");
-    write_cstr(&mut uts.nodename, "glenda");
-    write_cstr(&mut uts.release, "5.19.0-glenda-APE");
-    write_cstr(&mut uts.version, "Glenda Microkernel");
-    write_cstr(&mut uts.machine, "riscv64");
-    write_cstr(&mut uts.domainname, "localdomain");
+    write_cstr(&mut uts.sysname, SYSNAME);
+    write_cstr(&mut uts.nodename, NODENAME);
+    write_cstr(&mut uts.release, RELEASE);
+    write_cstr(&mut uts.version, VERSION);
+    write_cstr(&mut uts.machine, MACHINE);
+    write_cstr(&mut uts.domainname, DOMAINNAME);
 
     mgr.write_obj_to_user(pid, buf_ptr, &uts)?;
     Ok(0)
