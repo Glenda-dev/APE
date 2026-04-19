@@ -17,8 +17,7 @@ use glenda::interface::{
 use glenda::io::uring::{IoUringBuffer, IoUringClient};
 use glenda::ipc::Badge;
 use linux_raw_sys::general::{
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC, O_CLOEXEC,
-    O_NONBLOCK,
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC, O_CLOEXEC, O_NONBLOCK,
 };
 
 const DIRENT64_FIXED_SIZE: usize = 8 + 8 + 2 + 1;
@@ -508,11 +507,7 @@ pub(crate) fn do_getdents64<'a>(
 
         let mut packed = Vec::new();
         for entry in entries {
-            let name_len = entry
-                .d_name
-                .iter()
-                .position(|b| *b == 0)
-                .unwrap_or(entry.d_name.len());
+            let name_len = entry.d_name.iter().position(|b| *b == 0).unwrap_or(entry.d_name.len());
 
             let reclen = align_up_8(DIRENT64_FIXED_SIZE + name_len + 1);
             if reclen > u16::MAX as usize {

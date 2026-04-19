@@ -23,12 +23,8 @@ pub(crate) fn route_syscall<'a>(
         ApeSyscall::Getdents64 => fs::sys_getdents64(mgr, pid, args[0], args[1], args[2]),
         ApeSyscall::MkdirAt => fs::sys_mkdirat(mgr, pid, args[0], args[1], args[2]),
         ApeSyscall::UnlinkAt => fs::sys_unlinkat(mgr, pid, args[0], args[1], args[2]),
-        ApeSyscall::LinkAt => {
-            fs::sys_linkat(mgr, pid, args[0], args[1], args[2], args[3], args[4])
-        }
-        ApeSyscall::Mount => {
-            fs::sys_mount(mgr, pid, args[0], args[1], args[2], args[3], args[4])
-        }
+        ApeSyscall::LinkAt => fs::sys_linkat(mgr, pid, args[0], args[1], args[2], args[3], args[4]),
+        ApeSyscall::Mount => fs::sys_mount(mgr, pid, args[0], args[1], args[2], args[3], args[4]),
         ApeSyscall::Umount2 => fs::sys_umount2(mgr, pid, args[0], args[1]),
         ApeSyscall::Pipe2 => fs::sys_pipe2(mgr, pid, args[0], args[1]),
         ApeSyscall::Close => fs::sys_close(mgr, pid, args[0]),

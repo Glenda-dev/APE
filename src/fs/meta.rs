@@ -11,9 +11,8 @@ use glenda::interface::{
 };
 use glenda::ipc::Badge;
 use linux_raw_sys::general::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_SYMLINK_FOLLOW,
-    AT_SYMLINK_NOFOLLOW, MNT_DETACH, MNT_EXPIRE, MNT_FORCE, S_IFCHR, S_IFDIR, S_IFMT,
-    UMOUNT_NOFOLLOW, stat,
+    AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    MNT_DETACH, MNT_EXPIRE, MNT_FORCE, S_IFCHR, S_IFDIR, S_IFMT, UMOUNT_NOFOLLOW, stat,
 };
 
 const FSTATAT_ALLOWED_FLAGS: u32 = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT;
@@ -59,10 +58,7 @@ fn resolve_path_at(
             | FileType::PipeWrite(_) => return Err(Error::InvalidArgs),
         }
 
-        (
-            process.root_dir.clone(),
-            process.fd_paths.get(&fd).cloned().ok_or(Error::InvalidArgs)?,
-        )
+        (process.root_dir.clone(), process.fd_paths.get(&fd).cloned().ok_or(Error::InvalidArgs)?)
     };
 
     Ok(resolve_path(raw_path, &root_dir, &dir_path))
@@ -101,7 +97,9 @@ pub(crate) fn do_fstat<'a>(
         let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
         let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
         match handle.file_type {
-            FileType::Normal(normal) => fs_stat_to_linux_stat(normal.fs_client.stat(Badge::null())?),
+            FileType::Normal(normal) => {
+                fs_stat_to_linux_stat(normal.fs_client.stat(Badge::null())?)
+            }
             FileType::Terminal(_) => make_linux_char_device_stat(fd as usize),
             FileType::PtyMaster(master) => make_linux_char_device_stat(master.vt_id),
             FileType::PtySlave(slave) => make_linux_char_device_stat(slave.vt_id),

@@ -6,6 +6,7 @@ use glenda::interface::TimeService;
 use glenda::ipc::Badge;
 use libape::version::*;
 use linux_raw_sys::ctypes::c_char;
+use linux_raw_sys::ctypes::c_long;
 use linux_raw_sys::errno::{EINTR, EINVAL};
 use linux_raw_sys::general::{
     __kernel_timespec, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC,
@@ -13,7 +14,6 @@ use linux_raw_sys::general::{
     CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID,
     RLIM64_INFINITY, rlimit64, timeval,
 };
-use linux_raw_sys::ctypes::c_long;
 use linux_raw_sys::system::{__NEW_UTS_LEN, new_utsname};
 
 const UTS_STR_LEN: usize = (__NEW_UTS_LEN as usize) + 1;

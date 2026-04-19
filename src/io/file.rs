@@ -41,7 +41,8 @@ pub(crate) fn do_read<'a>(
         FileType::PipeRead(pipe) => {
             let chunk = min(len, IPC_BUFFER_SIZE);
             let mut tmp = vec![0u8; chunk];
-            let (n, writers_closed) = mgr.pipe_read(pipe.pipe_id, &mut tmp).ok_or(Error::InvalidSlot)?;
+            let (n, writers_closed) =
+                mgr.pipe_read(pipe.pipe_id, &mut tmp).ok_or(Error::InvalidSlot)?;
             if n == 0 {
                 if writers_closed {
                     return Ok(0);
