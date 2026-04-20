@@ -13,6 +13,9 @@ use linux_raw_sys::ctypes::c_uint;
 use linux_raw_sys::errno::{EAGAIN, EBADF, EPIPE};
 use linux_raw_sys::general::{SEEK_CUR, SEEK_END, SEEK_SET, iovec};
 
+const ENABLE_FS_RW_ASYNC_IO: bool = false;
+const FS_SYNC_RW_CHUNK: usize = 4096;
+
 pub(crate) fn do_read<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,
@@ -55,10 +58,11 @@ pub(crate) fn do_read<'a>(
         FileType::PipeWrite(_) => Ok(-(EBADF as isize)),
         FileType::Terminal(term) => crate::io::tty::do_read_terminal(mgr, pid, *term, buf_ptr, len),
         FileType::Normal(normal) => {
-            if normal.async_io.is_none() {
+            if ENABLE_FS_RW_ASYNC_IO && normal.async_io.is_none() {
                 let _ = mgr.try_enable_fs_async_io(pid, normal);
             }
-            if let Some(async_io) = normal.async_io.as_mut() {
+            if ENABLE_FS_RW_ASYNC_IO {
+                if let Some(async_io) = normal.async_io.as_mut() {
                 let fs_client = &mut normal.fs_client;
                 let ring = &mut async_io.ring;
                 let data_vaddr = async_io.data_vaddr;
@@ -100,39 +104,33 @@ pub(crate) fn do_read<'a>(
                 })?;
 
                 normal.offset = file_off;
-                Ok(total as isize)
-            } else {
-                let total = mgr.with_user_session(pid, |sess| {
-                    let mut total = 0usize;
-                    let mut kbuf = [0u8; IPC_BUFFER_SIZE];
-                    while total < len {
-                        let chunk = min(len - total, kbuf.len());
-                        if chunk == 0 {
-                            break;
-                        }
-
-                        let read_len = normal.fs_client.read(
-                            Badge::null(),
-                            normal.offset,
-                            &mut kbuf[..chunk],
-                        )?;
-                        if read_len == 0 {
-                            break;
-                        }
-
-                        let user_dst = buf_ptr.checked_add(total).ok_or(Error::InvalidAddress)?;
-                        sess.copy_to_user(user_dst, &kbuf[..read_len])?;
-
-                        total += read_len;
-                        normal.offset = normal.offset.saturating_add(read_len);
-                        if read_len < chunk {
-                            break;
-                        }
-                    }
-                    Ok(total)
-                })?;
-                Ok(total as isize)
+                return Ok(total as isize);
+                }
             }
+
+            let mut total = 0usize;
+            let mut kbuf = [0u8; FS_SYNC_RW_CHUNK];
+            while total < len {
+                let chunk = min(len - total, kbuf.len());
+                if chunk == 0 {
+                    break;
+                }
+
+                let read_len = normal.fs_client.read(Badge::null(), normal.offset, &mut kbuf[..chunk])?;
+                if read_len == 0 {
+                    break;
+                }
+
+                let user_dst = buf_ptr.checked_add(total).ok_or(Error::InvalidAddress)?;
+                mgr.copy_to_user(pid, user_dst, &kbuf[..read_len])?;
+
+                total += read_len;
+                normal.offset = normal.offset.saturating_add(read_len);
+                if read_len < chunk {
+                    break;
+                }
+            }
+            Ok(total as isize)
         }
     })
 }
@@ -174,10 +172,11 @@ pub(crate) fn do_write<'a>(
             crate::io::tty::do_write_terminal(mgr, pid, *term, buf_ptr, len)
         }
         FileType::Normal(normal) => {
-            if normal.async_io.is_none() {
+            if ENABLE_FS_RW_ASYNC_IO && normal.async_io.is_none() {
                 let _ = mgr.try_enable_fs_async_io(pid, normal);
             }
-            if let Some(async_io) = normal.async_io.as_mut() {
+            if ENABLE_FS_RW_ASYNC_IO {
+                if let Some(async_io) = normal.async_io.as_mut() {
                 let fs_client = &mut normal.fs_client;
                 let ring = &mut async_io.ring;
                 let data_vaddr = async_io.data_vaddr;
@@ -215,32 +214,29 @@ pub(crate) fn do_write<'a>(
                 })?;
 
                 normal.offset = file_off;
-                Ok(total as isize)
-            } else {
-                let total = mgr.with_user_session(pid, |sess| {
-                    let mut total = 0usize;
-                    let mut kbuf = [0u8; IPC_BUFFER_SIZE];
-                    while total < len {
-                        let chunk = min(len - total, kbuf.len());
-                        if chunk == 0 {
-                            break;
-                        }
-
-                        let user_src = buf_ptr.checked_add(total).ok_or(Error::InvalidAddress)?;
-                        sess.copy_from_user(user_src, &mut kbuf[..chunk])?;
-
-                        let written =
-                            normal.fs_client.write(Badge::null(), normal.offset, &kbuf[..chunk])?;
-                        total += written;
-                        normal.offset = normal.offset.saturating_add(written);
-                        if written < chunk {
-                            break;
-                        }
-                    }
-                    Ok(total)
-                })?;
-                Ok(total as isize)
+                return Ok(total as isize);
+                }
             }
+
+            let mut total = 0usize;
+            let mut kbuf = [0u8; FS_SYNC_RW_CHUNK];
+            while total < len {
+                let chunk = min(len - total, kbuf.len());
+                if chunk == 0 {
+                    break;
+                }
+
+                let user_src = buf_ptr.checked_add(total).ok_or(Error::InvalidAddress)?;
+                mgr.copy_from_user(pid, user_src, &mut kbuf[..chunk])?;
+
+                let written = normal.fs_client.write(Badge::null(), normal.offset, &kbuf[..chunk])?;
+                total += written;
+                normal.offset = normal.offset.saturating_add(written);
+                if written < chunk {
+                    break;
+                }
+            }
+            Ok(total as isize)
         }
     })
 }

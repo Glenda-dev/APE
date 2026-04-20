@@ -88,6 +88,17 @@ pub fn sys_linkat<'a>(
     crate::fs::meta::do_linkat(mgr, pid, olddirfd, oldpath, newdirfd, newpath, flags)
 }
 
+pub fn sys_utimensat<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    dirfd: usize,
+    pathname: usize,
+    times: usize,
+    flags: usize,
+) -> Result<isize, Error> {
+    crate::fs::meta::do_utimensat(mgr, pid, dirfd, pathname, times, flags)
+}
+
 pub fn sys_mount<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,

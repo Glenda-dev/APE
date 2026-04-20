@@ -377,6 +377,62 @@ pub(crate) fn do_brk<'a>(
     Ok(process.heap_brk)
 }
 
+fn map_anonymous_range_eager<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    start: usize,
+    end: usize,
+    perms: Perms,
+) -> Result<(), Error> {
+    let mut mapped: Vec<(usize, CapPtr)> = Vec::new();
+
+    for page in (start..end).step_by(PGSIZE) {
+        let slot = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
+        if let Err(e) = mgr.res_client.alloc(Badge::null(), CapType::Page, 1, slot) {
+            mgr.cspace_mgr.free(slot);
+            for (vaddr, old_slot) in mapped.iter().rev() {
+                let _ = mgr.unmap_process_pages(pid, *vaddr, 1);
+                if let Some(process) = mgr.get_process_mut(pid) {
+                    process.memory_maps.remove(vaddr);
+                }
+                mgr.release_process_frame_slot(pid, *old_slot, 1, "mmap_anon_eager_rollback");
+            }
+            return Err(e);
+        }
+        mgr.ledger_record_frame_alloc(pid, slot, 1, "mmap_anon_eager");
+
+        if let Err(e) = mgr.map_process_frame(pid, Page::from(slot), page, perms, 1) {
+            mgr.release_process_frame_slot(pid, slot, 1, "mmap_anon_eager_map_fail");
+            for (vaddr, old_slot) in mapped.iter().rev() {
+                let _ = mgr.unmap_process_pages(pid, *vaddr, 1);
+                if let Some(process) = mgr.get_process_mut(pid) {
+                    process.memory_maps.remove(vaddr);
+                }
+                mgr.release_process_frame_slot(pid, *old_slot, 1, "mmap_anon_eager_rollback");
+            }
+            return Err(e);
+        }
+
+        if let Some(process) = mgr.get_process_mut(pid) {
+            process.add_memory_map(MemoryMap {
+                vaddr: page,
+                paddr: 0,
+                size: PGSIZE,
+                flags: perms,
+                mem_type: MemoryType::Anonymous,
+                cow: false,
+                frame_cap: slot.bits(),
+                file_backing_fd: None,
+                file_backing_offset: 0,
+            });
+        }
+
+        mapped.push((page, slot));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn do_mmap<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,
@@ -500,21 +556,7 @@ pub(crate) fn do_mmap<'a>(
                 });
             }
         } else {
-            let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-            for page in (start..end).step_by(PGSIZE) {
-                process.add_lazy_memory_map(MemoryMap {
-                    vaddr: page,
-                    paddr: 0,
-                    size: PGSIZE,
-                    flags: perms,
-                    mem_type: MemoryType::Anonymous,
-                    cow: false,
-                    frame_cap: 0,
-                    file_backing_fd: None,
-                    file_backing_offset: 0,
-                });
-            }
-            process.mmap_next = process.mmap_next.max(end);
+            map_anonymous_range_eager(mgr, pid, start, end, perms)?;
         }
 
         if let Some(process) = mgr.get_process_mut(pid) {
@@ -566,20 +608,7 @@ pub(crate) fn do_mmap<'a>(
             });
         }
     } else {
-        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-        for page in (start..end).step_by(PGSIZE) {
-            process.add_lazy_memory_map(MemoryMap {
-                vaddr: page,
-                paddr: 0,
-                size: PGSIZE,
-                flags: perms,
-                mem_type: MemoryType::Anonymous,
-                cow: false,
-                frame_cap: 0,
-                file_backing_fd: None,
-                file_backing_offset: 0,
-            });
-        }
+        map_anonymous_range_eager(mgr, pid, start, end, perms)?;
     }
 
     let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;

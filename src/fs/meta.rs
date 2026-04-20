@@ -216,6 +216,39 @@ pub(crate) fn do_linkat<'a>(
     Ok(0)
 }
 
+pub(crate) fn do_utimensat<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    dirfd: usize,
+    pathname: usize,
+    _times: usize,
+    flags: usize,
+) -> Result<isize, Error> {
+    let flags = u32::try_from(flags).map_err(|_| Error::InvalidArgs)?;
+    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+        return Err(Error::InvalidArgs);
+    }
+
+    if pathname == 0 {
+        let fd = u32::try_from(dirfd).map_err(|_| Error::InvalidSlot)?;
+        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
+        match handle.file_type {
+            FileType::Normal(_) => Ok(0),
+            _ => Err(Error::InvalidArgs),
+        }
+    } else {
+        let raw_path = mgr.strncpy_from_user(pid, pathname, USER_PATH_MAX)?;
+        if raw_path.is_empty() {
+            return Err(Error::NotFound);
+        }
+
+        let resolved = resolve_path_at(mgr, pid, dirfd, &raw_path)?;
+        let _ = mgr.fs_client.stat_path(Badge::null(), &resolved)?;
+        Ok(0)
+    }
+}
+
 pub(crate) fn do_mount<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,

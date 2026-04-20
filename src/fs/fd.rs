@@ -29,6 +29,18 @@ fn align_up_8(v: usize) -> usize {
     (v + 7) & !7
 }
 
+fn duplicate_normal_handle(
+    _mgr: &mut ApeManager<'_>,
+    handle: &crate::ape::process::NormalFileHandle,
+) -> Result<crate::ape::process::NormalFileHandle, Error> {
+    Ok(crate::ape::process::NormalFileHandle {
+        fs_client: handle.fs_client,
+        fs_ep_slot: handle.fs_ep_slot,
+        offset: handle.offset,
+        async_io: None,
+    })
+}
+
 // 4KB ring + 12KB data window，降低每 fd 的常驻内存。
 const FS_ASYNC_REGION_SIZE: usize = 16 * 1024;
 const FS_ASYNC_RING_SIZE: usize = 4096;
@@ -309,10 +321,22 @@ pub(crate) fn do_close<'a>(
             mgr.close_pipe_write_end(pipe.pipe_id);
         }
         FileType::Normal(mut normal) => {
-            let _ = normal.fs_client.close(Badge::null());
-            if !normal.fs_ep_slot.is_null() {
-                let _ = CSPACE_CAP.delete(normal.fs_ep_slot);
-                mgr.cspace_mgr.free(normal.fs_ep_slot);
+            let still_shared = {
+                let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+                process.fds.values().any(|fh| {
+                    matches!(
+                        fh.file_type,
+                        FileType::Normal(other) if other.fs_ep_slot == normal.fs_ep_slot
+                    )
+                })
+            };
+
+            if !still_shared {
+                let _ = normal.fs_client.close(Badge::null());
+                if !normal.fs_ep_slot.is_null() {
+                    let _ = CSPACE_CAP.delete(normal.fs_ep_slot);
+                    mgr.cspace_mgr.free(normal.fs_ep_slot);
+                }
             }
             if let Some(async_io) = normal.async_io {
                 mgr.recycle_fs_async_region(async_io.region_id);
@@ -370,7 +394,7 @@ pub(crate) fn do_fcntl<'a>(
             Ok(0)
         }
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            let (new_fd, pipe_clone) = {
+            let (new_fd, cloned, pipe_clone) = {
                 let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
                 if !process.fds.contains_key(&fd) {
                     return Err(Error::InvalidSlot);
@@ -383,12 +407,24 @@ pub(crate) fn do_fcntl<'a>(
                 }
 
                 let cloned = process.fds.get(&fd).cloned().ok_or(Error::InvalidSlot)?;
-                let pipe_clone = match cloned.file_type {
+                let file_type = cloned.file_type;
+                let pipe_clone = match file_type {
                     FileType::PipeRead(pipe) => Some((true, pipe.pipe_id)),
                     FileType::PipeWrite(pipe) => Some((false, pipe.pipe_id)),
                     _ => None,
                 };
+                (new_fd, cloned, pipe_clone)
+            };
 
+            let cloned = match cloned.file_type {
+                FileType::Normal(normal) => {
+                    FileHandle { file_type: FileType::Normal(duplicate_normal_handle(mgr, &normal)?) }
+                }
+                other => FileHandle { file_type: other },
+            };
+
+            {
+                let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
                 process.fds.insert(new_fd, cloned);
                 if let Some(path) = process.fd_paths.get(&fd).cloned() {
                     process.fd_paths.insert(new_fd, path);
@@ -399,9 +435,7 @@ pub(crate) fn do_fcntl<'a>(
                 if process.next_fd <= new_fd {
                     process.next_fd = new_fd.saturating_add(1);
                 }
-
-                (new_fd, pipe_clone)
-            };
+            }
 
             if let Some((is_read, pipe_id)) = pipe_clone {
                 if is_read {
@@ -455,11 +489,21 @@ pub(crate) fn do_dup3<'a>(
         do_close(mgr, pid, newfd as usize)?;
     }
 
-    match cloned.file_type {
-        FileType::PipeRead(pipe) => mgr.clone_pipe_read_end(pipe.pipe_id),
-        FileType::PipeWrite(pipe) => mgr.clone_pipe_write_end(pipe.pipe_id),
-        _ => {}
-    }
+    let file_type = cloned.file_type;
+    let cloned = match file_type {
+        FileType::Normal(normal) => {
+            FileHandle { file_type: FileType::Normal(duplicate_normal_handle(mgr, &normal)?) }
+        }
+        FileType::PipeRead(pipe) => {
+            mgr.clone_pipe_read_end(pipe.pipe_id);
+            FileHandle { file_type: FileType::PipeRead(pipe) }
+        }
+        FileType::PipeWrite(pipe) => {
+            mgr.clone_pipe_write_end(pipe.pipe_id);
+            FileHandle { file_type: FileType::PipeWrite(pipe) }
+        }
+        other => FileHandle { file_type: other },
+    };
 
     let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
     process.fds.insert(newfd, cloned);
