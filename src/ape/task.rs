@@ -49,6 +49,10 @@ impl<'a> ApeManager<'a> {
         pages: usize,
         reason: &str,
     ) {
+        if !self.release_shared_frame_cap(slot) {
+            return;
+        }
+
         let released = match self.res_client.free(Badge::null(), slot) {
             Ok(()) => true,
             Err(e)

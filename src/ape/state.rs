@@ -100,6 +100,7 @@ pub struct ApeTaskState {
     processes: BTreeMap<usize, SubProcess>,
     host_pid_map: BTreeMap<usize, usize>, // host_pid -> local pid
     exited_children: BTreeMap<usize, VecDeque<ChildExitEvent>>, // parent_pid -> child exits
+    frame_cap_refs: BTreeMap<CapPtr, usize>, // shared frame capability reference counters
     next_pid: usize,
 }
 
@@ -109,8 +110,29 @@ impl ApeTaskState {
             processes: BTreeMap::new(),
             host_pid_map: BTreeMap::new(),
             exited_children: BTreeMap::new(),
+            frame_cap_refs: BTreeMap::new(),
             next_pid,
         }
+    }
+
+    pub fn retain_frame_cap(&mut self, slot: CapPtr) {
+        let entry = self.frame_cap_refs.entry(slot).or_insert(1);
+        *entry = entry.saturating_add(1);
+    }
+
+    /// Returns true when caller should perform the actual resource free.
+    pub fn release_frame_cap(&mut self, slot: CapPtr) -> bool {
+        let Some(count) = self.frame_cap_refs.get_mut(&slot) else {
+            return true;
+        };
+
+        if *count > 1 {
+            *count -= 1;
+            return false;
+        }
+
+        self.frame_cap_refs.remove(&slot);
+        true
     }
 
     pub fn alloc_pid(&mut self) -> usize {

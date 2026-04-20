@@ -198,6 +198,15 @@ impl<'a> ApeManager<'a> {
         let _ = self.task_state.remove_process(pid);
     }
 
+    pub(crate) fn retain_shared_frame_cap(&mut self, slot: CapPtr) {
+        self.task_state.retain_frame_cap(slot);
+    }
+
+    /// Returns true when caller should perform the actual resource free.
+    pub(crate) fn release_shared_frame_cap(&mut self, slot: CapPtr) -> bool {
+        self.task_state.release_frame_cap(slot)
+    }
+
     pub fn set_active_caller_pid(&mut self, pid: usize) {
         self.ipc.active_caller_pid = Some(pid);
     }

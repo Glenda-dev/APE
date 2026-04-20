@@ -1,10 +1,11 @@
 use crate::ApeManager;
 use crate::ape::process::{FileType, MemoryMap};
 use crate::layout::APE_SLOT;
+use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::vec::Vec;
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, CapType, Endpoint, Page};
+use glenda::cap::{CapPtr, Endpoint, Page};
 use glenda::error::Error;
 use glenda::interface::{
     AuthService, CSpaceService, ProcessService, ResourceService, VSpaceService,
@@ -145,12 +146,8 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
         )
     };
 
-    let mut child_maps = Vec::with_capacity(parent_maps.len());
-
-    for mut map in parent_maps {
-        map.cow = false;
-        child_maps.push(map);
-    }
+    let mut child_maps = parent_maps;
+    let mut retained_shared_slots = BTreeSet::new();
 
     for map in &mut child_maps {
         if map.frame_cap == 0 {
@@ -161,59 +158,45 @@ pub(crate) fn do_fork(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Err
             continue;
         }
 
-        if map.flags.contains(Perms::WRITE) {
-            let new_frame_slot = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
-            mgr.res_client.alloc(Badge::null(), CapType::Page, pages, new_frame_slot)?;
-            mgr.ledger_record_frame_alloc(
-                child_pid,
-                new_frame_slot,
-                pages,
-                "fork_private_writable_map",
-            );
+        let frame_slot = CapPtr::from(map.frame_cap);
+        let frame = Page::from(frame_slot);
 
-            let old_frame = Page::from(CapPtr::from(map.frame_cap));
-            let new_frame = Page::from(new_frame_slot);
+        let writable = map.flags.contains(Perms::WRITE);
+        let child_map_perms = if writable {
+            let mut p = map.flags;
+            p.remove(Perms::WRITE);
+            p
+        } else {
+            map.flags
+        };
 
-            let src = mgr.vspace_mgr.map_scratch(
-                old_frame,
-                Perms::READ,
-                pages,
-                &mut *mgr.res_client,
-                &mut *mgr.cspace_mgr,
-            )?;
-
-            let dst = match mgr.vspace_mgr.map_scratch(
-                new_frame,
-                Perms::READ | Perms::WRITE,
-                pages,
-                &mut *mgr.res_client,
-                &mut *mgr.cspace_mgr,
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = mgr.vspace_mgr.unmap(src, pages);
-                    return Err(e);
-                }
-            };
-
-            unsafe {
-                core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, pages * PGSIZE);
-            }
-
-            let _ = mgr.vspace_mgr.unmap(src, pages);
-            let _ = mgr.vspace_mgr.unmap(dst, pages);
-
-            map.frame_cap = new_frame_slot.bits();
-            map.cow = false;
+        if let Err(e) = mgr.map_process_frame(child_pid, frame, map.vaddr, child_map_perms, pages) {
+            return Err(e);
         }
 
-        mgr.map_process_frame(
-            child_pid,
-            Page::from(CapPtr::from(map.frame_cap)),
-            map.vaddr,
-            map.flags,
-            pages,
-        )?;
+        if writable && !map.cow {
+            let mut parent_map_perms = map.flags;
+            parent_map_perms.remove(Perms::WRITE);
+
+            let _ = mgr.unmap_process_pages(pid, map.vaddr, pages);
+            if let Err(e) = mgr.map_process_frame(pid, frame, map.vaddr, parent_map_perms, pages) {
+                let _ = mgr.unmap_process_pages(child_pid, map.vaddr, pages);
+                return Err(e);
+            }
+        }
+
+        if retained_shared_slots.insert(frame_slot) {
+            mgr.retain_shared_frame_cap(frame_slot);
+        }
+
+        if writable {
+            map.cow = true;
+            if let Some(parent) = mgr.get_process_mut(pid)
+                && let Some(parent_map) = parent.memory_maps.get_mut(&map.vaddr)
+            {
+                parent_map.cow = true;
+            }
+        }
     }
 
     {
