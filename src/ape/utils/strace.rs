@@ -1007,7 +1007,10 @@ fn format_whence(whence: u32) -> &'static str {
         SEEK_SET => "SEEK_SET",
         SEEK_CUR => "SEEK_CUR",
         SEEK_END => "SEEK_END",
-        _ => "UNKNOWN",
+        _ => {
+            warn!("Unknown whence: {}", whence);
+            "UNKNOWN"
+        }
     }
 }
 
@@ -1020,7 +1023,10 @@ fn format_fcntl_cmd(cmd: usize) -> &'static str {
         F_GETFL => "F_GETFL",
         F_SETFL => "F_SETFL",
         F_DUPFD_CLOEXEC => "F_DUPFD_CLOEXEC",
-        _ => "F_?",
+        _ => {
+            warn!("Unknown fcntl cmd: {}", cmd);
+            "F_?"
+        }
     }
 }
 
@@ -1037,7 +1043,10 @@ fn format_ioctl_req(req: usize) -> &'static str {
         TIOCSWINSZ => "TIOCSWINSZ",
         TIOCGPTN => "TIOCGPTN",
         TIOCSPTLCK => "TIOCSPTLCK",
-        _ => "IOCTL_?",
+        _ => {
+            warn!("Unknown ioctl req: {}", req);
+            "IOCTL_?"
+        }
     }
 }
 
@@ -1055,8 +1064,8 @@ fn format_getrandom_flags(flags: u32) -> String {
     join_flags(&parts)
 }
 
-fn format_signal(sig: isize) -> String {
-    let name = match sig {
+fn format_signal(sig: isize) -> &'static str {
+    match sig {
         0 => "0",
         x if x == SIGHUP as isize => "SIGHUP",
         x if x == SIGINT as isize => "SIGINT",
@@ -1089,9 +1098,11 @@ fn format_signal(sig: isize) -> String {
         x if x == SIGIO as isize => "SIGIO",
         x if x == SIGPWR as isize => "SIGPWR",
         x if x == SIGSYS as isize => "SIGSYS",
-        _ => return format!("{}", sig),
-    };
-    if sig == 0 { "0".to_string() } else { name.to_string() }
+        _ => {
+            warn!("Unknown signal: {}", sig);
+            "SIG_?"
+        }
+    }
 }
 
 fn format_sigmask_how(how: isize) -> &'static str {
@@ -1099,7 +1110,10 @@ fn format_sigmask_how(how: isize) -> &'static str {
         SIG_BLOCK => "SIG_BLOCK",
         SIG_UNBLOCK => "SIG_UNBLOCK",
         SIG_SETMASK => "SIG_SETMASK",
-        _ => "SIGMASK_?",
+        _ => {
+            warn!("Unknown sigmask how: {}", how);
+            "SIGMASK_?"
+        }
     }
 }
 
@@ -1116,7 +1130,10 @@ fn format_clockid(clockid: isize) -> &'static str {
         CLOCK_REALTIME_ALARM => "CLOCK_REALTIME_ALARM",
         CLOCK_BOOTTIME_ALARM => "CLOCK_BOOTTIME_ALARM",
         CLOCK_TAI => "CLOCK_TAI",
-        _ => "CLOCK_?",
+        _ => {
+            warn!("Unknown clockid: {}", clockid);
+            "CLOCK_?"
+        }
     }
 }
 
@@ -1138,7 +1155,10 @@ fn format_futex_op(op: usize) -> String {
         FUTEX_WAKE_BITSET => "FUTEX_WAKE_BITSET",
         FUTEX_WAIT_REQUEUE_PI => "FUTEX_WAIT_REQUEUE_PI",
         FUTEX_CMP_REQUEUE_PI => "FUTEX_CMP_REQUEUE_PI",
-        _ => "FUTEX_?",
+        _ => {
+            warn!("Unknown futex op: {}", op);
+            "FUTEX_?"
+        }
     };
     parts.push(cmd_name);
     if op & FUTEX_PRIVATE_FLAG != 0 {
@@ -1168,6 +1188,9 @@ fn format_rlimit_resource(resource: u32) -> &'static str {
         RLIMIT_NICE => "RLIMIT_NICE",
         RLIMIT_RTPRIO => "RLIMIT_RTPRIO",
         RLIMIT_RTTIME => "RLIMIT_RTTIME",
-        _ => "RLIMIT_?",
+        _ => {
+            warn!("Unknown rlimit resource: {}", resource);
+            "RLIMIT_?"
+        }
     }
 }
