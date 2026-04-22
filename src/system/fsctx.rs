@@ -1,6 +1,6 @@
 use crate::ApeManager;
 use crate::ape::path::path_inside_root;
-use crate::ape::process::FileType as ApeFileType;
+use crate::ape::process::{FileType as ApeFileType, NormalHandleBackend};
 use crate::ape::user::USER_PATH_MAX;
 use alloc::string::String;
 use glenda::error::Error;
@@ -79,6 +79,9 @@ pub(crate) fn do_fchdir(mgr: &mut ApeManager<'_>, pid: usize, fd: usize) -> Resu
 
         match &handle.file_type {
             ApeFileType::Normal(normal) => {
+                if !matches!(normal.backend, NormalHandleBackend::Fs) {
+                    return Err(Error::InvalidArgs);
+                }
                 let st = normal.fs_client.stat(Badge::null())?;
                 if !is_dir_mode(st.mode) {
                     return Err(Error::InvalidArgs);

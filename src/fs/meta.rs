@@ -1,8 +1,8 @@
 use crate::ApeManager;
 use crate::ape::path::resolve_path;
-use crate::ape::process::FileType;
+use crate::ape::process::{FileType, NormalHandleBackend};
 use crate::ape::user::USER_PATH_MAX;
-use crate::ape::utils::linux_conv::{fs_stat_to_linux_stat, make_linux_char_device_stat};
+use crate::ape::utils::linux_conv::fs_stat_to_linux_stat;
 use alloc::string::String;
 use glenda::cap::CSPACE_CAP;
 use glenda::error::Error;
@@ -45,17 +45,14 @@ fn resolve_path_at(
         let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
         match handle.file_type {
             FileType::Normal(normal) => {
+                if !matches!(normal.backend, NormalHandleBackend::Fs) {
+                    return Err(Error::InvalidArgs);
+                }
                 let st = normal.fs_client.stat(Badge::null())?;
                 if !is_dir_mode(st.mode) {
                     return Err(Error::InvalidArgs);
                 }
             }
-            FileType::Terminal(_)
-            | FileType::PtyMaster(_)
-            | FileType::PtySlave(_)
-            | FileType::PseudoChar(_)
-            | FileType::PipeRead(_)
-            | FileType::PipeWrite(_) => return Err(Error::InvalidArgs),
         }
 
         (process.root_dir.clone(), process.fd_paths.get(&fd).cloned().ok_or(Error::InvalidArgs)?)
@@ -98,13 +95,11 @@ pub(crate) fn do_fstat<'a>(
         let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
         match handle.file_type {
             FileType::Normal(normal) => {
+                if !matches!(normal.backend, NormalHandleBackend::Fs) {
+                    return Err(Error::InvalidArgs);
+                }
                 fs_stat_to_linux_stat(normal.fs_client.stat(Badge::null())?)
             }
-            FileType::Terminal(_) => make_linux_char_device_stat(fd as usize),
-            FileType::PtyMaster(master) => make_linux_char_device_stat(master.vt_id),
-            FileType::PtySlave(slave) => make_linux_char_device_stat(slave.vt_id),
-            FileType::PseudoChar(_) => make_linux_char_device_stat(fd as usize),
-            FileType::PipeRead(_) | FileType::PipeWrite(_) => return Err(Error::InvalidArgs),
         }
     };
 
@@ -234,8 +229,12 @@ pub(crate) fn do_utimensat<'a>(
         let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
         let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
         match handle.file_type {
-            FileType::Normal(_) => Ok(0),
-            _ => Err(Error::InvalidArgs),
+            FileType::Normal(normal) => {
+                if !matches!(normal.backend, NormalHandleBackend::Fs) {
+                    return Err(Error::InvalidArgs);
+                }
+                Ok(0)
+            }
         }
     } else {
         let raw_path = mgr.strncpy_from_user(pid, pathname, USER_PATH_MAX)?;
@@ -330,13 +329,11 @@ pub(crate) fn do_newfstatat<'a>(
             let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
             match handle.file_type {
                 FileType::Normal(normal) => {
+                    if !matches!(normal.backend, NormalHandleBackend::Fs) {
+                        return Err(Error::InvalidArgs);
+                    }
                     fs_stat_to_linux_stat(normal.fs_client.stat(Badge::null())?)
                 }
-                FileType::Terminal(_) => make_linux_char_device_stat(fd as usize),
-                FileType::PtyMaster(master) => make_linux_char_device_stat(master.vt_id),
-                FileType::PtySlave(slave) => make_linux_char_device_stat(slave.vt_id),
-                FileType::PseudoChar(_) => make_linux_char_device_stat(fd as usize),
-                FileType::PipeRead(_) | FileType::PipeWrite(_) => return Err(Error::InvalidArgs),
             }
         };
 

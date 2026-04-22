@@ -1,17 +1,19 @@
 use crate::ApeManager;
 use crate::ape::policy::SharedPagePoolPolicy;
 use crate::ape::policy::lru::LruPolicy;
-use crate::ape::process::MemoryMap;
+use crate::ape::process::{MemoryMap, MemoryType};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp::min;
 use core::mem::size_of;
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, Page};
+use glenda::cap::{CapPtr, CapType, Page};
 use glenda::error::Error;
+use glenda::interface::{CSpaceService, ResourceService};
+use glenda::ipc::Badge;
 use glenda::interface::VSpaceService;
 use glenda::mem::Perms;
-use glenda::utils::align::align_up;
+use glenda::utils::align::{align_down, align_up};
 
 /// 对齐 Linux PATH_MAX 的常见值。
 pub const USER_PATH_MAX: usize = 4096;
@@ -153,11 +155,78 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
         self.pool.release_all(self.mgr)
     }
 
-    fn lookup_map(&self, user_addr: usize, required: Perms) -> Result<MemoryMap, Error> {
+    fn try_grow_stack_for_user_addr(&mut self, user_addr: usize) -> Result<bool, Error> {
+        let page_addr = align_down(user_addr, PGSIZE);
+        let (stack_bottom, max_stack_size, stack_size) = {
+            let process = self.mgr.get_process(self.pid).ok_or(Error::NotFound)?;
+            (process.stack_bottom, process.max_stack_size, process.stack_size)
+        };
+
+        let stack_low_limit = stack_bottom.saturating_sub(max_stack_size);
+        if !(user_addr < stack_bottom && user_addr >= stack_low_limit) {
+            return Ok(false);
+        }
+
+        let current_stack_low = stack_bottom.saturating_sub(stack_size);
+        if page_addr >= current_stack_low {
+            return Ok(false);
+        }
+
+        let pages_to_map = (current_stack_low - page_addr) / PGSIZE;
+        if pages_to_map == 0 {
+            return Ok(false);
+        }
+
+        for idx in 0..pages_to_map {
+            let vaddr = current_stack_low - (idx + 1) * PGSIZE;
+            let frame_slot = self.mgr.cspace_mgr.alloc(&mut *self.mgr.res_client)?;
+            self.mgr.res_client.alloc(Badge::null(), CapType::Page, 1, frame_slot)?;
+            self.mgr.ledger_record_frame_alloc(
+                self.pid,
+                frame_slot,
+                1,
+                "user_copy_stack_growth",
+            );
+            self.mgr.map_process_frame(
+                self.pid,
+                Page::from(frame_slot),
+                vaddr,
+                Perms::READ | Perms::WRITE,
+                1,
+            )?;
+
+            let process = self.mgr.get_process_mut(self.pid).ok_or(Error::NotFound)?;
+            process.add_memory_map(MemoryMap {
+                vaddr,
+                paddr: 0,
+                size: PGSIZE,
+                flags: Perms::READ | Perms::WRITE,
+                mem_type: MemoryType::Stack,
+                cow: false,
+                frame_cap: frame_slot.bits(),
+                file_backing_fd: None,
+                file_backing_offset: 0,
+            });
+            process.stack_size = process.stack_size.saturating_add(PGSIZE);
+        }
+
+        Ok(true)
+    }
+
+    fn lookup_map(&mut self, user_addr: usize, required: Perms) -> Result<MemoryMap, Error> {
         let map = {
             let process = self.mgr.get_process(self.pid).ok_or(Error::NotFound)?;
             process.lookup_memory_map(user_addr).cloned()
         }
+        .or_else(|| {
+            match self.try_grow_stack_for_user_addr(user_addr) {
+                Ok(true) => self
+                    .mgr
+                    .get_process(self.pid)
+                    .and_then(|process| process.lookup_memory_map(user_addr).cloned()),
+                _ => None,
+            }
+        })
         .ok_or(Error::InvalidAddress)?;
 
         if map.frame_cap == 0 || !map.flags.contains(required) {

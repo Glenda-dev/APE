@@ -5,4 +5,3 @@
 //! 后续可将设备 I/O、多路复用、异步事件等能力逐步下沉到本模块。
 
 pub mod file;
-pub mod tty;

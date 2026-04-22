@@ -1,8 +1,7 @@
 use crate::ApeManager;
-use crate::ape::process::FileType as ApeFileType;
-use crate::io::tty::terminal_poll_readable;
 use alloc::vec;
 use core::mem::size_of;
+use crate::drivers::tty::TtyDevice;
 use glenda::error::Error;
 use glenda::interface::TimeService;
 use glenda::ipc::Badge;
@@ -15,18 +14,17 @@ const NSEC_PER_SEC: u64 = 1_000_000_000;
 const PPOLL_SLEEP_MS: usize = 4;
 
 fn pollin_ready_for_fd(mgr: &mut ApeManager<'_>, pid: usize, fd: u32) -> Result<bool, Error> {
-    let term = {
+    let is_tty = {
         let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-        let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
-        match handle.file_type {
-            ApeFileType::Terminal(term) => Some(term),
-            ApeFileType::PtyMaster(master) => Some(master.term),
-            ApeFileType::PtySlave(slave) => Some(slave.term),
-            _ => None,
-        }
+        process.fd_paths.get(&fd).map(|p| p.as_str() == "/dev/tty").unwrap_or(false)
     };
 
-    if let Some(term) = term { terminal_poll_readable(mgr, term) } else { Ok(true) }
+    if is_tty {
+        return TtyDevice::global().poll_readable();
+    }
+
+    // Regular files remain readable from poll's perspective.
+    Ok(true)
 }
 
 #[inline]

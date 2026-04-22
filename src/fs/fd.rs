@@ -1,18 +1,14 @@
 use crate::ApeManager;
-use crate::ape::path::path_inside_root;
 use crate::ape::process::{
-    AsyncIoState, FileHandle, FileType, NormalFileHandle, PipeEndHandle, PseudoCharDevice,
-    PtyMasterHandle, PtySlaveHandle,
+    AsyncIoState, FileHandle, FileType, NormalFileHandle, NormalHandleBackend,
 };
 use crate::ape::user::USER_PATH_MAX;
-use crate::io::tty::set_terminal_pgrp_local;
-use alloc::format;
 use alloc::vec::Vec;
-use glenda::cap::{CSPACE_CAP, Endpoint, Page};
-use glenda::client::{FsClient, TerminalClient};
+use glenda::cap::{CSPACE_CAP, CapPtr, Endpoint, Page};
+use glenda::client::FsClient;
 use glenda::error::Error;
 use glenda::interface::{
-    CSpaceService, FileHandleService, FileSystemService, VirtualTerminalService,
+    CSpaceService, FileHandleService, FileSystemService,
 };
 use glenda::io::uring::{IoUringBuffer, IoUringClient};
 use glenda::ipc::Badge;
@@ -34,11 +30,30 @@ fn duplicate_normal_handle(
     handle: &crate::ape::process::NormalFileHandle,
 ) -> Result<crate::ape::process::NormalFileHandle, Error> {
     Ok(crate::ape::process::NormalFileHandle {
+        backend: NormalHandleBackend::Fs,
         fs_client: handle.fs_client,
         fs_ep_slot: handle.fs_ep_slot,
         offset: handle.offset,
         async_io: None,
     })
+}
+
+fn open_pipe_end_via_pipefs<'a>(
+    mgr: &mut ApeManager<'a>,
+    pipe_id: usize,
+    path_suffix: &str,
+    flags: glenda::protocol::fs::OpenFlags,
+) -> Result<(FsClient, CapPtr), Error> {
+    let pipe_ep = mgr.pipe_vfs_endpoint.ok_or(Error::NotFound)?;
+    let fs_ep_slot = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
+    let path = alloc::format!("/{}/{}", pipe_id, path_suffix);
+    let mut open_client = FsClient::new(pipe_ep);
+    if let Err(e) = open_client.open(Badge::null(), &path, flags, 0, fs_ep_slot) {
+        let _ = CSPACE_CAP.delete(fs_ep_slot);
+        mgr.cspace_mgr.free(fs_ep_slot);
+        return Err(e);
+    }
+    Ok((FsClient::new(Endpoint::from(fs_ep_slot)), fs_ep_slot))
 }
 
 // 4KB ring + 12KB data window，降低每 fd 的常驻内存。
@@ -49,158 +64,18 @@ const FS_ASYNC_SQ_ENTRIES: u32 = 16;
 const FS_ASYNC_CQ_ENTRIES: u32 = 16;
 const ENABLE_FS_ASYNC_IO: bool = true;
 
-enum DevicePathKind {
-    StdioTty,
-    Pseudo(PseudoCharDevice),
-    PtyMaster,
-    PtySlave(usize),
-}
-
-fn classify_device_path(path: &str) -> Option<DevicePathKind> {
-    if path == "/dev/ptmx" {
-        return Some(DevicePathKind::PtyMaster);
-    }
-    if let Some(idx) = path.strip_prefix("/dev/pts/") {
-        return idx.parse::<usize>().ok().map(DevicePathKind::PtySlave);
-    }
-    if path.starts_with("/dev/tty")
-        || matches!(path, "/dev/console" | "/dev/stdin" | "/dev/stdout" | "/dev/stderr")
-    {
-        return Some(DevicePathKind::StdioTty);
-    }
-
-    let pseudo = match path {
-        "/dev/null" => Some(PseudoCharDevice::Null),
-        "/dev/zero" => Some(PseudoCharDevice::Zero),
-        "/dev/random" => Some(PseudoCharDevice::Random),
-        "/dev/urandom" => Some(PseudoCharDevice::URandom),
-        _ => None,
-    };
-    pseudo.map(DevicePathKind::Pseudo)
-}
-
-pub(crate) fn do_openat<'a>(
+fn open_via_nexus_fs<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,
-    dirfd: usize,
-    pathname: usize,
+    path: &str,
     flags: usize,
     mode: usize,
 ) -> Result<isize, Error> {
-    let _ = dirfd;
-    let raw_path = mgr.strncpy_from_user(pid, pathname, USER_PATH_MAX)?;
-    let path = mgr.resolve_path_for_process(pid, &raw_path)?;
-    let root_dir = mgr.get_process(pid).ok_or(Error::NotFound)?.root_dir.clone();
-    let guest_path = path_inside_root(&path, &root_dir).unwrap_or_else(|| path.clone());
-
-    if let Some(kind) = classify_device_path(&guest_path) {
-        match kind {
-            DevicePathKind::PtyMaster => {
-                let ep_slot = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
-                let vt_name = format!("pts-{}-{}", pid, guest_path);
-                let (vt_id, vt_ep) = match mgr.vt_client.create_vt(Badge::null(), &vt_name, ep_slot)
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        mgr.cspace_mgr.free(ep_slot);
-                        return Err(e);
-                    }
-                };
-                if let Err(e) = mgr.vt_client.set_pty_lock(Badge::null(), vt_id, true) {
-                    let _ = mgr.vt_client.destroy_vt(Badge::null(), vt_id);
-                    let _ = CSPACE_CAP.delete(ep_slot);
-                    mgr.cspace_mgr.free(ep_slot);
-                    return Err(e);
-                }
-
-                let term = TerminalClient::new(vt_ep);
-                set_terminal_pgrp_local(mgr, term, pid as i32);
-
-                let fd = {
-                    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-                    let fd = process.next_fd;
-                    process.next_fd += 1;
-                    process.fds.insert(
-                        fd,
-                        FileHandle {
-                            file_type: FileType::PtyMaster(PtyMasterHandle {
-                                term,
-                                vt_id,
-                                ep_slot,
-                                locked: true,
-                            }),
-                        },
-                    );
-                    fd
-                };
-                mgr.ledger_record_fd_open(pid);
-                return Ok(fd as isize);
-            }
-            DevicePathKind::PtySlave(vt_id) => {
-                let locked = mgr.vt_client.get_pty_lock(Badge::null(), vt_id)?;
-                if locked {
-                    return Err(Error::PermissionDenied);
-                }
-
-                let slave_ep_slot = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
-                let vt_ep = match mgr.vt_client.open_vt(Badge::null(), vt_id, slave_ep_slot) {
-                    Ok(ep) => ep,
-                    Err(e) => {
-                        mgr.cspace_mgr.free(slave_ep_slot);
-                        return Err(e);
-                    }
-                };
-
-                let fd = {
-                    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-                    let fd = process.next_fd;
-                    process.next_fd += 1;
-                    process.fds.insert(
-                        fd,
-                        FileHandle {
-                            file_type: FileType::PtySlave(PtySlaveHandle {
-                                term: TerminalClient::new(vt_ep),
-                                vt_id,
-                                ep_slot: slave_ep_slot,
-                            }),
-                        },
-                    );
-                    fd
-                };
-                mgr.ledger_record_fd_open(pid);
-                return Ok(fd as isize);
-            }
-            DevicePathKind::StdioTty => {
-                let term = mgr.stdio_term().ok_or(Error::NotFound)?;
-                let fd = {
-                    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-                    let fd = process.next_fd;
-                    process.next_fd += 1;
-                    process.fds.insert(fd, FileHandle { file_type: FileType::Terminal(term) });
-                    fd
-                };
-                mgr.ledger_record_fd_open(pid);
-                return Ok(fd as isize);
-            }
-            DevicePathKind::Pseudo(dev) => {
-                let fd = {
-                    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-                    let fd = process.next_fd;
-                    process.next_fd += 1;
-                    process.fds.insert(fd, FileHandle { file_type: FileType::PseudoChar(dev) });
-                    fd
-                };
-                mgr.ledger_record_fd_open(pid);
-                return Ok(fd as isize);
-            }
-        }
-    }
-
     // 使用 Nexus 返回的独立句柄 endpoint（强制隔离）。
     let fs_ep_slot = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
     let mut fs_open_client = FsClient::new(mgr.fs_client.endpoint());
     let open_flags = glenda::protocol::fs::OpenFlags::from_bits_truncate(flags);
-    if let Err(e) = fs_open_client.open(Badge::null(), &path, open_flags, mode as u32, fs_ep_slot) {
+    if let Err(e) = fs_open_client.open(Badge::null(), path, open_flags, mode as u32, fs_ep_slot) {
         let _ = CSPACE_CAP.delete(fs_ep_slot);
         mgr.cspace_mgr.free(fs_ep_slot);
         return Err(e);
@@ -220,11 +95,7 @@ pub(crate) fn do_openat<'a>(
                     FS_ASYNC_CQ_ENTRIES,
                 )
             };
-            let mut ring = IoUringClient::new(ring_buf);
-            // NOTE:
-            // 通过 Nexus 代理的文件句柄 endpoint 无法可靠承载 io_uring 的 notify badge 路由，
-            // 直接 notify 会在 Nexus 侧落入未知请求分支。
-            // APE 的读写路径会在 submit 后显式调用 process_iouring()，因此这里不设置 notify。
+            let ring = IoUringClient::new(ring_buf);
 
             match fs_client.setup_iouring(
                 Badge::null(),
@@ -275,6 +146,7 @@ pub(crate) fn do_openat<'a>(
             fd,
             FileHandle {
                 file_type: FileType::Normal(NormalFileHandle {
+                    backend: NormalHandleBackend::Fs,
                     fs_client,
                     fs_ep_slot,
                     offset: 0,
@@ -282,12 +154,26 @@ pub(crate) fn do_openat<'a>(
                 }),
             },
         );
-        process.fd_paths.insert(fd, path);
+        process.fd_paths.insert(fd, path.into());
         fd
     };
     mgr.ledger_record_fd_open(pid);
 
     Ok(fd as isize)
+}
+
+pub(crate) fn do_openat<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    dirfd: usize,
+    pathname: usize,
+    flags: usize,
+    mode: usize,
+) -> Result<isize, Error> {
+    let _ = dirfd;
+    let raw_path = mgr.strncpy_from_user(pid, pathname, USER_PATH_MAX)?;
+    let path = mgr.resolve_path_for_process(pid, &raw_path)?;
+    open_via_nexus_fs(mgr, pid, &path, flags, mode)
 }
 
 pub(crate) fn do_close<'a>(
@@ -304,41 +190,37 @@ pub(crate) fn do_close<'a>(
     };
 
     match handle.file_type {
-        FileType::Terminal(_) | FileType::PseudoChar(_) => {}
-        FileType::PtyMaster(master) => {
-            let _ = mgr.vt_client.destroy_vt(Badge::null(), master.vt_id);
-            let _ = CSPACE_CAP.delete(master.ep_slot);
-            mgr.cspace_mgr.free(master.ep_slot);
-        }
-        FileType::PtySlave(slave) => {
-            let _ = CSPACE_CAP.delete(slave.ep_slot);
-            mgr.cspace_mgr.free(slave.ep_slot);
-        }
-        FileType::PipeRead(pipe) => {
-            mgr.close_pipe_read_end(pipe.pipe_id);
-        }
-        FileType::PipeWrite(pipe) => {
-            mgr.close_pipe_write_end(pipe.pipe_id);
-        }
-        FileType::Normal(mut normal) => {
-            let still_shared = {
-                let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-                process.fds.values().any(|fh| {
+        FileType::Normal(normal) => {
+            let fs_client = normal.fs_client;
+            let fs_ep_slot = normal.fs_ep_slot;
+            let async_io = normal.async_io;
+            let mut still_shared = false;
+            for other_pid in mgr.local_pids() {
+                let Some(proc_ref) = mgr.get_process(other_pid) else {
+                    continue;
+                };
+                if proc_ref.fds.values().any(|fh| {
                     matches!(
                         fh.file_type,
-                        FileType::Normal(other) if other.fs_ep_slot == normal.fs_ep_slot
+                        FileType::Normal(other)
+                            if matches!(other.backend, NormalHandleBackend::Fs)
+                                && other.fs_ep_slot == fs_ep_slot
                     )
-                })
-            };
-
-            if !still_shared {
-                let _ = normal.fs_client.close(Badge::null());
-                if !normal.fs_ep_slot.is_null() {
-                    let _ = CSPACE_CAP.delete(normal.fs_ep_slot);
-                    mgr.cspace_mgr.free(normal.fs_ep_slot);
+                }) {
+                    still_shared = true;
+                    break;
                 }
             }
-            if let Some(async_io) = normal.async_io {
+
+            if !still_shared {
+                let mut fs_client = fs_client;
+                let _ = fs_client.close(Badge::null());
+                if !fs_ep_slot.is_null() {
+                    let _ = CSPACE_CAP.delete(fs_ep_slot);
+                    mgr.cspace_mgr.free(fs_ep_slot);
+                }
+            }
+            if let Some(async_io) = async_io {
                 mgr.recycle_fs_async_region(async_io.region_id);
             }
         }
@@ -394,7 +276,7 @@ pub(crate) fn do_fcntl<'a>(
             Ok(0)
         }
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            let (new_fd, cloned, pipe_clone) = {
+            let (new_fd, cloned) = {
                 let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
                 if !process.fds.contains_key(&fd) {
                     return Err(Error::InvalidSlot);
@@ -407,19 +289,13 @@ pub(crate) fn do_fcntl<'a>(
                 }
 
                 let cloned = process.fds.get(&fd).cloned().ok_or(Error::InvalidSlot)?;
-                let file_type = cloned.file_type;
-                let pipe_clone = match file_type {
-                    FileType::PipeRead(pipe) => Some((true, pipe.pipe_id)),
-                    FileType::PipeWrite(pipe) => Some((false, pipe.pipe_id)),
-                    _ => None,
-                };
-                (new_fd, cloned, pipe_clone)
+                (new_fd, cloned)
             };
 
             let cloned = match cloned.file_type {
-                FileType::Normal(normal) => {
-                    FileHandle { file_type: FileType::Normal(duplicate_normal_handle(mgr, &normal)?) }
-                }
+                FileType::Normal(normal) => FileHandle {
+                    file_type: FileType::Normal(duplicate_normal_handle(mgr, &normal)?),
+                },
                 other => FileHandle { file_type: other },
             };
 
@@ -434,14 +310,6 @@ pub(crate) fn do_fcntl<'a>(
                 process.fd_cloexec.insert(new_fd, new_cloexec);
                 if process.next_fd <= new_fd {
                     process.next_fd = new_fd.saturating_add(1);
-                }
-            }
-
-            if let Some((is_read, pipe_id)) = pipe_clone {
-                if is_read {
-                    mgr.clone_pipe_read_end(pipe_id);
-                } else {
-                    mgr.clone_pipe_write_end(pipe_id);
                 }
             }
 
@@ -489,20 +357,10 @@ pub(crate) fn do_dup3<'a>(
         do_close(mgr, pid, newfd as usize)?;
     }
 
-    let file_type = cloned.file_type;
-    let cloned = match file_type {
+    let cloned = match cloned.file_type {
         FileType::Normal(normal) => {
             FileHandle { file_type: FileType::Normal(duplicate_normal_handle(mgr, &normal)?) }
         }
-        FileType::PipeRead(pipe) => {
-            mgr.clone_pipe_read_end(pipe.pipe_id);
-            FileHandle { file_type: FileType::PipeRead(pipe) }
-        }
-        FileType::PipeWrite(pipe) => {
-            mgr.clone_pipe_write_end(pipe.pipe_id);
-            FileHandle { file_type: FileType::PipeWrite(pipe) }
-        }
-        other => FileHandle { file_type: other },
     };
 
     let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
@@ -545,7 +403,9 @@ pub(crate) fn do_getdents64<'a>(
 
     let result = (|| {
         let entries = match &mut handle.file_type {
-            FileType::Normal(normal) => normal.fs_client.getdents(Badge::null(), count)?,
+            FileType::Normal(normal) => match normal.backend {
+                NormalHandleBackend::Fs => normal.fs_client.getdents(Badge::null(), count)?,
+            },
             _ => return Err(Error::InvalidType),
         };
 
@@ -599,7 +459,31 @@ pub(crate) fn do_pipe2<'a>(
     }
 
     let pipe_id = mgr.create_pipe();
+    if pipe_id == 0 {
+        return Err(Error::NotFound);
+    }
     let cloexec = (flags & O_CLOEXEC) != 0;
+    let (read_client, read_ep_slot) = open_pipe_end_via_pipefs(
+        mgr,
+        pipe_id,
+        "r",
+        glenda::protocol::fs::OpenFlags::O_RDONLY,
+    )?;
+    let (write_client, write_ep_slot) = match open_pipe_end_via_pipefs(
+        mgr,
+        pipe_id,
+        "w",
+        glenda::protocol::fs::OpenFlags::O_WRONLY,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let mut rc = read_client;
+            let _ = rc.close(Badge::null());
+            let _ = CSPACE_CAP.delete(read_ep_slot);
+            mgr.cspace_mgr.free(read_ep_slot);
+            return Err(e);
+        }
+    };
 
     let (read_fd, write_fd) = {
         let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
@@ -616,11 +500,27 @@ pub(crate) fn do_pipe2<'a>(
 
         process.fds.insert(
             read_fd,
-            FileHandle { file_type: FileType::PipeRead(PipeEndHandle { pipe_id }) },
+            FileHandle {
+                file_type: FileType::Normal(NormalFileHandle {
+                    backend: NormalHandleBackend::Fs,
+                    fs_client: read_client,
+                    fs_ep_slot: read_ep_slot,
+                    offset: 0,
+                    async_io: None,
+                }),
+            },
         );
         process.fds.insert(
             write_fd,
-            FileHandle { file_type: FileType::PipeWrite(PipeEndHandle { pipe_id }) },
+            FileHandle {
+                file_type: FileType::Normal(NormalFileHandle {
+                    backend: NormalHandleBackend::Fs,
+                    fs_client: write_client,
+                    fs_ep_slot: write_ep_slot,
+                    offset: 0,
+                    async_io: None,
+                }),
+            },
         );
         process.fd_cloexec.insert(read_fd, cloexec);
         process.fd_cloexec.insert(write_fd, cloexec);
@@ -636,13 +536,25 @@ pub(crate) fn do_pipe2<'a>(
     out[4..].copy_from_slice(&write_i32.to_ne_bytes());
 
     if let Err(e) = mgr.copy_to_user(pid, pipefd, &out) {
-        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-        process.fds.remove(&read_fd);
-        process.fds.remove(&write_fd);
-        process.fd_cloexec.remove(&read_fd);
-        process.fd_cloexec.remove(&write_fd);
-        mgr.close_pipe_read_end(pipe_id);
-        mgr.close_pipe_write_end(pipe_id);
+        let (read_handle, write_handle) = {
+            let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+            let read_handle = process.fds.remove(&read_fd);
+            let write_handle = process.fds.remove(&write_fd);
+            process.fd_cloexec.remove(&read_fd);
+            process.fd_cloexec.remove(&write_fd);
+            (read_handle, write_handle)
+        };
+
+        if let Some(FileHandle { file_type: FileType::Normal(mut n) }) = read_handle {
+            let _ = n.fs_client.close(Badge::null());
+            let _ = CSPACE_CAP.delete(n.fs_ep_slot);
+            mgr.cspace_mgr.free(n.fs_ep_slot);
+        }
+        if let Some(FileHandle { file_type: FileType::Normal(mut n) }) = write_handle {
+            let _ = n.fs_client.close(Badge::null());
+            let _ = CSPACE_CAP.delete(n.fs_ep_slot);
+            mgr.cspace_mgr.free(n.fs_ep_slot);
+        }
         return Err(e);
     }
 

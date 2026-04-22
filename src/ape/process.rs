@@ -6,7 +6,6 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use glenda::cap::{CNode, CapPtr, TCB, TCB_SLOT, VSPACE_SLOT, VSpace};
 use glenda::client::FsClient;
-use glenda::client::TerminalClient;
 use glenda::io::uring::IoUringClient;
 use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
 use glenda::protocol::auth::IdentityInfo;
@@ -76,7 +75,13 @@ pub struct AsyncIoState {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub enum NormalHandleBackend {
+    Fs,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct NormalFileHandle {
+    pub backend: NormalHandleBackend,
     pub fs_client: FsClient,
     pub fs_ep_slot: CapPtr,
     pub offset: usize,
@@ -84,42 +89,8 @@ pub struct NormalFileHandle {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct PtyMasterHandle {
-    pub term: TerminalClient,
-    pub vt_id: usize,
-    pub ep_slot: CapPtr,
-    pub locked: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct PtySlaveHandle {
-    pub term: TerminalClient,
-    pub vt_id: usize,
-    pub ep_slot: CapPtr,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct PipeEndHandle {
-    pub pipe_id: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PseudoCharDevice {
-    Null,
-    Zero,
-    Random,
-    URandom,
-}
-
-#[derive(Debug, Clone, Copy)]
 pub enum FileType {
     Normal(NormalFileHandle),
-    Terminal(TerminalClient),
-    PtyMaster(PtyMasterHandle),
-    PtySlave(PtySlaveHandle),
-    PseudoChar(PseudoCharDevice),
-    PipeRead(PipeEndHandle),
-    PipeWrite(PipeEndHandle),
 }
 
 #[derive(Debug, Clone)]

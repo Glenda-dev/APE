@@ -1,20 +1,36 @@
 use crate::ApeManager;
-use crate::ape::process::{FileHandle, FileType, PseudoCharDevice};
+use crate::ape::process::{FileHandle, FileType, NormalHandleBackend};
 use alloc::vec;
+use alloc::vec::Vec;
 use core::cmp::min;
 use core::mem::size_of;
 use glenda::client::FsClient;
 use glenda::error::Error;
-use glenda::interface::{FileHandleService, FileSystemService, VirtualTerminalService};
+use glenda::interface::{
+    FileHandleService, FileSystemService,
+};
 use glenda::io::uring::{IOURING_OP_READ, IOURING_OP_WRITE, IoUringClient, IoUringSqe};
 use glenda::ipc::Badge;
-use glenda::ipc::IPC_BUFFER_SIZE;
 use linux_raw_sys::ctypes::c_uint;
-use linux_raw_sys::errno::{EAGAIN, EBADF, EPIPE};
 use linux_raw_sys::general::{SEEK_CUR, SEEK_END, SEEK_SET, iovec};
+use linux_raw_sys::ioctl::{TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGPGRP, TIOCGWINSZ, TIOCSPGRP, TIOCSWINSZ};
 
 const ENABLE_FS_RW_ASYNC_IO: bool = false;
 const FS_SYNC_RW_CHUNK: usize = 4096;
+const IOCTL_DIR_NONE: usize = 0;
+const IOCTL_DIR_WRITE: usize = 1;
+const IOCTL_DIR_READ: usize = 2;
+const IOCTL_MAX_STRUCT_SIZE: usize = 4096;
+
+#[inline]
+fn ioctl_dir(request: u32) -> usize {
+    ((request as usize) >> 30) & 0x3
+}
+
+#[inline]
+fn ioctl_size(request: u32) -> usize {
+    ((request as usize) >> 16) & 0x3fff
+}
 
 pub(crate) fn do_read<'a>(
     mgr: &mut ApeManager<'a>,
@@ -28,109 +44,30 @@ pub(crate) fn do_read<'a>(
     }
 
     with_fd_handle_mut(mgr, pid, fd, |mgr, handle| match &mut handle.file_type {
-        FileType::PtyMaster(master) => {
-            crate::io::tty::do_read_terminal(mgr, pid, master.term, buf_ptr, len)
-        }
-        FileType::PtySlave(slave) => {
-            crate::io::tty::do_read_terminal(mgr, pid, slave.term, buf_ptr, len)
-        }
-        FileType::PseudoChar(dev) => match dev {
-            PseudoCharDevice::Null => Ok(0),
-            PseudoCharDevice::Zero | PseudoCharDevice::Random | PseudoCharDevice::URandom => {
-                mgr.write_zeros_to_user(pid, buf_ptr, len)?;
-                Ok(len as isize)
-            }
-        },
-        FileType::PipeRead(pipe) => {
-            let chunk = min(len, IPC_BUFFER_SIZE);
-            let mut tmp = vec![0u8; chunk];
-            let (n, writers_closed) =
-                mgr.pipe_read(pipe.pipe_id, &mut tmp).ok_or(Error::InvalidSlot)?;
-            if n == 0 {
-                if writers_closed {
-                    return Ok(0);
-                }
-                return Ok(-(EAGAIN as isize));
-            }
-            mgr.copy_to_user(pid, buf_ptr, &tmp[..n])?;
-            Ok(n as isize)
-        }
-        FileType::PipeWrite(_) => Ok(-(EBADF as isize)),
-        FileType::Terminal(term) => crate::io::tty::do_read_terminal(mgr, pid, *term, buf_ptr, len),
-        FileType::Normal(normal) => {
-            if ENABLE_FS_RW_ASYNC_IO && normal.async_io.is_none() {
-                let _ = mgr.try_enable_fs_async_io(pid, normal);
-            }
-            if ENABLE_FS_RW_ASYNC_IO {
-                if let Some(async_io) = normal.async_io.as_mut() {
+        FileType::Normal(normal) => match &mut normal.backend {
+            NormalHandleBackend::Fs => {
                 let fs_client = &mut normal.fs_client;
-                let ring = &mut async_io.ring;
-                let data_vaddr = async_io.data_vaddr;
-                let data_len = async_io.data_len;
-                let next_user_data = &mut async_io.next_user_data;
-                let mut file_off = normal.offset;
-
-                let total = mgr.with_user_session(pid, |sess| {
-                    let mut total = 0usize;
-                    while total < len {
-                        let chunk = min(len - total, data_len);
-                        if chunk == 0 {
-                            break;
-                        }
-
-                        let read_len = async_submit_and_wait(
-                            fs_client,
-                            ring,
-                            next_user_data,
-                            file_off,
-                            data_vaddr,
-                            IOURING_OP_READ,
-                            chunk,
-                        )?;
-                        if read_len == 0 {
-                            break;
-                        }
-
-                        let user_dst = buf_ptr.checked_add(total).ok_or(Error::InvalidAddress)?;
-                        sess.copy_to_user_from_ptr(user_dst, data_vaddr as *const u8, read_len)?;
-
-                        total += read_len;
-                        file_off = file_off.saturating_add(read_len);
-                        if read_len < chunk {
-                            break;
-                        }
+                let mut total = 0usize;
+                let mut kbuf = [0u8; FS_SYNC_RW_CHUNK];
+                while total < len {
+                    let chunk = min(len - total, kbuf.len());
+                    if chunk == 0 {
+                        break;
                     }
-                    Ok(total)
-                })?;
-
-                normal.offset = file_off;
-                return Ok(total as isize);
+                    let read_len = fs_client.read(Badge::null(), normal.offset, &mut kbuf[..chunk])?;
+                    if read_len == 0 {
+                        break;
+                    }
+                    let user_dst = buf_ptr.checked_add(total).ok_or(Error::InvalidAddress)?;
+                    mgr.copy_to_user(pid, user_dst, &kbuf[..read_len])?;
+                    total += read_len;
+                    normal.offset = normal.offset.saturating_add(read_len);
+                    if read_len < chunk {
+                        break;
+                    }
                 }
+                Ok(total as isize)
             }
-
-            let mut total = 0usize;
-            let mut kbuf = [0u8; FS_SYNC_RW_CHUNK];
-            while total < len {
-                let chunk = min(len - total, kbuf.len());
-                if chunk == 0 {
-                    break;
-                }
-
-                let read_len = normal.fs_client.read(Badge::null(), normal.offset, &mut kbuf[..chunk])?;
-                if read_len == 0 {
-                    break;
-                }
-
-                let user_dst = buf_ptr.checked_add(total).ok_or(Error::InvalidAddress)?;
-                mgr.copy_to_user(pid, user_dst, &kbuf[..read_len])?;
-
-                total += read_len;
-                normal.offset = normal.offset.saturating_add(read_len);
-                if read_len < chunk {
-                    break;
-                }
-            }
-            Ok(total as isize)
         }
     })
 }
@@ -147,96 +84,27 @@ pub(crate) fn do_write<'a>(
     }
 
     with_fd_handle_mut(mgr, pid, fd, |mgr, handle| match &mut handle.file_type {
-        FileType::PtyMaster(master) => {
-            crate::io::tty::do_write_terminal(mgr, pid, master.term, buf_ptr, len)
-        }
-        FileType::PtySlave(slave) => {
-            crate::io::tty::do_write_terminal(mgr, pid, slave.term, buf_ptr, len)
-        }
-        FileType::PseudoChar(_) => Ok(len as isize),
-        FileType::PipeRead(_) => Ok(-(EBADF as isize)),
-        FileType::PipeWrite(pipe) => {
-            let chunk = min(len, IPC_BUFFER_SIZE);
-            let mut tmp = vec![0u8; chunk];
-            mgr.copy_from_user(pid, buf_ptr, &mut tmp)?;
-            let (n, no_readers) = mgr.pipe_write(pipe.pipe_id, &tmp).ok_or(Error::InvalidSlot)?;
-            if no_readers {
-                return Ok(-(EPIPE as isize));
-            }
-            if n == 0 {
-                return Ok(-(EAGAIN as isize));
-            }
-            Ok(n as isize)
-        }
-        FileType::Terminal(term) => {
-            crate::io::tty::do_write_terminal(mgr, pid, *term, buf_ptr, len)
-        }
-        FileType::Normal(normal) => {
-            if ENABLE_FS_RW_ASYNC_IO && normal.async_io.is_none() {
-                let _ = mgr.try_enable_fs_async_io(pid, normal);
-            }
-            if ENABLE_FS_RW_ASYNC_IO {
-                if let Some(async_io) = normal.async_io.as_mut() {
+        FileType::Normal(normal) => match &mut normal.backend {
+            NormalHandleBackend::Fs => {
                 let fs_client = &mut normal.fs_client;
-                let ring = &mut async_io.ring;
-                let data_vaddr = async_io.data_vaddr;
-                let data_len = async_io.data_len;
-                let next_user_data = &mut async_io.next_user_data;
-                let mut file_off = normal.offset;
-
-                let total = mgr.with_user_session(pid, |sess| {
-                    let mut total = 0usize;
-                    while total < len {
-                        let chunk = min(len - total, data_len);
-                        if chunk == 0 {
-                            break;
-                        }
-
-                        let user_src = buf_ptr.checked_add(total).ok_or(Error::InvalidAddress)?;
-                        sess.copy_from_user_to_ptr(user_src, data_vaddr as *mut u8, chunk)?;
-
-                        let written = async_submit_and_wait(
-                            fs_client,
-                            ring,
-                            next_user_data,
-                            file_off,
-                            data_vaddr,
-                            IOURING_OP_WRITE,
-                            chunk,
-                        )?;
-                        total += written;
-                        file_off = file_off.saturating_add(written);
-                        if written < chunk {
-                            break;
-                        }
+                let mut total = 0usize;
+                let mut kbuf = [0u8; FS_SYNC_RW_CHUNK];
+                while total < len {
+                    let chunk = min(len - total, kbuf.len());
+                    if chunk == 0 {
+                        break;
                     }
-                    Ok(total)
-                })?;
-
-                normal.offset = file_off;
-                return Ok(total as isize);
+                    let user_src = buf_ptr.checked_add(total).ok_or(Error::InvalidAddress)?;
+                    mgr.copy_from_user(pid, user_src, &mut kbuf[..chunk])?;
+                    let written = fs_client.write(Badge::null(), normal.offset, &kbuf[..chunk])?;
+                    total += written;
+                    normal.offset = normal.offset.saturating_add(written);
+                    if written < chunk {
+                        break;
+                    }
                 }
+                Ok(total as isize)
             }
-
-            let mut total = 0usize;
-            let mut kbuf = [0u8; FS_SYNC_RW_CHUNK];
-            while total < len {
-                let chunk = min(len - total, kbuf.len());
-                if chunk == 0 {
-                    break;
-                }
-
-                let user_src = buf_ptr.checked_add(total).ok_or(Error::InvalidAddress)?;
-                mgr.copy_from_user(pid, user_src, &mut kbuf[..chunk])?;
-
-                let written = normal.fs_client.write(Badge::null(), normal.offset, &kbuf[..chunk])?;
-                total += written;
-                normal.offset = normal.offset.saturating_add(written);
-                if written < chunk {
-                    break;
-                }
-            }
-            Ok(total as isize)
         }
     })
 }
@@ -269,28 +137,27 @@ pub(crate) fn do_lseek<'a>(
     whence: usize,
 ) -> Result<isize, Error> {
     with_fd_handle_mut(mgr, pid, fd, |_mgr, handle| match &mut handle.file_type {
-        FileType::PtyMaster(_) | FileType::PtySlave(_) => Err(Error::InvalidArgs),
-        FileType::PseudoChar(_) => Ok(0),
-        FileType::PipeRead(_) | FileType::PipeWrite(_) => Err(Error::InvalidArgs),
-        FileType::Terminal(_) => Err(Error::InvalidArgs),
-        FileType::Normal(normal) => {
-            let base: isize = match whence as u32 {
-                SEEK_SET => 0,
-                SEEK_CUR => normal.offset as isize,
-                SEEK_END => {
-                    let st = normal.fs_client.stat(Badge::null())?;
-                    st.size as isize
+        FileType::Normal(normal) => match &mut normal.backend {
+            NormalHandleBackend::Fs => {
+                let fs_client = &mut normal.fs_client;
+                let base: isize = match whence as u32 {
+                    SEEK_SET => 0,
+                    SEEK_CUR => normal.offset as isize,
+                    SEEK_END => {
+                        let st = fs_client.stat(Badge::null())?;
+                        st.size as isize
+                    }
+                    _ => return Err(Error::InvalidArgs),
+                };
+
+                let new_off = base.checked_add(offset).ok_or(Error::InvalidArgs)?;
+                if new_off < 0 {
+                    return Err(Error::InvalidArgs);
                 }
-                _ => return Err(Error::InvalidArgs),
-            };
 
-            let new_off = base.checked_add(offset).ok_or(Error::InvalidArgs)?;
-            if new_off < 0 {
-                return Err(Error::InvalidArgs);
+                normal.offset = new_off as usize;
+                Ok(new_off)
             }
-
-            normal.offset = new_off as usize;
-            Ok(new_off)
         }
     })
 }
@@ -305,23 +172,79 @@ pub(crate) fn do_ioctl<'a>(
     let req = u32::try_from(request).map_err(|_| Error::InvalidArgs)?;
 
     with_fd_handle_mut(mgr, pid, fd, |mgr, handle| match &mut handle.file_type {
-        FileType::PtyMaster(master) => crate::io::tty::do_ioctl_pty_master(
-            mgr,
-            pid,
-            master.vt_id,
-            &mut master.locked,
-            master.term,
-            req,
-            argp,
-        ),
-        FileType::PtySlave(slave) => {
-            crate::io::tty::do_ioctl_terminal(mgr, pid, slave.term, req, argp)
+        FileType::Normal(normal) => match normal.backend {
+            NormalHandleBackend::Fs => {
+                do_ioctl_fs_passthrough(mgr, pid, normal.fs_client, req, argp)
+            }
         }
-        FileType::PipeRead(_) | FileType::PipeWrite(_) => Err(Error::InvalidType),
-        FileType::PseudoChar(_) => Err(Error::InvalidType),
-        FileType::Terminal(term) => crate::io::tty::do_ioctl_terminal(mgr, pid, *term, req, argp),
-        FileType::Normal(_) => Err(Error::InvalidType),
     })
+}
+
+fn do_ioctl_fs_passthrough<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    mut fs_client: FsClient,
+    request: u32,
+    argp: usize,
+) -> Result<isize, Error> {
+    let dir = ioctl_dir(request);
+    let encoded_size = ioctl_size(request);
+    if encoded_size > IOCTL_MAX_STRUCT_SIZE {
+        return Err(Error::InvalidArgs);
+    }
+
+    let mut in_len = if encoded_size > 0
+        && (dir == IOCTL_DIR_WRITE || dir == (IOCTL_DIR_WRITE | IOCTL_DIR_READ))
+    {
+        encoded_size
+    } else {
+        0
+    };
+    let mut out_len = if encoded_size > 0
+        && (dir == IOCTL_DIR_READ || dir == (IOCTL_DIR_WRITE | IOCTL_DIR_READ))
+    {
+        encoded_size
+    } else {
+        0
+    };
+
+    // 兼容 legacy tty ioctl 编码（无 _IOC dir/size 位）。
+    if in_len == 0 && out_len == 0 {
+        match request {
+            TIOCGWINSZ => out_len = size_of::<linux_raw_sys::general::winsize>(),
+            TIOCSWINSZ => in_len = size_of::<linux_raw_sys::general::winsize>(),
+            TIOCGPGRP => out_len = size_of::<i32>(),
+            TIOCSPGRP => in_len = size_of::<i32>(),
+            TCGETS => out_len = crate::ape::tty::TTY_TERMIOS_SIZE,
+            TCSETS | TCSETSW | TCSETSF => in_len = crate::ape::tty::TTY_TERMIOS_SIZE,
+            _ => {}
+        }
+    }
+    let mut input = Vec::new();
+    if in_len > 0 {
+        if argp == 0 {
+            return Err(Error::InvalidAddress);
+        }
+        input.resize(in_len, 0);
+        mgr.copy_from_user(pid, argp, &mut input)?;
+    }
+
+    let (ret, out) = fs_client.ioctl_ex(
+        Badge::null(),
+        request,
+        argp,
+        if input.is_empty() { None } else { Some(input.as_slice()) },
+        out_len,
+    )?;
+
+    if !out.is_empty() {
+        if argp == 0 {
+            return Err(Error::InvalidAddress);
+        }
+        mgr.copy_to_user(pid, argp, &out)?;
+    }
+
+    Ok(ret as isize)
 }
 
 fn with_fd_handle_mut<'a, T, F>(

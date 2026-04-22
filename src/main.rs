@@ -8,6 +8,7 @@ extern crate alloc;
 mod ape;
 mod arch;
 mod config;
+mod drivers;
 mod elf;
 mod fs;
 mod io;
@@ -17,6 +18,7 @@ mod net;
 mod syscall;
 mod system;
 mod task;
+mod vfs;
 
 pub use ape::ApeManager;
 

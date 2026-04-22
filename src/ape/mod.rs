@@ -22,7 +22,7 @@ use glenda::error::Error;
 use glenda::interface::{
     AuthService, CSpaceService, FileHandleService, ResourceService, VSpaceService,
 };
-use glenda::ipc::Badge;
+use glenda::ipc::{Badge, MsgFlags, MsgTag, UTCB};
 use glenda::mem::{Perms, TRAMPOLINE_VA, get_trapframe_va, get_utcb_va};
 use glenda::utils::align::align_up;
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
@@ -45,6 +45,9 @@ pub struct ApeManager<'a> {
     runtime_state: ApeRuntimeState,
     fs_state: ApeFsState,
     resource_ledger: ApeResourceLedger,
+    pub dev_vfs_endpoint: Option<Endpoint>,
+    pub tmp_vfs_endpoint: Option<Endpoint>,
+    pub pipe_vfs_endpoint: Option<Endpoint>,
     pub init_client: &'a mut InitClient,
     pub proc_client: &'a mut ProcessClient,
     pub res_client: &'a mut ResourceClient,
@@ -98,6 +101,9 @@ impl<'a> ApeManager<'a> {
             runtime_state: ApeRuntimeState::new(ApeConfig::default()),
             fs_state: ApeFsState::new(FS_ASYNC_POOL_BASE_VADDR, 0x10000),
             resource_ledger: ApeResourceLedger::default(),
+            dev_vfs_endpoint: None,
+            tmp_vfs_endpoint: None,
+            pipe_vfs_endpoint: None,
             init_client,
             proc_client,
             res_client,
@@ -358,31 +364,20 @@ impl<'a> ApeManager<'a> {
     }
 
     pub fn create_pipe(&mut self) -> usize {
-        self.fs_state.create_pipe()
-    }
-
-    pub fn pipe_read(&mut self, pipe_id: usize, dst: &mut [u8]) -> Option<(usize, bool)> {
-        self.fs_state.pipe_read(pipe_id, dst)
-    }
-
-    pub fn pipe_write(&mut self, pipe_id: usize, src: &[u8]) -> Option<(usize, bool)> {
-        self.fs_state.pipe_write(pipe_id, src)
-    }
-
-    pub fn close_pipe_read_end(&mut self, pipe_id: usize) {
-        self.fs_state.close_pipe_read_end(pipe_id);
-    }
-
-    pub fn close_pipe_write_end(&mut self, pipe_id: usize) {
-        self.fs_state.close_pipe_write_end(pipe_id);
-    }
-
-    pub fn clone_pipe_read_end(&mut self, pipe_id: usize) {
-        self.fs_state.clone_pipe_read_end(pipe_id);
-    }
-
-    pub fn clone_pipe_write_end(&mut self, pipe_id: usize) {
-        self.fs_state.clone_pipe_write_end(pipe_id);
+        let Some(ep) = self.pipe_vfs_endpoint else {
+            return 0;
+        };
+        let utcb = unsafe { UTCB::new() };
+        utcb.clear();
+        utcb.set_msg_tag(MsgTag::new(
+            glenda::protocol::FS_PROTO,
+            glenda::protocol::fs::PIPE_CREATE,
+            MsgFlags::NONE,
+        ));
+        if ep.call(utcb).is_err() {
+            return 0;
+        }
+        utcb.get_mr(0)
     }
 
     pub fn mark_fs_iouring_supported(&mut self) {

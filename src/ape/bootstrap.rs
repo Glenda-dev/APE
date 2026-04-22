@@ -1,20 +1,31 @@
 use crate::ApeManager;
-use crate::ape::process::{FileHandle, FileType};
+use crate::ape::process::{FileHandle, FileType, NormalFileHandle, NormalHandleBackend};
 use crate::config::ApeConfig;
-use crate::io::tty::set_terminal_pgrp_local;
+use crate::drivers::tty::TtyDevice;
 use crate::layout::{
     DEFAULT_INIT_PROCESS_NAME, DEFAULT_VIEW_ROOT, DEFAULT_VT_NAME, FIRST_USER_FD, ROOTFS_SLOT,
     STDIO_SLOT,
 };
+use crate::vfs::worker::{VfsWorkerConfig, VfsWorkerKind, spawn_worker};
+use glenda::arch::mem::PGSIZE;
+use glenda::cap::{CapPtr, CapType, Endpoint, Page};
 use glenda::client::TerminalClient;
 use glenda::error::Error;
 use glenda::interface::{
-    CSpaceService, InitService, ProcessService, ResourceService, ThreadService,
-    VirtualFileSystemService, VirtualTerminalService, VolumeService,
+    CSpaceService, FileSystemService, InitService, ProcessService, ResourceService, ThreadService,
+    VSpaceService, VirtualFileSystemService, VirtualTerminalService, VolumeService,
 };
 use glenda::ipc::Badge;
+use glenda::mem::Perms;
 use glenda::protocol;
+use glenda::protocol::fs::OpenFlags;
 use linux_raw_sys::general::*;
+
+const VFS_WORKER_STACK_SIZE: usize = 64 * 1024;
+const VFS_WORKER_STACK_PAGES: usize = VFS_WORKER_STACK_SIZE / PGSIZE;
+const DEVTMPFS_WORKER_STACK_BASE: usize = 0x5700_0000;
+const TMPFS_WORKER_STACK_BASE: usize = DEVTMPFS_WORKER_STACK_BASE + 0x20_000;
+const PIPEFS_WORKER_STACK_BASE: usize = TMPFS_WORKER_STACK_BASE + 0x20_000;
 
 impl<'a> ApeManager<'a> {
     pub fn bootstrap(&mut self) -> Result<(), Error> {
@@ -23,6 +34,8 @@ impl<'a> ApeManager<'a> {
         self.load_ape_config();
         self.mount_rootfs()?;
         self.setup_view()?;
+        self.start_vfs_workers()?;
+        self.mount_devtmpfs()?;
         self.init_stdio()?;
         self.load_init()?;
 
@@ -63,6 +76,87 @@ impl<'a> ApeManager<'a> {
         let view_id = self.fs_client.create_view(Badge::null(), DEFAULT_VIEW_ROOT)?;
         self.fs_client.set_view(Badge::null(), view_id)?;
         log!("bootstrap: switched to view {} with root {}", view_id, DEFAULT_VIEW_ROOT);
+        Ok(())
+    }
+
+    fn mount_devtmpfs(&mut self) -> Result<(), Error> {
+        let dev_path = "/linux/dev";
+        match self.fs_client.mkdir(Badge::null(), dev_path, 0o755) {
+            Ok(()) | Err(Error::AlreadyExists) => {}
+            Err(e) => return Err(e),
+        }
+
+        let dev_ep = self.dev_vfs_endpoint.ok_or(Error::NotInitialized)?;
+        self.fs_client.mount(Badge::null(), dev_path, dev_ep)?;
+        log!("bootstrap: mounted ape devtmpfs backend at {}", dev_path);
+        Ok(())
+    }
+
+    fn alloc_worker_endpoint_and_windows(&mut self) -> Result<(Endpoint, CapPtr, CapPtr), Error> {
+        let endpoint_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
+        self.res_client.alloc(Badge::null(), CapType::Endpoint, 0, endpoint_slot)?;
+
+        let reply_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
+        let recv_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
+
+        Ok((Endpoint::from(endpoint_slot), reply_slot, recv_slot))
+    }
+
+    fn alloc_worker_stack(&mut self, stack_base: usize) -> Result<usize, Error> {
+        let frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
+        let page_level =
+            CapType::page_pages_to_level(VFS_WORKER_STACK_PAGES).ok_or(Error::InvalidArgs)?;
+        self.res_client.alloc(Badge::null(), CapType::Page, page_level, frame_slot)?;
+
+        self.vspace_mgr.map_page(
+            Page::from(frame_slot),
+            stack_base,
+            Perms::READ | Perms::WRITE,
+            VFS_WORKER_STACK_PAGES,
+            &mut *self.res_client,
+            &mut *self.cspace_mgr,
+        )?;
+
+        Ok(stack_base + VFS_WORKER_STACK_SIZE)
+    }
+
+    fn start_vfs_workers(&mut self) -> Result<(), Error> {
+        let (dev_ep, dev_reply, dev_recv) = self.alloc_worker_endpoint_and_windows()?;
+        let (tmp_ep, tmp_reply, tmp_recv) = self.alloc_worker_endpoint_and_windows()?;
+        let (pipe_ep, pipe_reply, pipe_recv) = self.alloc_worker_endpoint_and_windows()?;
+
+        let dev_cfg = VfsWorkerConfig {
+            endpoint: dev_ep,
+            reply_slot: dev_reply,
+            recv_slot: dev_recv,
+            kind: VfsWorkerKind::DevTmpFs,
+        };
+        let tmp_cfg = VfsWorkerConfig {
+            endpoint: tmp_ep,
+            reply_slot: tmp_reply,
+            recv_slot: tmp_recv,
+            kind: VfsWorkerKind::TmpFs,
+        };
+        let pipe_cfg = VfsWorkerConfig {
+            endpoint: pipe_ep,
+            reply_slot: pipe_reply,
+            recv_slot: pipe_recv,
+            kind: VfsWorkerKind::PipeFs,
+        };
+
+        let dev_stack_top = self.alloc_worker_stack(DEVTMPFS_WORKER_STACK_BASE)?;
+        let tmp_stack_top = self.alloc_worker_stack(TMPFS_WORKER_STACK_BASE)?;
+        let pipe_stack_top = self.alloc_worker_stack(PIPEFS_WORKER_STACK_BASE)?;
+
+        let _dev_tid = spawn_worker(self.proc_client, dev_cfg, dev_stack_top)?;
+        let _tmp_tid = spawn_worker(self.proc_client, tmp_cfg, tmp_stack_top)?;
+        let _pipe_tid = spawn_worker(self.proc_client, pipe_cfg, pipe_stack_top)?;
+
+        self.dev_vfs_endpoint = Some(dev_ep);
+        self.tmp_vfs_endpoint = Some(tmp_ep);
+        self.pipe_vfs_endpoint = Some(pipe_ep);
+
+        log!("bootstrap: started vfs workers (devtmpfs + tmpfs + pipefs)");
         Ok(())
     }
 
@@ -109,13 +203,18 @@ impl<'a> ApeManager<'a> {
 
         // 4. 为 init 进程初始化 stdio fds
         if let Some(term) = self.stdio_term() {
-            set_terminal_pgrp_local(self, term, pid as i32);
+            TtyDevice::global().set_foreground_pgrp(pid as i32);
+            let tty_path = self.resolve_path_for_process(pid, "/dev/tty")?;
+            let tty = self.open_normal_handle(&tty_path, OpenFlags::O_RDWR)?;
 
             let proc = self.get_process_mut(pid).unwrap();
             proc.controlling_tty = Some(term.endpoint().cap().bits());
-            proc.fds.insert(STDIN_FILENO, FileHandle { file_type: FileType::Terminal(term) });
-            proc.fds.insert(STDOUT_FILENO, FileHandle { file_type: FileType::Terminal(term) });
-            proc.fds.insert(STDERR_FILENO, FileHandle { file_type: FileType::Terminal(term) });
+            proc.fds.insert(STDIN_FILENO, FileHandle { file_type: FileType::Normal(tty) });
+            proc.fds.insert(STDOUT_FILENO, FileHandle { file_type: FileType::Normal(tty) });
+            proc.fds.insert(STDERR_FILENO, FileHandle { file_type: FileType::Normal(tty) });
+            proc.fd_paths.insert(STDIN_FILENO, "/dev/tty".into());
+            proc.fd_paths.insert(STDOUT_FILENO, "/dev/tty".into());
+            proc.fd_paths.insert(STDERR_FILENO, "/dev/tty".into());
             proc.next_fd = FIRST_USER_FD;
         }
 
@@ -127,5 +226,27 @@ impl<'a> ApeManager<'a> {
         tcb_cap.resume()?;
         log!("load_init: resumed init tcb");
         Ok(())
+    }
+
+    fn open_normal_handle(
+        &mut self,
+        path: &str,
+        flags: OpenFlags,
+    ) -> Result<NormalFileHandle, Error> {
+        let fs_ep_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
+        let mut fs_open_client = glenda::client::FsClient::new(self.fs_client.endpoint());
+        if let Err(e) = fs_open_client.open(Badge::null(), path, flags, 0, fs_ep_slot) {
+            let _ = glenda::cap::CSPACE_CAP.delete(fs_ep_slot);
+            self.cspace_mgr.free(fs_ep_slot);
+            return Err(e);
+        }
+
+        Ok(NormalFileHandle {
+            backend: NormalHandleBackend::Fs,
+            fs_client: glenda::client::FsClient::new(glenda::cap::Endpoint::from(fs_ep_slot)),
+            fs_ep_slot,
+            offset: 0,
+            async_io: None,
+        })
     }
 }
