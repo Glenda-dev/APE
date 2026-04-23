@@ -277,11 +277,7 @@ pub struct ApeRuntimeState {
 
 impl ApeRuntimeState {
     pub fn new(config: ApeConfig) -> Self {
-        Self {
-            config,
-            stdio_term: None,
-            tty_registry: TtyRegistry::new(),
-        }
+        Self { config, stdio_term: None, tty_registry: TtyRegistry::new() }
     }
 
     pub fn config(&self) -> &ApeConfig {

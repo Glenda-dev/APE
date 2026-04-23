@@ -1,7 +1,7 @@
 use crate::ApeManager;
+use crate::drivers::tty::TtyDevice;
 use alloc::vec;
 use core::mem::size_of;
-use crate::drivers::tty::TtyDevice;
 use glenda::error::Error;
 use glenda::interface::TimeService;
 use glenda::ipc::Badge;

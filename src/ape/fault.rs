@@ -279,18 +279,18 @@ impl<'a> ApeManager<'a> {
         span_pages = core::cmp::max(span_pages, 1);
 
         let try_zero_copy = {
-                let mut fs_client = {
-                    let process = self.get_process(pid).ok_or(Error::NotFound)?;
-                    let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
-                    match handle.file_type {
-                        FileType::Normal(normal) => {
-                            if !matches!(normal.backend, NormalHandleBackend::Fs) {
-                                return Err(Error::InvalidType);
-                            }
-                            normal.fs_client
+            let mut fs_client = {
+                let process = self.get_process(pid).ok_or(Error::NotFound)?;
+                let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
+                match handle.file_type {
+                    FileType::Normal(normal) => {
+                        if !matches!(normal.backend, NormalHandleBackend::Fs) {
+                            return Err(Error::InvalidType);
                         }
+                        normal.fs_client
                     }
-                };
+                }
+            };
 
             let recv_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
             let map_res = fs_client.map_pages(Badge::null(), file_offset, span_pages, recv_slot);

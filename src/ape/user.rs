@@ -9,9 +9,9 @@ use core::mem::size_of;
 use glenda::arch::mem::PGSIZE;
 use glenda::cap::{CapPtr, CapType, Page};
 use glenda::error::Error;
+use glenda::interface::VSpaceService;
 use glenda::interface::{CSpaceService, ResourceService};
 use glenda::ipc::Badge;
-use glenda::interface::VSpaceService;
 use glenda::mem::Perms;
 use glenda::utils::align::{align_down, align_up};
 
@@ -181,12 +181,7 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
             let vaddr = current_stack_low - (idx + 1) * PGSIZE;
             let frame_slot = self.mgr.cspace_mgr.alloc(&mut *self.mgr.res_client)?;
             self.mgr.res_client.alloc(Badge::null(), CapType::Page, 1, frame_slot)?;
-            self.mgr.ledger_record_frame_alloc(
-                self.pid,
-                frame_slot,
-                1,
-                "user_copy_stack_growth",
-            );
+            self.mgr.ledger_record_frame_alloc(self.pid, frame_slot, 1, "user_copy_stack_growth");
             self.mgr.map_process_frame(
                 self.pid,
                 Page::from(frame_slot),
@@ -218,14 +213,12 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
             let process = self.mgr.get_process(self.pid).ok_or(Error::NotFound)?;
             process.lookup_memory_map(user_addr).cloned()
         }
-        .or_else(|| {
-            match self.try_grow_stack_for_user_addr(user_addr) {
-                Ok(true) => self
-                    .mgr
-                    .get_process(self.pid)
-                    .and_then(|process| process.lookup_memory_map(user_addr).cloned()),
-                _ => None,
-            }
+        .or_else(|| match self.try_grow_stack_for_user_addr(user_addr) {
+            Ok(true) => self
+                .mgr
+                .get_process(self.pid)
+                .and_then(|process| process.lookup_memory_map(user_addr).cloned()),
+            _ => None,
         })
         .ok_or(Error::InvalidAddress)?;
 

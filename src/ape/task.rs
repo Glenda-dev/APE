@@ -49,7 +49,8 @@ impl<'a> ApeManager<'a> {
             self.pop_waitable_exited_child(parent_pid, pending.target_pid, pending.caller_pgid)
         {
             if pending.wstatus != 0
-                && let Err(e) = self.copy_to_user(parent_pid, pending.wstatus, &status.to_ne_bytes())
+                && let Err(e) =
+                    self.copy_to_user(parent_pid, pending.wstatus, &status.to_ne_bytes())
             {
                 map_error_to_errno(e)
             } else {

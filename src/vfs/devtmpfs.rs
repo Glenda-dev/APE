@@ -75,10 +75,7 @@ struct LinuxCharDevice {
 
 impl LinuxCharDevice {
     fn new(mode: u32, devno: LinuxDeviceNumber, fops: Arc<dyn LinuxFileOperations>) -> Self {
-        Self {
-            meta: LinuxCharDeviceMeta { mode, devno },
-            fops,
-        }
+        Self { meta: LinuxCharDeviceMeta { mode, devno }, fops }
     }
 }
 

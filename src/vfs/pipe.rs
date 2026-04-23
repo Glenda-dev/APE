@@ -53,11 +53,8 @@ impl FileHandleService for PipeHandle {
         if self.end != PipeEnd::Read {
             return Err(Error::InvalidType);
         }
-        let (n, _writers_closed) = self
-            .registry
-            .lock()
-            .pipe_read(self.pipe_id, buf)
-            .ok_or(Error::NotFound)?;
+        let (n, _writers_closed) =
+            self.registry.lock().pipe_read(self.pipe_id, buf).ok_or(Error::NotFound)?;
         Ok(n)
     }
 
@@ -65,11 +62,8 @@ impl FileHandleService for PipeHandle {
         if self.end != PipeEnd::Write {
             return Err(Error::InvalidType);
         }
-        let (n, no_readers) = self
-            .registry
-            .lock()
-            .pipe_write(self.pipe_id, buf)
-            .ok_or(Error::NotFound)?;
+        let (n, no_readers) =
+            self.registry.lock().pipe_write(self.pipe_id, buf).ok_or(Error::NotFound)?;
         if no_readers {
             return Err(Error::IoError);
         }

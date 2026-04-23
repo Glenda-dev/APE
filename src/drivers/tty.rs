@@ -1,9 +1,11 @@
 use crate::ape::tty::{TTY_TERMIOS_SIZE, TtyCompatState, ansi, ldisc};
-use crate::ape::utils::linux_conv::{host_window_size_to_linux_winsize, linux_winsize_to_host_window_size};
+use crate::ape::utils::linux_conv::{
+    host_window_size_to_linux_winsize, linux_winsize_to_host_window_size,
+};
 use alloc::vec::Vec;
 use core::cmp::min;
-use core::mem::size_of;
 use core::hint::spin_loop;
+use core::mem::size_of;
 use glenda::cap::Endpoint;
 use glenda::client::TerminalClient;
 use glenda::error::Error;
@@ -195,7 +197,28 @@ impl TtyDevice {
             ansi::process_output(&mut state.compat, &tx);
             tx
         };
-        prism_stream_write(self.term, &tx)
+        // We emulate DSR queries/replies in ansi::process_output. Forwarding the raw
+        // query (e.g. CSI 6n) to host terminal passthrough may trigger host CPR
+        // responses and leak `^[ [row;colR` into the interactive session.
+        let tx = strip_dsr_queries(&tx);
+        if tx.is_empty() {
+            return Ok(buf.len());
+        }
+
+        // POSIX write()/writev() must report how many bytes from the caller buffer
+        // are consumed, not how many bytes are emitted after terminal post-processing.
+        // In ONLCR mode '\n' -> "\r\n", so we must not leak transformed length upward.
+        let mut sent = 0usize;
+        while sent < tx.len() {
+            let n = prism_stream_write(self.term, &tx[sent..])?;
+            if n == 0 {
+                spin_loop();
+                continue;
+            }
+            sent = sent.saturating_add(n);
+        }
+
+        Ok(buf.len())
     }
 
     pub fn ioctl_ex(
@@ -261,7 +284,8 @@ impl TtyDevice {
                 if payload.len() < size_of::<i32>() {
                     return Err(Error::InvalidArgs);
                 }
-                let pgrp = i32::from_ne_bytes(payload[..4].try_into().map_err(|_| Error::InvalidArgs)?);
+                let pgrp =
+                    i32::from_ne_bytes(payload[..4].try_into().map_err(|_| Error::InvalidArgs)?);
                 self.state.lock().compat.pgrp = pgrp;
                 Ok((0, Vec::new()))
             }
@@ -296,6 +320,54 @@ fn tty_output_transform(termios: [u8; TTY_TERMIOS_SIZE], input: &[u8]) -> Vec<u8
         } else {
             out.push(b);
         }
+    }
+    out
+}
+
+fn parse_dsr_query_len(input: &[u8], start: usize) -> Option<usize> {
+    // Match: CSI 5n / CSI 6n and private form CSI ? 5n / CSI ? 6n.
+    if input.get(start) != Some(&0x1b) || input.get(start + 1) != Some(&b'[') {
+        return None;
+    }
+
+    let mut i = start + 2;
+    if input.get(i) == Some(&b'?') {
+        i += 1;
+    }
+
+    let digits_start = i;
+    while let Some(b) = input.get(i) {
+        if b.is_ascii_digit() {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if i == digits_start || input.get(i) != Some(&b'n') {
+        return None;
+    }
+
+    let mut param = 0u32;
+    for &d in &input[digits_start..i] {
+        param = param.saturating_mul(10).saturating_add((d - b'0') as u32);
+    }
+    if param == 5 || param == 6 { Some(i + 1 - start) } else { None }
+}
+
+fn strip_dsr_queries(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < input.len() {
+        if let Some(skip) = parse_dsr_query_len(input, i) {
+            i = i.saturating_add(skip);
+            continue;
+        }
+        out.push(input[i]);
+        i += 1;
     }
     out
 }

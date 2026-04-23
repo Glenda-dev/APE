@@ -7,9 +7,7 @@ use alloc::vec::Vec;
 use glenda::cap::{CSPACE_CAP, CapPtr, Endpoint, Page};
 use glenda::client::FsClient;
 use glenda::error::Error;
-use glenda::interface::{
-    CSpaceService, FileHandleService, FileSystemService,
-};
+use glenda::interface::{CSpaceService, FileHandleService, FileSystemService};
 use glenda::io::uring::{IoUringBuffer, IoUringClient};
 use glenda::ipc::Badge;
 use linux_raw_sys::general::{
@@ -463,12 +461,8 @@ pub(crate) fn do_pipe2<'a>(
         return Err(Error::NotFound);
     }
     let cloexec = (flags & O_CLOEXEC) != 0;
-    let (read_client, read_ep_slot) = open_pipe_end_via_pipefs(
-        mgr,
-        pipe_id,
-        "r",
-        glenda::protocol::fs::OpenFlags::O_RDONLY,
-    )?;
+    let (read_client, read_ep_slot) =
+        open_pipe_end_via_pipefs(mgr, pipe_id, "r", glenda::protocol::fs::OpenFlags::O_RDONLY)?;
     let (write_client, write_ep_slot) = match open_pipe_end_via_pipefs(
         mgr,
         pipe_id,

@@ -263,10 +263,9 @@ impl<'a> ApeManager<'a> {
             return Err(e);
         }
 
-        self.ipc.pending_wait_replies.insert(
-            pid,
-            PendingWaitReply { reply_slot, target_pid, wstatus, caller_pgid },
-        );
+        self.ipc
+            .pending_wait_replies
+            .insert(pid, PendingWaitReply { reply_slot, target_pid, wstatus, caller_pgid });
         Ok(())
     }
 

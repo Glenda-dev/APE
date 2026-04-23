@@ -6,14 +6,14 @@ use core::cmp::min;
 use core::mem::size_of;
 use glenda::client::FsClient;
 use glenda::error::Error;
-use glenda::interface::{
-    FileHandleService, FileSystemService,
-};
+use glenda::interface::{FileHandleService, FileSystemService};
 use glenda::io::uring::{IOURING_OP_READ, IOURING_OP_WRITE, IoUringClient, IoUringSqe};
 use glenda::ipc::Badge;
 use linux_raw_sys::ctypes::c_uint;
 use linux_raw_sys::general::{SEEK_CUR, SEEK_END, SEEK_SET, iovec};
-use linux_raw_sys::ioctl::{TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGPGRP, TIOCGWINSZ, TIOCSPGRP, TIOCSWINSZ};
+use linux_raw_sys::ioctl::{
+    TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGPGRP, TIOCGWINSZ, TIOCSPGRP, TIOCSWINSZ,
+};
 
 const ENABLE_FS_RW_ASYNC_IO: bool = false;
 const FS_SYNC_RW_CHUNK: usize = 4096;
@@ -54,7 +54,8 @@ pub(crate) fn do_read<'a>(
                     if chunk == 0 {
                         break;
                     }
-                    let read_len = fs_client.read(Badge::null(), normal.offset, &mut kbuf[..chunk])?;
+                    let read_len =
+                        fs_client.read(Badge::null(), normal.offset, &mut kbuf[..chunk])?;
                     if read_len == 0 {
                         break;
                     }
@@ -68,7 +69,7 @@ pub(crate) fn do_read<'a>(
                 }
                 Ok(total as isize)
             }
-        }
+        },
     })
 }
 
@@ -105,7 +106,7 @@ pub(crate) fn do_write<'a>(
                 }
                 Ok(total as isize)
             }
-        }
+        },
     })
 }
 
@@ -158,7 +159,7 @@ pub(crate) fn do_lseek<'a>(
                 normal.offset = new_off as usize;
                 Ok(new_off)
             }
-        }
+        },
     })
 }
 
@@ -179,7 +180,7 @@ pub(crate) fn do_ioctl<'a>(
             NormalHandleBackend::Fs => {
                 do_ioctl_fs_passthrough(mgr, pid, normal.fs_client, req, argp)
             }
-        }
+        },
     })
 }
 

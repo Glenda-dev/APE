@@ -92,18 +92,13 @@ impl Perform for TtyPerformer<'_> {
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: u8) {
         let prefix = intermediates.first().copied().unwrap_or(0);
         match action {
-            b'n' => match param_raw(params, 0) {
-                5 => self.respond("\x1b[0n"),
-                6 => {
-                    let buf = if prefix == b'?' {
-                        alloc::format!("\x1b[?{};{}R", self.state.cursor_row, self.state.cursor_col)
-                    } else {
-                        alloc::format!("\x1b[{};{}R", self.state.cursor_row, self.state.cursor_col)
-                    };
-                    self.respond(&buf);
-                }
-                _ => {}
-            },
+            b'n' => {
+                // Stream TTY backend: consume DSR/CPR queries but do not synthesize
+                // replies into readable input. Injected ESC[...R bytes can pollute
+                // shell input state when no dedicated terminal emulator is present.
+                let _ = prefix;
+                let _ = params;
+            }
             b'c' => {
                 // DA / Secondary DA
                 if prefix == b'>' {
