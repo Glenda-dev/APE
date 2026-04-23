@@ -5,8 +5,13 @@ use glenda::protocol::terminal::WindowSize;
 
 pub const TTY_TERMIOS_SIZE: usize = 44;
 
+const IFLAG_OFFSET: usize = 0;
+const OFLAG_OFFSET: usize = 4;
 const LFLAG_OFFSET: usize = 12;
 const CC_OFFSET: usize = 17;
+const IFLAG_ICRNL: u32 = 0x00100;
+const OFLAG_OPOST: u32 = 0x00001;
+const OFLAG_ONLCR: u32 = 0x00004;
 const LFLAG_ISIG: u32 = 0x00001;
 const LFLAG_ICANON: u32 = 0x00002;
 const LFLAG_ECHO: u32 = 0x00008;
@@ -20,6 +25,12 @@ const VMIN: usize = 6;
 
 fn default_termios() -> [u8; TTY_TERMIOS_SIZE] {
     let mut t = [0u8; TTY_TERMIOS_SIZE];
+
+    let iflag = IFLAG_ICRNL.to_ne_bytes();
+    t[IFLAG_OFFSET..IFLAG_OFFSET + 4].copy_from_slice(&iflag);
+
+    let oflag = (OFLAG_OPOST | OFLAG_ONLCR).to_ne_bytes();
+    t[OFLAG_OFFSET..OFLAG_OFFSET + 4].copy_from_slice(&oflag);
 
     let lflag = (LFLAG_ISIG | LFLAG_ICANON | LFLAG_ECHO).to_ne_bytes();
     t[LFLAG_OFFSET..LFLAG_OFFSET + 4].copy_from_slice(&lflag);

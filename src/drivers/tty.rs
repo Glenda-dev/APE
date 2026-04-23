@@ -26,6 +26,10 @@ const IOC_SIZESHIFT: u32 = IOC_TYPESHIFT + IOC_TYPEBITS;
 const IOC_DIRSHIFT: u32 = IOC_SIZESHIFT + IOC_SIZEBITS;
 const IOC_WRITE: u32 = 1;
 const IOC_READ: u32 = 2;
+const OFLAG_OFFSET: usize = 4;
+const OFLAG_OPOST: u32 = 0x00001;
+const OFLAG_ONLCR: u32 = 0x00004;
+const OFLAG_OCRNL: u32 = 0x00008;
 
 const fn ioc(dir: u32, ty: u32, nr: u32, sz: u32) -> u32 {
     (dir << IOC_DIRSHIFT) | (ty << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT) | (sz << IOC_SIZESHIFT)
@@ -141,7 +145,7 @@ impl TtyDevice {
             ldisc::feed_input(&mut state.compat, &input[..read_len])
         };
         if !echo.is_empty() {
-            let _ = prism_stream_write(self.term, &echo);
+            let _ = self.write(&echo);
         }
 
         Ok(ldisc::can_read_now(&self.state.lock().compat))
@@ -175,7 +179,7 @@ impl TtyDevice {
                 ldisc::feed_input(&mut state.compat, &input[..read_len])
             };
             if !echo.is_empty() {
-                let _ = prism_stream_write(self.term, &echo);
+                let _ = self.write(&echo);
             }
         }
     }
@@ -185,11 +189,13 @@ impl TtyDevice {
             return Ok(0);
         }
 
-        {
+        let tx = {
             let mut state = self.state.lock();
-            ansi::process_output(&mut state.compat, buf);
-        }
-        prism_stream_write(self.term, buf)
+            let tx = tty_output_transform(state.compat.termios, buf);
+            ansi::process_output(&mut state.compat, &tx);
+            tx
+        };
+        prism_stream_write(self.term, &tx)
     }
 
     pub fn ioctl_ex(
@@ -262,6 +268,36 @@ impl TtyDevice {
             TtyCmd::Tiocsctty | TtyCmd::Tiocnotty => Ok((0, Vec::new())),
         }
     }
+}
+
+fn read_u32(raw: &[u8; TTY_TERMIOS_SIZE], off: usize) -> u32 {
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&raw[off..off + 4]);
+    u32::from_ne_bytes(bytes)
+}
+
+fn tty_output_transform(termios: [u8; TTY_TERMIOS_SIZE], input: &[u8]) -> Vec<u8> {
+    let oflag = read_u32(&termios, OFLAG_OFFSET);
+    let opost = (oflag & OFLAG_OPOST) != 0;
+    let onlcr = (oflag & OFLAG_ONLCR) != 0;
+    let ocrnl = (oflag & OFLAG_OCRNL) != 0;
+    if !opost || (!onlcr && !ocrnl) {
+        return input.to_vec();
+    }
+
+    let nl_count = if onlcr { input.iter().filter(|&&b| b == b'\n').count() } else { 0 };
+    let mut out = Vec::with_capacity(input.len().saturating_add(nl_count));
+    for &b in input {
+        if onlcr && b == b'\n' {
+            out.push(b'\r');
+            out.push(b'\n');
+        } else if ocrnl && b == b'\r' {
+            out.push(b'\n');
+        } else {
+            out.push(b);
+        }
+    }
+    out
 }
 
 fn query_prism_tty_state(term: TerminalClient) -> Result<TtyCompatState, Error> {
