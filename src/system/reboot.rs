@@ -1,4 +1,5 @@
 use crate::ApeManager;
+use crate::task as task_subsystem;
 use glenda::error::Error;
 use glenda::interface::{SystemService, ThreadService};
 use linux_raw_sys::general::{
@@ -43,7 +44,7 @@ fn do_reboot_runtime(mgr: &mut ApeManager<'_>, caller_pid: usize) -> Result<(), 
 
     let init_path = mgr.config().init_path.clone();
     log!("sys_reboot: rebooting APE runtime by exec init pid={}, path={}", init_pid, init_path);
-    mgr.do_execve_path(init_pid, &init_path, &[], &[])?;
+    task_subsystem::do_execve(mgr, init_pid, &init_path, &[], &[])?;
 
     if init_pid != caller_pid
         && let Some(proc) = mgr.get_process(init_pid)

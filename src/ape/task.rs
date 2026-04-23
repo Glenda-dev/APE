@@ -630,7 +630,7 @@ impl<'a> ApeManager<'a> {
         })
     }
 
-    pub(crate) fn do_execve_path(
+    pub(crate) fn do_execve(
         &mut self,
         pid: usize,
         path: &str,
@@ -644,7 +644,7 @@ impl<'a> ApeManager<'a> {
 
         let main_file_type = main_elf.file_type();
         if main_file_type != ET_EXEC as u16 && main_file_type != ET_DYN as u16 {
-            error!("execve_path: unsupported ELF type {} for {}", main_file_type, path);
+            error!("execve: unsupported ELF type {} for {}", main_file_type, path);
             return Err(Error::InvalidArgs);
         }
 

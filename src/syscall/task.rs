@@ -104,6 +104,6 @@ pub fn sys_execve<'a>(
     argv_ptr: usize,
     envp_ptr: usize,
 ) -> Result<isize, Error> {
-    task_subsystem::do_execve(mgr, pid, filename_ptr, argv_ptr, envp_ptr)?;
+    task_subsystem::do_execve_user(mgr, pid, filename_ptr, argv_ptr, envp_ptr)?;
     Ok(0)
 }

@@ -5,7 +5,7 @@ pub mod exec;
 pub mod job;
 pub mod lifecycle;
 
-pub(crate) use exec::do_execve;
+pub(crate) use exec::{do_execve, do_execve_user};
 pub(crate) use job::{do_getpgid, do_getsid, do_kill, do_setpgid, do_setsid};
 pub(crate) use lifecycle::{
     do_clone, do_exit, do_exit_group, do_fork, do_getpid, do_getppid, do_gettid,

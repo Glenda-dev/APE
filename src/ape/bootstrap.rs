@@ -6,6 +6,7 @@ use crate::layout::{
     DEFAULT_INIT_PROCESS_NAME, DEFAULT_VIEW_ROOT, DEFAULT_VT_NAME, FIRST_USER_FD, ROOTFS_SLOT,
     STDIO_SLOT,
 };
+use crate::task as task_subsystem;
 use crate::vfs::worker::{VfsWorkerConfig, VfsWorkerKind, spawn_worker};
 use glenda::arch::mem::PGSIZE;
 use glenda::cap::{CapPtr, CapType, Endpoint, Page};
@@ -220,7 +221,7 @@ impl<'a> ApeManager<'a> {
 
         let init_path = self.config().init_path.clone();
         log!("load_init: execve init path={}", init_path);
-        self.do_execve_path(pid, &init_path, &[], &[])?;
+        task_subsystem::do_execve(self, pid, &init_path, &[], &[])?;
         log!("load_init: execve completed");
         let tcb_cap = self.get_process(pid).ok_or(Error::NotFound)?.tcb();
         tcb_cap.resume()?;
