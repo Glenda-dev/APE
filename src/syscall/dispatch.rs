@@ -18,6 +18,7 @@ pub(crate) fn route_syscall<'a>(
         ApeSyscall::Readv => io::sys_readv(mgr, pid, args[0], args[1], args[2]),
         ApeSyscall::Writev => io::sys_writev(mgr, pid, args[0], args[1], args[2]),
         ApeSyscall::OpenAt => fs::sys_openat(mgr, pid, args[0], args[1], args[2], args[3]),
+        ApeSyscall::ReadlinkAt => fs::sys_readlinkat(mgr, pid, args[0], args[1], args[2], args[3]),
         ApeSyscall::NewFstatAt => fs::sys_newfstatat(mgr, pid, args[0], args[1], args[2], args[3]),
         ApeSyscall::Fstat => fs::sys_fstat(mgr, pid, args[0], args[1]),
         ApeSyscall::Getdents64 => fs::sys_getdents64(mgr, pid, args[0], args[1], args[2]),

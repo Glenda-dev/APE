@@ -323,17 +323,9 @@ pub(crate) fn do_wait4(
         return Ok(0);
     }
 
+    mgr.queue_wait4_reply(pid, target_pid, wstatus, caller_pgid)?;
     if let Some(proc) = mgr.get_process_mut(pid) {
         proc.arm_wait4_block(target_pid, caller_pgid);
     }
-
-    let tcb = mgr.get_process(pid).ok_or(Error::NotFound)?.tcb();
-    if let Err(e) = tcb.suspend() {
-        warn!("wait4: failed to suspend pid={} in blocking wait4: {:?}", pid, e);
-        if let Some(proc) = mgr.get_process_mut(pid) {
-            proc.clear_wait4_block();
-        }
-    }
-
-    Ok(0)
+    Err(Error::Success)
 }

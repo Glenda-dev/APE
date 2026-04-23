@@ -6,7 +6,7 @@ use crate::ape::utils::linux_conv::get_exit_code_for_signal;
 use crate::ape::utils::strace;
 use crate::arch::constants::{INST_PAGE_FAULT, LOAD_PAGE_FAULT, STORE_PAGE_FAULT};
 use crate::arch::parse_syscall_args;
-use crate::syscall::dispatch_syscall;
+use crate::syscall::{map_error_to_errno, route_syscall};
 use crate::system::signal::{PendingSignalAction, consume_deliverable_signal_on_syscall_return};
 use alloc::vec::Vec;
 use glenda::arch::mem::{PGSIZE, SHIFTS};
@@ -21,6 +21,7 @@ use glenda::protocol;
 use glenda::utils::align::{align_down, align_up};
 use libape::policy::{ApeSyscall, decode_ape_syscall};
 use linux_raw_sys::errno::EINTR;
+use linux_raw_sys::errno::ENOSYS;
 use linux_raw_sys::general::{SIGBUS, SIGILL, SIGSEGV, SIGTRAP};
 
 const L1_HUGE_PAGES: usize = 1 << (SHIFTS[1] - SHIFTS[0]);
@@ -740,20 +741,31 @@ impl<'a> FaultService for ApeManager<'a> {
         #[cfg(feature = "strace")]
         let trace_state = strace::trace_syscall_enter(&mut *self, pid, sys_num as u32, sys_args);
 
-        let mut ret = dispatch_syscall(&mut *self, pid, sys_num, sys_args);
+        let syscall_ret = route_syscall(&mut *self, pid, sys_num, sys_args);
+        if let Err(Error::Success) = syscall_ret {
+            return Err(Error::Success);
+        }
+
+        let mut ret = match syscall_ret {
+            Ok(ret) => ret,
+            Err(e) => map_error_to_errno(e),
+        };
+        if ret == -(ENOSYS as isize) {
+            error!("syscall: unimplemented syscall number {} called by pid {}", sys_num, pid);
+        }
 
         match consume_deliverable_signal_on_syscall_return(self, pid) {
             Ok(PendingSignalAction::None) => {}
             Ok(PendingSignalAction::Interrupt { restart }) => {
                 // TODO(ape/signal,phase4): 当前为 SA_RESTART 最小策略，
                 // 尚未覆盖所有可重启 syscall 及 restart_syscall 细粒度语义。
-                if ret >= 0 && !(restart && is_restartable_syscall(sys_num)) {
+                if ret >= 0 && is_restartable_syscall(sys_num) && !restart {
                     ret = -(EINTR as isize);
                 }
             }
             Ok(PendingSignalAction::Terminate(exit_code)) => {
-                // syscall 上下文终止进程时，保留 reply slot 避免破坏本次回包路径。
-                let _ = self.terminate_process_preserve_reply(pid, exit_code, true);
+                // 终止当前 syscall 调用方时，通过 Error::Success 传播“不需要回包”语义。
+                self.terminate_process_preserve_reply(pid, exit_code, true)?;
             }
             Err(e) if e == Error::NotFound => {}
             Err(e) => {

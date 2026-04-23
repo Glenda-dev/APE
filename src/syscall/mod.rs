@@ -15,3 +15,5 @@ pub mod system;
 pub mod task;
 
 pub use entry::*;
+pub(crate) use common::map_error_to_errno;
+pub(crate) use dispatch::route_syscall;

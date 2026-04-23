@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 
 const LFLAG_OFFSET: usize = 12;
 const CC_OFFSET: usize = 17;
+const IFLAG_OFFSET: usize = 0;
 const IFLAG_IGNCR: u32 = 0x00080;
 const IFLAG_ICRNL: u32 = 0x00100;
 const IFLAG_INLCR: u32 = 0x00040;
@@ -25,15 +26,15 @@ fn read_cc(termios: &[u8; TTY_TERMIOS_SIZE], idx: usize, default: u8) -> u8 {
 }
 
 fn is_igncr(termios: &[u8; TTY_TERMIOS_SIZE]) -> bool {
-    (read_u32(termios, 0) & IFLAG_IGNCR) != 0
+    (read_u32(termios, IFLAG_OFFSET) & IFLAG_IGNCR) != 0
 }
 
 fn is_icrnl(termios: &[u8; TTY_TERMIOS_SIZE]) -> bool {
-    (read_u32(termios, 0) & IFLAG_ICRNL) != 0
+    (read_u32(termios, IFLAG_OFFSET) & IFLAG_ICRNL) != 0
 }
 
 fn is_inlcr(termios: &[u8; TTY_TERMIOS_SIZE]) -> bool {
-    (read_u32(termios, 0) & IFLAG_INLCR) != 0
+    (read_u32(termios, IFLAG_OFFSET) & IFLAG_INLCR) != 0
 }
 
 fn is_icanon(termios: &[u8; TTY_TERMIOS_SIZE]) -> bool {
@@ -74,14 +75,10 @@ pub fn feed_input(state: &mut TtyCompatState, input: &[u8]) -> Vec<u8> {
     let icrnl = is_icrnl(&state.termios);
     let inlcr = is_inlcr(&state.termios);
 
-    for &incoming in input {
-        // Normalize Enter from serial/telnet paths: many transports send LF for the Enter key.
-        let from_transport_lf = incoming == b'\n';
-        let raw = if from_transport_lf { b'\r' } else { incoming };
+    for &raw in input {
         let b = match raw {
             b'\r' if igncr => continue,
-            // Keep CR for shell/readline compatibility on current serial path.
-            b'\r' if icrnl && !from_transport_lf => b'\r',
+            b'\r' if icrnl => b'\n',
             b'\n' if inlcr => b'\r',
             _ => raw,
         };
@@ -105,7 +102,7 @@ pub fn feed_input(state: &mut TtyCompatState, input: &[u8]) -> Vec<u8> {
                 x if x == veof => {
                     flush_canonical_to_readable(state);
                 }
-                b'\n' | b'\r' => {
+                b'\n' => {
                     state.canonical_line_buf.push_back(b);
                     flush_canonical_to_readable(state);
                     if do_echo {

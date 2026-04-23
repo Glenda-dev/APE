@@ -295,6 +295,34 @@ pub(crate) fn do_umount2<'a>(
     Ok(0)
 }
 
+pub(crate) fn do_readlinkat<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    dirfd: usize,
+    pathname: usize,
+    buf: usize,
+    bufsiz: usize,
+) -> Result<isize, Error> {
+    if pathname == 0 || buf == 0 {
+        return Err(Error::InvalidAddress);
+    }
+    if bufsiz == 0 {
+        return Ok(0);
+    }
+
+    let raw_path = mgr.strncpy_from_user(pid, pathname, USER_PATH_MAX)?;
+    if raw_path.is_empty() {
+        return Err(Error::NotFound);
+    }
+
+    let resolved = resolve_path_at(mgr, pid, dirfd, &raw_path)?;
+    let target = mgr.fs_client.readlink_path(Badge::null(), &resolved)?;
+    let bytes = target.as_bytes();
+    let n = core::cmp::min(bufsiz, bytes.len());
+    mgr.copy_to_user(pid, buf, &bytes[..n])?;
+    Ok(n as isize)
+}
+
 pub(crate) fn do_newfstatat<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,

@@ -2,6 +2,7 @@ use crate::ApeManager;
 use crate::ape::process::{MemoryMap, MemoryType};
 use crate::elf::ElfFile;
 use crate::layout::APE_SLOT;
+use crate::syscall::map_error_to_errno;
 use crate::system::signal::queue_process_signal;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -9,13 +10,13 @@ use alloc::vec::Vec;
 use core::cmp::{max, min};
 use core::mem::size_of;
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Endpoint, Page};
+use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Endpoint, Page, Reply};
 use glenda::error::Error;
 use glenda::interface::{
     CSpaceService, FileHandleService, FileSystemService, ProcessService, ResourceService,
     ThreadService, VSpaceService,
 };
-use glenda::ipc::Badge;
+use glenda::ipc::{Badge, UTCB};
 use glenda::mem::get_utcb_va;
 use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
 use glenda::protocol::fs::OpenFlags;
@@ -23,6 +24,7 @@ use glenda::utils::align::{align_down, align_up};
 use linux_raw_sys::auxvec::{AT_BASE, AT_ENTRY, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM};
 use linux_raw_sys::elf::{ET_DYN, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
 use linux_raw_sys::elf_uapi::ET_EXEC;
+use linux_raw_sys::errno::ECHILD;
 use linux_raw_sys::general::SIGCHLD;
 
 const INITIAL_STACK_ALIGN: usize = 16;
@@ -38,6 +40,50 @@ struct LoadedElfInfo {
 }
 
 impl<'a> ApeManager<'a> {
+    fn try_wake_pending_wait4_reply(&mut self, parent_pid: usize) -> bool {
+        let Some(pending) = self.peek_wait4_reply(parent_pid) else {
+            return false;
+        };
+
+        let ret = if let Some((reaped_pid, status)) =
+            self.pop_waitable_exited_child(parent_pid, pending.target_pid, pending.caller_pgid)
+        {
+            if pending.wstatus != 0
+                && let Err(e) = self.copy_to_user(parent_pid, pending.wstatus, &status.to_ne_bytes())
+            {
+                map_error_to_errno(e)
+            } else {
+                reaped_pid as isize
+            }
+        } else if !self.has_waitable_child(parent_pid, pending.target_pid, pending.caller_pgid) {
+            -(ECHILD as isize)
+        } else {
+            return false;
+        };
+
+        let Some(pending) = self.take_wait4_reply(parent_pid) else {
+            return false;
+        };
+
+        if let Some(parent) = self.get_process_mut(parent_pid) {
+            parent.clear_wait4_block();
+        }
+
+        let mut utcb = unsafe { UTCB::new() };
+        utcb.clear();
+        utcb.set_mr(0, ret as usize);
+
+        if let Err(e) = Reply::from(pending.reply_slot).reply(&mut utcb) {
+            warn!(
+                "wait4: failed to reply pending wait4 pid={} via slot {:?}: {:?}",
+                parent_pid, pending.reply_slot, e
+            );
+        }
+        let _ = CSPACE_CAP.delete(pending.reply_slot);
+        self.cspace_mgr.free(pending.reply_slot);
+        true
+    }
+
     fn encode_wait_status(exit_code: usize) -> i32 {
         ((exit_code & 0xff) as i32) << 8
     }
@@ -78,15 +124,6 @@ impl<'a> ApeManager<'a> {
         }
     }
 
-    fn clear_reply_cap_for_exit(&mut self) {
-        if let Err(e) = CSPACE_CAP.delete(self.ipc.reply.cap())
-            && e != Error::InvalidCapability
-            && e != Error::InvalidSlot
-        {
-            warn!("exit: failed to clear ape reply slot {:?}: {:?}", self.ipc.reply.cap(), e);
-        }
-    }
-
     fn release_process_cnode_cap(&mut self, pid: usize) {
         if let Some(slot) = self.get_process(pid).map(|p| p.cnode_cap.cap()) {
             let _ = CSPACE_CAP.revoke(slot);
@@ -115,7 +152,6 @@ impl<'a> ApeManager<'a> {
         pid: usize,
         exit_code: usize,
         panic_if_init: bool,
-        clear_reply: bool,
     ) -> Result<(), Error> {
         let (fd_list, mapped_pages, frame_pages, parent_pid, process_group_id) = {
             let process = self.get_process(pid).ok_or(Error::NotFound)?;
@@ -152,18 +188,12 @@ impl<'a> ApeManager<'a> {
             self.release_process_frame_slot(pid, slot, pages, "process_exit_memory_map");
         }
 
-        if clear_reply {
-            self.clear_reply_cap_for_exit();
-        }
         self.release_process_cnode_cap(pid);
-        if self.ipc.active_caller_pid == Some(pid) {
-            self.mark_skip_reply_once();
-            self.defer_host_kill(pid);
-        } else {
-            self.kill_host_process_by_local_pid(pid);
-        }
+        let should_skip_reply = self.ipc.active_caller_pid == Some(pid);
+        self.kill_host_process_by_local_pid(pid);
 
         let _ = self.release_process_intermediate_page_tables(pid);
+        self.drop_wait4_reply(pid);
 
         let _ = self.ledger_take_process(pid);
 
@@ -177,26 +207,29 @@ impl<'a> ApeManager<'a> {
                 process_group_id,
             );
 
-            let should_resume_wait4 = self
-                .get_process(parent_pid)
-                .map(|parent| parent.wait4_block_matches(pid, process_group_id))
-                .unwrap_or(false);
+            let replied_wait4 = self.try_wake_pending_wait4_reply(parent_pid);
+            if !replied_wait4 {
+                let should_resume_wait4 = self
+                    .get_process(parent_pid)
+                    .map(|parent| parent.wait4_block_matches(pid, process_group_id))
+                    .unwrap_or(false);
 
-            if should_resume_wait4 {
-                if let Some(parent) = self.get_process_mut(parent_pid) {
-                    parent.clear_wait4_block();
+                if should_resume_wait4 {
+                    if let Some(parent) = self.get_process_mut(parent_pid) {
+                        parent.clear_wait4_block();
+                    }
+                    if let Some(parent) = self.get_process(parent_pid)
+                        && let Err(e) = parent.tcb().resume()
+                    {
+                        warn!(
+                            "wait4: failed to resume parent pid={} on child exit pid={}: {:?}",
+                            parent_pid, pid, e
+                        );
+                    }
                 }
-                if let Some(parent) = self.get_process(parent_pid)
-                    && let Err(e) = parent.tcb().resume()
-                {
-                    warn!(
-                        "wait4: failed to resume parent pid={} on child exit pid={}: {:?}",
-                        parent_pid, pid, e
-                    );
-                }
+
+                let _ = queue_process_signal(self, parent_pid, SIGCHLD as usize);
             }
-
-            let _ = queue_process_signal(self, parent_pid, SIGCHLD as usize);
         }
 
         if panic_if_init && pid == 1 {
@@ -206,7 +239,17 @@ impl<'a> ApeManager<'a> {
             );
         }
 
-        Ok(())
+        if should_skip_reply {
+            if let Err(e) = CSPACE_CAP.delete(self.ipc.reply.cap())
+                && e != Error::InvalidCapability
+                && e != Error::InvalidSlot
+            {
+                warn!("exit: failed to clear fixed reply slot {:?}: {:?}", self.ipc.reply.cap(), e);
+            }
+            Err(Error::Success)
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn terminate_process(
@@ -215,7 +258,7 @@ impl<'a> ApeManager<'a> {
         exit_code: usize,
         panic_if_init: bool,
     ) -> Result<(), Error> {
-        self.terminate_process_impl(pid, exit_code, panic_if_init, true)
+        self.terminate_process_impl(pid, exit_code, panic_if_init)
     }
 
     pub(crate) fn terminate_process_preserve_reply(
@@ -224,7 +267,7 @@ impl<'a> ApeManager<'a> {
         exit_code: usize,
         panic_if_init: bool,
     ) -> Result<(), Error> {
-        self.terminate_process_impl(pid, exit_code, panic_if_init, false)
+        self.terminate_process_impl(pid, exit_code, panic_if_init)
     }
     fn close_cloexec_fds(&mut self, pid: usize) -> Result<(), Error> {
         let cloexec_fds: Vec<u32> = {

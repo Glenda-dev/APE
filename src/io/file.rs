@@ -170,6 +170,9 @@ pub(crate) fn do_ioctl<'a>(
     argp: usize,
 ) -> Result<isize, Error> {
     let req = u32::try_from(request).map_err(|_| Error::InvalidArgs)?;
+    if req == 0 {
+        return Ok(0);
+    }
 
     with_fd_handle_mut(mgr, pid, fd, |mgr, handle| match &mut handle.file_type {
         FileType::Normal(normal) => match normal.backend {

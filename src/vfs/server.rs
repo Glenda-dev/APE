@@ -53,6 +53,10 @@ impl FsNamespace for DevTmpFsNamespace {
         self.inner.stat(path)
     }
 
+    fn lstat_path(&mut self, path: &str, _badge: Badge) -> Result<fs::Stat, Error> {
+        self.inner.stat(path)
+    }
+
     fn readlink_path(&mut self, path: &str, _badge: Badge) -> Result<alloc::string::String, Error> {
         self.inner.readlink(path)
     }
@@ -96,6 +100,10 @@ impl FsNamespace for TmpFsNamespace {
     }
 
     fn stat_path(&mut self, path: &str, _badge: Badge) -> Result<fs::Stat, Error> {
+        self.inner.stat(path)
+    }
+
+    fn lstat_path(&mut self, path: &str, _badge: Badge) -> Result<fs::Stat, Error> {
         self.inner.stat(path)
     }
 
@@ -162,6 +170,10 @@ impl FsNamespace for PipeFsNamespace {
     }
 
     fn stat_path(&mut self, _path: &str, _badge: Badge) -> Result<fs::Stat, Error> {
+        Err(Error::NotSupported)
+    }
+
+    fn lstat_path(&mut self, _path: &str, _badge: Badge) -> Result<fs::Stat, Error> {
         Err(Error::NotSupported)
     }
 

@@ -13,6 +13,7 @@ pub mod utils;
 
 use crate::config::ApeConfig;
 use crate::layout::{APE_SLOT, FS_ASYNC_POOL_BASE_VADDR, FS_ASYNC_POOL_MAX_REGIONS};
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use glenda::arch::mem::{PGSIZE, SHIFTS};
@@ -29,14 +30,21 @@ use glenda::utils::manager::{CSpaceManager, VSpaceManager};
 use process::{AsyncIoRegion, AsyncIoState, NormalFileHandle, SubProcess};
 use state::{ApeFsState, ApeProcessLedger, ApeResourceLedger, ApeRuntimeState, ApeTaskState};
 
+#[derive(Debug, Clone, Copy)]
+pub struct PendingWaitReply {
+    pub reply_slot: CapPtr,
+    pub target_pid: isize,
+    pub wstatus: usize,
+    pub caller_pgid: usize,
+}
+
 pub struct ApeIpc {
     pub running: bool,
     pub endpoint: Endpoint,
     pub reply: Reply,
     pub recv: CapPtr,
     pub active_caller_pid: Option<usize>,
-    pub deferred_kill_pids: Vec<usize>,
-    pub skip_reply_once: bool,
+    pub pending_wait_replies: BTreeMap<usize, PendingWaitReply>,
 }
 
 pub struct ApeManager<'a> {
@@ -94,8 +102,7 @@ impl<'a> ApeManager<'a> {
                 recv: CapPtr::null(),
                 reply: Reply::from(CapPtr::null()),
                 active_caller_pid: None,
-                deferred_kill_pids: Vec::new(),
-                skip_reply_once: false,
+                pending_wait_replies: BTreeMap::new(),
             },
             task_state: ApeTaskState::new(1),
             runtime_state: ApeRuntimeState::new(ApeConfig::default()),
@@ -221,22 +228,61 @@ impl<'a> ApeManager<'a> {
         self.ipc.active_caller_pid = None;
     }
 
-    pub fn defer_host_kill(&mut self, pid: usize) {
-        if !self.ipc.deferred_kill_pids.contains(&pid) {
-            self.ipc.deferred_kill_pids.push(pid);
+    pub fn queue_wait4_reply(
+        &mut self,
+        pid: usize,
+        target_pid: isize,
+        wstatus: usize,
+        caller_pgid: usize,
+    ) -> Result<(), Error> {
+        if self.ipc.pending_wait_replies.contains_key(&pid) {
+            return Err(Error::WouldBlock);
         }
+
+        let src_reply = self.ipc.reply.cap();
+        if src_reply.is_null() {
+            return Err(Error::InvalidCapability);
+        }
+
+        let mut retry = 0usize;
+        let reply_slot = loop {
+            let slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
+            if slot == src_reply {
+                // Keep the fixed reply slot reserved and never use it as pending storage.
+                self.cspace_mgr.free(slot);
+                retry = retry.saturating_add(1);
+                if retry > 64 {
+                    return Err(Error::OutOfMemory);
+                }
+                continue;
+            }
+            break slot;
+        };
+        if let Err(e) = CSPACE_CAP.transfer_self(src_reply, reply_slot) {
+            self.cspace_mgr.free(reply_slot);
+            return Err(e);
+        }
+
+        self.ipc.pending_wait_replies.insert(
+            pid,
+            PendingWaitReply { reply_slot, target_pid, wstatus, caller_pgid },
+        );
+        Ok(())
     }
 
-    pub fn take_deferred_host_kills(&mut self) -> Vec<usize> {
-        core::mem::take(&mut self.ipc.deferred_kill_pids)
+    pub fn take_wait4_reply(&mut self, pid: usize) -> Option<PendingWaitReply> {
+        self.ipc.pending_wait_replies.remove(&pid)
     }
 
-    pub fn mark_skip_reply_once(&mut self) {
-        self.ipc.skip_reply_once = true;
+    pub fn peek_wait4_reply(&self, pid: usize) -> Option<PendingWaitReply> {
+        self.ipc.pending_wait_replies.get(&pid).copied()
     }
 
-    pub fn take_skip_reply_once(&mut self) -> bool {
-        core::mem::replace(&mut self.ipc.skip_reply_once, false)
+    pub fn drop_wait4_reply(&mut self, pid: usize) {
+        if let Some(pending) = self.ipc.pending_wait_replies.remove(&pid) {
+            let _ = CSPACE_CAP.delete(pending.reply_slot);
+            self.cspace_mgr.free(pending.reply_slot);
+        }
     }
 
     pub fn config(&self) -> &ApeConfig {

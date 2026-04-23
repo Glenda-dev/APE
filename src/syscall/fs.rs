@@ -26,6 +26,17 @@ pub fn sys_openat<'a>(
     crate::fs::fd::do_openat(mgr, pid, dirfd, pathname, flags, mode)
 }
 
+pub fn sys_readlinkat<'a>(
+    mgr: &mut ApeManager<'a>,
+    pid: usize,
+    dirfd: usize,
+    pathname: usize,
+    buf: usize,
+    bufsiz: usize,
+) -> Result<isize, Error> {
+    crate::fs::meta::do_readlinkat(mgr, pid, dirfd, pathname, buf, bufsiz)
+}
+
 pub fn sys_newfstatat<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,

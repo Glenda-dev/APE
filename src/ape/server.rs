@@ -33,22 +33,17 @@ impl<'a> SystemService for ApeManager<'a> {
                 continue;
             }
             self.set_active_caller_pid(utcb.get_badge().bits());
-            match self.dispatch(&mut utcb) {
-                Ok(()) => {}
-                Err(Error::Success) => {
-                    continue;
-                }
+            let should_reply = match self.dispatch(&mut utcb) {
+                Ok(()) => true,
+                Err(Error::Success) => false,
                 Err(e) => {
                     error!("Dispatch error: {:?}", e);
-                    continue;
+                    false
                 }
-            }
+            };
             self.clear_active_caller_pid();
 
-            for pid in self.take_deferred_host_kills() {
-                self.kill_host_process_by_local_pid(pid);
-            }
-            if let Err(e) = self.reply(&mut utcb) {
+            if should_reply && let Err(e) = self.reply(&mut utcb) {
                 error!("Reply error: {:?}", e);
             }
         }
