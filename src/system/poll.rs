@@ -1,5 +1,5 @@
 use crate::ApeManager;
-use crate::drivers::tty::TtyDevice;
+use crate::ape::process::FileType;
 use alloc::vec;
 use core::mem::size_of;
 use glenda::error::Error;
@@ -7,25 +7,11 @@ use glenda::interface::TimeService;
 use glenda::ipc::Badge;
 use linux_raw_sys::errno::{EINTR, EINVAL};
 use linux_raw_sys::general::__kernel_timespec;
-use linux_raw_sys::general::{POLLIN, POLLNVAL, POLLOUT, POLLPRI, pollfd};
+use linux_raw_sys::general::{POLLNVAL, pollfd};
 
 const SIGSET_BYTES: usize = size_of::<u64>();
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 const PPOLL_SLEEP_MS: usize = 4;
-
-fn pollin_ready_for_fd(mgr: &mut ApeManager<'_>, pid: usize, fd: u32) -> Result<bool, Error> {
-    let is_tty = {
-        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-        process.fd_paths.get(&fd).map(|p| p.as_str() == "/dev/tty").unwrap_or(false)
-    };
-
-    if is_tty {
-        return TtyDevice::global().poll_readable();
-    }
-
-    // Regular files remain readable from poll's perspective.
-    Ok(true)
-}
 
 #[inline]
 fn has_valid_sigset_size(sigsetsize: usize) -> bool {
@@ -126,16 +112,8 @@ fn poll_scan_once(
                 pfd.revents = POLLNVAL as i16;
                 ready_count += 1;
             } else {
-                let mut revents = 0i16;
-                if ((pfd.events as u32) & (POLLIN | POLLPRI)) != 0
-                    && pollin_ready_for_fd(mgr, pid, fd)?
-                {
-                    revents |= POLLIN as i16;
-                }
-                if ((pfd.events as u32) & POLLOUT) != 0 {
-                    revents |= POLLOUT as i16;
-                }
-                pfd.revents = revents;
+                let revents = poll_fd_once(mgr, pid, fd, pfd.events as u32)?;
+                pfd.revents = (revents & 0xffff) as i16;
                 if revents != 0 {
                     ready_count += 1;
                 }
@@ -148,6 +126,28 @@ fn poll_scan_once(
         mgr.copy_to_user(pid, p, out)?;
     }
     Ok(ready_count)
+}
+
+fn poll_fd_once(
+    mgr: &mut ApeManager<'_>,
+    pid: usize,
+    fd: u32,
+    events: u32,
+) -> Result<u32, Error> {
+    let mut handle = {
+        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+        process.fds.remove(&fd).ok_or(Error::InvalidSlot)?
+    };
+
+    let result = (|| {
+        match &mut handle.file_type {
+            FileType::Normal(normal) => normal.poll(events),
+        }
+    })();
+
+    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+    process.fds.insert(fd, handle);
+    result
 }
 
 pub(crate) fn do_ppoll(

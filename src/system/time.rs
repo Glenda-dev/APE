@@ -215,35 +215,13 @@ pub(crate) fn do_nanosleep(
         }
         return Ok(0);
     }
-
-    let start = mgr.time_client.mono_now(Badge::null())?;
-    let deadline = start.saturating_add(req_ns);
-
-    loop {
-        let now = mgr.time_client.mono_now(Badge::null())?;
-        if now >= deadline {
-            break;
+    if has_deliverable_signal(mgr, pid) {
+        if rem != 0 {
+            mgr.write_obj_to_user(pid, rem, &req_ts)?;
         }
-
-        if has_deliverable_signal(mgr, pid) {
-            if rem != 0 {
-                let remain_ns = deadline.saturating_sub(now);
-                let rem_ts = ns_to_timespec(remain_ns);
-                mgr.write_obj_to_user(pid, rem, &rem_ts)?;
-            }
-            return Ok(-(EINTR as isize));
-        }
-
-        let remain_ns = deadline.saturating_sub(now);
-        let remain_ms = usize::try_from(remain_ns.div_ceil(1_000_000)).unwrap_or(usize::MAX);
-        let sleep_ms = core::cmp::max(1, core::cmp::min(SLEEP_POLL_MS, remain_ms));
-        mgr.time_client.sleep(Badge::null(), sleep_ms)?;
+        return Ok(-(EINTR as isize));
     }
 
-    if rem != 0 {
-        let zero = __kernel_timespec { tv_sec: 0, tv_nsec: 0 };
-        mgr.write_obj_to_user(pid, rem, &zero)?;
-    }
-
-    Ok(0)
+    mgr.schedule_nanosleep_async(pid, req_ns, rem)?;
+    Err(Error::Success)
 }

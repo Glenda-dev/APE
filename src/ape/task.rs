@@ -195,6 +195,7 @@ impl<'a> ApeManager<'a> {
 
         let _ = self.release_process_intermediate_page_tables(pid);
         self.drop_wait4_reply(pid);
+        self.drop_pending_sleep_reply(pid);
 
         let _ = self.ledger_take_process(pid);
 

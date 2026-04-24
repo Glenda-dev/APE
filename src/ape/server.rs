@@ -1,4 +1,5 @@
 use crate::ApeManager;
+use crate::layout::APE_ASYNC_NOTIFY_BADGE_BITS;
 use glenda::cap::{CSPACE_CAP, CapPtr, Endpoint, Reply};
 use glenda::error::Error;
 use glenda::interface::FaultService;
@@ -25,11 +26,21 @@ impl<'a> SystemService for ApeManager<'a> {
         self.init_client.report_service(Badge::null(), protocol::init::ServiceState::Running)?;
         self.ipc.running = true;
         while self.ipc.running {
+            if let Err(e) = self.drain_async_events() {
+                warn!("async runtime drain failed before recv: {:?}", e);
+            }
             let mut utcb = unsafe { UTCB::new() };
+            utcb.clear();
             utcb.set_reply_window(self.ipc.reply.cap());
             utcb.set_recv_window(self.ipc.recv);
             if let Err(e) = self.ipc.endpoint.recv(&mut utcb) {
                 error!("Recv error: {:?}", e);
+                continue;
+            }
+            if utcb.get_badge().bits() == APE_ASYNC_NOTIFY_BADGE_BITS {
+                if let Err(e) = self.drain_async_events() {
+                    warn!("async runtime drain failed after notify: {:?}", e);
+                }
                 continue;
             }
             self.set_active_caller_pid(utcb.get_badge().bits());

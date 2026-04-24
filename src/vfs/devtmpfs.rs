@@ -9,6 +9,7 @@ use glenda::error::Error;
 use glenda::interface::FileHandleService;
 use glenda::ipc::Badge;
 use glenda::protocol::fs::{DEntry, FileType, OpenFlags, Stat};
+use linux_raw_sys::general::{POLLIN, POLLOUT, POLLPRI};
 
 use super::tmpfs::TmpFsHandle;
 
@@ -52,6 +53,10 @@ pub trait LinuxFileOperations: Send + Sync {
 
     fn unlocked_ioctl(&self, _cmd: u32, _arg: usize) -> Result<usize, Error> {
         Err(Error::NotSupported)
+    }
+
+    fn poll(&self, events: u32) -> Result<u32, Error> {
+        Ok(events)
     }
 
     fn ioctl_ex(
@@ -146,6 +151,17 @@ impl LinuxFileOperations for TtyFileOps {
     ) -> Result<(usize, Vec<u8>), Error> {
         TtyDevice::global().ioctl_ex(cmd, input, out_len)
     }
+
+    fn poll(&self, events: u32) -> Result<u32, Error> {
+        let mut revents = 0u32;
+        if (events & (POLLIN | POLLPRI)) != 0 && TtyDevice::global().poll_readable()? {
+            revents |= events & (POLLIN | POLLPRI);
+        }
+        if (events & POLLOUT) != 0 {
+            revents |= POLLOUT;
+        }
+        Ok(revents)
+    }
 }
 
 pub struct DeviceHandle {
@@ -199,6 +215,10 @@ impl FileHandleService for DeviceHandle {
 
     fn ioctl(&mut self, _pid: Badge, cmd: u32, arg: usize) -> Result<usize, Error> {
         self.device.fops.unlocked_ioctl(cmd, arg)
+    }
+
+    fn poll(&mut self, _pid: Badge, events: u32) -> Result<u32, Error> {
+        self.device.fops.poll(events)
     }
 
     fn ioctl_ex(
@@ -392,6 +412,13 @@ impl FileHandleService for DevTmpFsHandle {
         match self {
             Self::File(h) => h.ioctl(pid, cmd, arg),
             Self::Device(h) => h.ioctl(pid, cmd, arg),
+        }
+    }
+
+    fn poll(&mut self, pid: Badge, events: u32) -> Result<u32, Error> {
+        match self {
+            Self::File(h) => h.poll(pid, events),
+            Self::Device(h) => h.poll(pid, events),
         }
     }
 

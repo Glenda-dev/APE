@@ -6,6 +6,9 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use glenda::cap::{CNode, CapPtr, TCB, TCB_SLOT, VSPACE_SLOT, VSpace};
 use glenda::client::FsClient;
+use glenda::error::Error;
+use glenda::interface::FileHandleService;
+use glenda::ipc::Badge;
 use glenda::io::uring::IoUringClient;
 use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
 use glenda::protocol::auth::IdentityInfo;
@@ -86,6 +89,14 @@ pub struct NormalFileHandle {
     pub fs_ep_slot: CapPtr,
     pub offset: usize,
     pub async_io: Option<AsyncIoState>,
+}
+
+impl NormalFileHandle {
+    pub fn poll(&mut self, events: u32) -> Result<u32, Error> {
+        match self.backend {
+            NormalHandleBackend::Fs => self.fs_client.poll(Badge::null(), events),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

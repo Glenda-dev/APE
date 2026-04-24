@@ -36,6 +36,7 @@ impl<'a> ApeManager<'a> {
         self.mount_rootfs()?;
         self.setup_view()?;
         self.start_vfs_workers()?;
+        self.start_async_runtime()?;
         self.mount_devtmpfs()?;
         self.init_stdio()?;
         self.load_init()?;

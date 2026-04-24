@@ -214,15 +214,20 @@ fn pop_lowest_signal(proc: &mut SubProcess, mask: u64) -> Option<usize> {
 }
 
 pub(crate) fn queue_process_signal(mgr: &mut ApeManager<'_>, pid: usize, signum: usize) -> bool {
-    let should_wake = {
+    let (should_wake, should_interrupt_sleep) = {
         let Some(proc) = mgr.get_process_mut(pid) else {
             return false;
         };
         if !proc.queue_signal(signum) {
             return false;
         }
-        proc.is_waiting_sigsuspend() && (proc.signal_pending & !proc.signal_blocked) != 0
+        let deliverable = (proc.signal_pending & !proc.signal_blocked) != 0;
+        (proc.is_waiting_sigsuspend() && deliverable, deliverable)
     };
+
+    if should_interrupt_sleep {
+        let _ = mgr.interrupt_pending_sleep_reply(pid);
+    }
 
     if should_wake {
         let restored = {

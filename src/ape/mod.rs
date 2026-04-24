@@ -1,3 +1,4 @@
+pub mod async_runtime;
 pub mod bootstrap;
 pub mod fault;
 pub mod fault_policy;
@@ -25,6 +26,8 @@ use glenda::interface::{
 };
 use glenda::ipc::{Badge, MsgFlags, MsgTag, UTCB};
 use glenda::mem::{Perms, TRAMPOLINE_VA, get_trapframe_va, get_utcb_va};
+use glenda::runtime::ThreadPool;
+use glenda::sync::channel::{Receiver, Sender};
 use glenda::utils::align::align_up;
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
 use process::{AsyncIoRegion, AsyncIoState, NormalFileHandle, SubProcess};
@@ -36,6 +39,28 @@ pub struct PendingWaitReply {
     pub target_pid: isize,
     pub wstatus: usize,
     pub caller_pgid: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PendingSleepReply {
+    pub reply_slot: CapPtr,
+    pub rem_ptr: usize,
+    pub deadline_ns: u64,
+    pub request_id: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SleepCompletion {
+    pub pid: usize,
+    pub request_id: usize,
+}
+
+pub struct ApeAsyncRuntime {
+    pub sleep_pool: ThreadPool,
+    pub sleep_done_tx: Sender<SleepCompletion>,
+    pub sleep_done_rx: Receiver<SleepCompletion>,
+    pub next_sleep_request_id: usize,
+    pub pending_sleep_replies: BTreeMap<usize, PendingSleepReply>,
 }
 
 pub struct ApeIpc {
@@ -53,6 +78,7 @@ pub struct ApeManager<'a> {
     runtime_state: ApeRuntimeState,
     fs_state: ApeFsState,
     resource_ledger: ApeResourceLedger,
+    async_runtime: Option<ApeAsyncRuntime>,
     pub dev_vfs_endpoint: Option<Endpoint>,
     pub tmp_vfs_endpoint: Option<Endpoint>,
     pub pipe_vfs_endpoint: Option<Endpoint>,
@@ -108,6 +134,7 @@ impl<'a> ApeManager<'a> {
             runtime_state: ApeRuntimeState::new(ApeConfig::default()),
             fs_state: ApeFsState::new(FS_ASYNC_POOL_BASE_VADDR, 0x10000),
             resource_ledger: ApeResourceLedger::default(),
+            async_runtime: None,
             dev_vfs_endpoint: None,
             tmp_vfs_endpoint: None,
             pipe_vfs_endpoint: None,
