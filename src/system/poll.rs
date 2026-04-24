@@ -128,21 +128,14 @@ fn poll_scan_once(
     Ok(ready_count)
 }
 
-fn poll_fd_once(
-    mgr: &mut ApeManager<'_>,
-    pid: usize,
-    fd: u32,
-    events: u32,
-) -> Result<u32, Error> {
+fn poll_fd_once(mgr: &mut ApeManager<'_>, pid: usize, fd: u32, events: u32) -> Result<u32, Error> {
     let mut handle = {
         let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
         process.fds.remove(&fd).ok_or(Error::InvalidSlot)?
     };
 
-    let result = (|| {
-        match &mut handle.file_type {
-            FileType::Normal(normal) => normal.poll(events),
-        }
+    let result = (|| match &mut handle.file_type {
+        FileType::Normal(normal) => normal.poll(events),
     })();
 
     let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;

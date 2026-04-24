@@ -30,12 +30,13 @@ use glenda::client::{
     AuthClient, FsClient, InitClient, ProcessClient, ResourceClient, TimeClient,
     VirtualTerminalClient, VolumeClient,
 };
-use glenda::interface::{ResourceService, SystemService};
+use glenda::interface::{CSpaceService, ResourceService, SystemService};
 use glenda::ipc::Badge;
 use glenda::protocol::resource::{
     APE_ENDPOINT, FACTOTUM_ENDPOINT, FS_ENDPOINT, INIT_ENDPOINT, ResourceType, TIME_ENDPOINT,
     VOLUME_ENDPOINT, VT_ENDPOINT,
 };
+use glenda::runtime::{RuntimeThreadConfig, init_current_thread};
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
 use layout::*;
 
@@ -90,6 +91,19 @@ fn main() -> usize {
     res_client
         .alloc(Badge::null(), CapType::Endpoint, 0, ENDPOINT_SLOT)
         .expect("Failed to alloc endpoint");
+
+    let main_park_slot =
+        cspace_mgr.alloc(&mut res_client).expect("Failed to alloc APE main park slot");
+    res_client
+        .alloc(Badge::null(), CapType::Endpoint, 0, main_park_slot)
+        .expect("Failed to alloc APE main park endpoint");
+    init_current_thread(RuntimeThreadConfig::new(
+        glenda::cap::Endpoint::from(main_park_slot),
+        CapPtr::null(),
+        CapPtr::null(),
+    ))
+    .expect("Failed to init APE main thread runtime");
+
     // Register APE endpoint to monitor
     res_client
         .register_cap(Badge::null(), ResourceType::Endpoint, APE_ENDPOINT, ENDPOINT_SLOT)

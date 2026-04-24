@@ -17,7 +17,7 @@ use glenda::sync::channel::bounded;
 use linux_raw_sys::errno::EINTR;
 use linux_raw_sys::general::__kernel_timespec;
 
-use super::{ApeAsyncRuntime, PendingSleepReply, SleepCompletion};
+use super::{ApeAsyncEvent, ApeAsyncRuntime, PendingSleepReply, SleepCompletion};
 
 const APE_ASYNC_SLEEP_QUEUE_CAPACITY: usize = 64;
 const APE_ASYNC_WORKER_STACK_SPAN: usize = 0x20_000;
@@ -80,41 +80,14 @@ impl<'a> ApeManager<'a> {
             .build(self.proc_client, &specs)?;
 
         self.async_runtime = Some(ApeAsyncRuntime {
-            sleep_pool,
-            sleep_done_tx,
-            sleep_done_rx,
-            next_sleep_request_id: 1,
+            executor: sleep_pool,
+            completion_tx: sleep_done_tx,
+            completion_rx: sleep_done_rx,
+            next_request_id: 1,
             pending_sleep_replies: Default::default(),
         });
         log!("Async runtime started with {} worker threads", APE_ASYNC_WORKER_COUNT);
         Ok(())
-    }
-
-    fn alloc_pending_reply_slot(&mut self) -> Result<CapPtr, Error> {
-        let src_reply = self.ipc.reply.cap();
-        if src_reply.is_null() {
-            return Err(Error::InvalidCapability);
-        }
-
-        let mut retry = 0usize;
-        let reply_slot = loop {
-            let slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
-            if slot == src_reply {
-                self.cspace_mgr.free(slot);
-                retry = retry.saturating_add(1);
-                if retry > 64 {
-                    return Err(Error::OutOfMemory);
-                }
-                continue;
-            }
-            break slot;
-        };
-
-        if let Err(e) = CSPACE_CAP.transfer_self(src_reply, reply_slot) {
-            self.cspace_mgr.free(reply_slot);
-            return Err(e);
-        }
-        Ok(reply_slot)
     }
 
     pub(crate) fn schedule_nanosleep_async(
@@ -124,24 +97,24 @@ impl<'a> ApeManager<'a> {
         rem_ptr: usize,
     ) -> Result<(), Error> {
         let deadline_ns = self.time_client.mono_now(Badge::null())?.saturating_add(req_ns);
-        let reply_slot = self.alloc_pending_reply_slot()?;
+        let reply_slot = self.reserve_pending_reply_slot()?;
         let sleep_ms = usize::try_from(req_ns.div_ceil(1_000_000)).unwrap_or(usize::MAX);
 
-        let (request_id, sleep_done_tx) = {
+        let (request_id, completion_tx) = {
             let runtime = self.async_runtime.as_mut().ok_or(Error::NotInitialized)?;
-            let request_id = runtime.next_sleep_request_id;
-            runtime.next_sleep_request_id = runtime.next_sleep_request_id.saturating_add(1);
+            let request_id = runtime.next_request_id;
+            runtime.next_request_id = runtime.next_request_id.saturating_add(1);
             runtime
                 .pending_sleep_replies
                 .insert(pid, PendingSleepReply { reply_slot, rem_ptr, deadline_ns, request_id });
-            (request_id, runtime.sleep_done_tx.clone())
+            (request_id, runtime.completion_tx.clone())
         };
 
         let runtime = self.async_runtime.as_ref().ok_or(Error::NotInitialized)?;
-        let _ = runtime.sleep_pool.spawn_blocking(move || {
+        let _ = runtime.executor.spawn(async move {
             let mut time_client = TimeClient::new(TIME_CAP);
             let _ = time_client.sleep(Badge::null(), max(1, sleep_ms));
-            sleep_done_tx.send(SleepCompletion { pid, request_id });
+            completion_tx.send(ApeAsyncEvent::Sleep(SleepCompletion { pid, request_id }));
             let _ = ENDPOINT_CAP.notify(Badge::new(APE_ASYNC_NOTIFY_BADGE_BITS));
         });
         Ok(())
@@ -214,16 +187,18 @@ impl<'a> ApeManager<'a> {
 
     pub(crate) fn drain_async_events(&mut self) -> Result<(), Error> {
         loop {
-            let completion = {
+            let event = {
                 let Some(runtime) = self.async_runtime.as_ref() else {
                     return Ok(());
                 };
-                runtime.sleep_done_rx.try_recv()
+                runtime.completion_rx.try_recv()
             };
-            let Some(completion) = completion else {
+            let Some(event) = event else {
                 break;
             };
-            self.complete_sleep_reply(completion)?;
+            match event {
+                ApeAsyncEvent::Sleep(completion) => self.complete_sleep_reply(completion)?,
+            }
         }
         Ok(())
     }

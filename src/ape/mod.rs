@@ -55,11 +55,16 @@ pub struct SleepCompletion {
     pub request_id: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ApeAsyncEvent {
+    Sleep(SleepCompletion),
+}
+
 pub struct ApeAsyncRuntime {
-    pub sleep_pool: ThreadPool,
-    pub sleep_done_tx: Sender<SleepCompletion>,
-    pub sleep_done_rx: Receiver<SleepCompletion>,
-    pub next_sleep_request_id: usize,
+    pub executor: ThreadPool,
+    pub completion_tx: Sender<ApeAsyncEvent>,
+    pub completion_rx: Receiver<ApeAsyncEvent>,
+    pub next_request_id: usize,
     pub pending_sleep_replies: BTreeMap<usize, PendingSleepReply>,
 }
 
@@ -255,17 +260,7 @@ impl<'a> ApeManager<'a> {
         self.ipc.active_caller_pid = None;
     }
 
-    pub fn queue_wait4_reply(
-        &mut self,
-        pid: usize,
-        target_pid: isize,
-        wstatus: usize,
-        caller_pgid: usize,
-    ) -> Result<(), Error> {
-        if self.ipc.pending_wait_replies.contains_key(&pid) {
-            return Err(Error::WouldBlock);
-        }
-
+    pub(crate) fn reserve_pending_reply_slot(&mut self) -> Result<CapPtr, Error> {
         let src_reply = self.ipc.reply.cap();
         if src_reply.is_null() {
             return Err(Error::InvalidCapability);
@@ -285,10 +280,27 @@ impl<'a> ApeManager<'a> {
             }
             break slot;
         };
+
         if let Err(e) = CSPACE_CAP.transfer_self(src_reply, reply_slot) {
             self.cspace_mgr.free(reply_slot);
             return Err(e);
         }
+
+        Ok(reply_slot)
+    }
+
+    pub fn queue_wait4_reply(
+        &mut self,
+        pid: usize,
+        target_pid: isize,
+        wstatus: usize,
+        caller_pgid: usize,
+    ) -> Result<(), Error> {
+        if self.ipc.pending_wait_replies.contains_key(&pid) {
+            return Err(Error::WouldBlock);
+        }
+
+        let reply_slot = self.reserve_pending_reply_slot()?;
 
         self.ipc
             .pending_wait_replies

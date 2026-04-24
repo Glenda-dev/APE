@@ -94,14 +94,19 @@ impl<'a> ApeManager<'a> {
         Ok(())
     }
 
-    fn alloc_worker_endpoint_and_windows(&mut self) -> Result<(Endpoint, CapPtr, CapPtr), Error> {
+    fn alloc_worker_endpoint_and_windows(
+        &mut self,
+    ) -> Result<(Endpoint, CapPtr, CapPtr, Endpoint), Error> {
         let endpoint_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
         self.res_client.alloc(Badge::null(), CapType::Endpoint, 0, endpoint_slot)?;
 
         let reply_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
         let recv_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
 
-        Ok((Endpoint::from(endpoint_slot), reply_slot, recv_slot))
+        let park_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
+        self.res_client.alloc(Badge::null(), CapType::Endpoint, 0, park_slot)?;
+
+        Ok((Endpoint::from(endpoint_slot), reply_slot, recv_slot, Endpoint::from(park_slot)))
     }
 
     fn alloc_worker_stack(&mut self, stack_base: usize) -> Result<usize, Error> {
@@ -123,26 +128,30 @@ impl<'a> ApeManager<'a> {
     }
 
     fn start_vfs_workers(&mut self) -> Result<(), Error> {
-        let (dev_ep, dev_reply, dev_recv) = self.alloc_worker_endpoint_and_windows()?;
-        let (tmp_ep, tmp_reply, tmp_recv) = self.alloc_worker_endpoint_and_windows()?;
-        let (pipe_ep, pipe_reply, pipe_recv) = self.alloc_worker_endpoint_and_windows()?;
+        let (dev_ep, dev_reply, dev_recv, dev_park) = self.alloc_worker_endpoint_and_windows()?;
+        let (tmp_ep, tmp_reply, tmp_recv, tmp_park) = self.alloc_worker_endpoint_and_windows()?;
+        let (pipe_ep, pipe_reply, pipe_recv, pipe_park) =
+            self.alloc_worker_endpoint_and_windows()?;
 
         let dev_cfg = VfsWorkerConfig {
             endpoint: dev_ep,
             reply_slot: dev_reply,
             recv_slot: dev_recv,
+            park_endpoint: dev_park,
             kind: VfsWorkerKind::DevTmpFs,
         };
         let tmp_cfg = VfsWorkerConfig {
             endpoint: tmp_ep,
             reply_slot: tmp_reply,
             recv_slot: tmp_recv,
+            park_endpoint: tmp_park,
             kind: VfsWorkerKind::TmpFs,
         };
         let pipe_cfg = VfsWorkerConfig {
             endpoint: pipe_ep,
             reply_slot: pipe_reply,
             recv_slot: pipe_recv,
+            park_endpoint: pipe_park,
             kind: VfsWorkerKind::PipeFs,
         };
 
