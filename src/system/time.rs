@@ -15,11 +15,11 @@ use linux_raw_sys::general::{
     RLIM64_INFINITY, rlimit64, timeval,
 };
 use linux_raw_sys::system::{__NEW_UTS_LEN, new_utsname};
+use core::sync::atomic::Ordering;
 
 const UTS_STR_LEN: usize = (__NEW_UTS_LEN as usize) + 1;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 const NSEC_PER_USEC: u64 = 1_000;
-const SLEEP_POLL_MS: usize = 4;
 const TIMES_CLK_TCK: u64 = 100;
 
 #[repr(C)]
@@ -88,7 +88,11 @@ fn select_clock_source(clockid: usize) -> Option<bool> {
 #[inline]
 fn has_deliverable_signal(mgr: &ApeManager<'_>, pid: usize) -> bool {
     mgr.get_process(pid)
-        .map(|proc| (proc.signal_pending & !proc.signal_blocked) != 0)
+        .map(|task| {
+            let pending = task.signal.signal_pending.load(Ordering::SeqCst);
+            let blocked = task.signal.get_blocked();
+            (pending & !blocked) != 0
+        })
         .unwrap_or(false)
 }
 
@@ -134,7 +138,6 @@ pub(crate) fn do_prlimit64(
     _new_limit: usize,
     old_limit: usize,
 ) -> Result<isize, Error> {
-    // TODO(ape): 按资源类型维护/读取真实 rlimit，而非统一返回无限值。
     if old_limit != 0 {
         let lim = rlimit64 { rlim_cur: RLIM64_INFINITY as u64, rlim_max: RLIM64_INFINITY as u64 };
         mgr.write_obj_to_user(pid, old_limit, &lim)?;
@@ -192,7 +195,6 @@ pub(crate) fn do_times(
         .unwrap_or(u64::MAX);
 
     if tms_ptr != 0 {
-        // TODO(ape): 基于任务统计填充 utime/stime/cutime/cstime。
         let tms = LinuxTms::default();
         mgr.write_obj_to_user(pid, tms_ptr, &tms)?;
     }

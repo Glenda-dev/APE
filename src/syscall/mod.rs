@@ -11,6 +11,7 @@ mod entry;
 pub mod fs;
 pub mod io;
 pub mod mm;
+pub mod stub;
 pub mod system;
 pub mod task;
 

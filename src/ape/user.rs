@@ -1,88 +1,83 @@
 use crate::ApeManager;
+use crate::ape::mm::{MemoryMap, MemoryType};
 use crate::ape::policy::SharedPagePoolPolicy;
 use crate::ape::policy::lru::LruPolicy;
-use crate::ape::process::{MemoryMap, MemoryType};
+use crate::ape::task::TaskStruct;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::min;
 use core::mem::size_of;
 use glenda::arch::mem::PGSIZE;
 use glenda::cap::{CapPtr, CapType, Page};
 use glenda::error::Error;
-use glenda::interface::VSpaceService;
-use glenda::interface::{CSpaceService, ResourceService};
+use glenda::interface::{CSpaceService, ResourceService, VSpaceService};
 use glenda::ipc::Badge;
 use glenda::mem::Perms;
 use glenda::utils::align::{align_down, align_up};
 
-/// 对齐 Linux PATH_MAX 的常见值。
 pub const USER_PATH_MAX: usize = 4096;
 pub const USER_EXEC_ARGV_MAX: usize = 256;
 pub const USER_EXEC_ENVP_MAX: usize = 256;
 pub const USER_EXEC_STRING_MAX: usize = 4096;
-pub const USER_SHARED_PAGE_POOL_SLOTS: usize = 8;
+pub const USER_SHARED_PAGE_POOL_SLOTS: usize = 16;
 
-#[derive(Debug, Clone)]
 pub struct ExecveUserInput {
     pub filename: String,
     pub argv: Vec<String>,
     pub envp: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct CachedUserMapping {
-    frame_cap: usize,
-    map_vaddr: usize,
-    map_size: usize,
-    pages: usize,
-    scratch_vaddr: usize,
-    perms: Perms,
+pub struct SharedPagePoolEntry {
+    pub map_vaddr: usize,
+    pub scratch_vaddr: usize,
+    pub pages: usize,
+    pub frame_cap: usize,
+    pub perms: Perms,
 }
 
-struct SharedPagePool<P: SharedPagePoolPolicy> {
-    entries: Vec<Option<CachedUserMapping>>,
-    occupied: Vec<bool>,
-    policy: P,
+pub struct SharedPagePool<P: SharedPagePoolPolicy> {
+    pub entries: [Option<SharedPagePoolEntry>; USER_SHARED_PAGE_POOL_SLOTS],
+    pub occupied: [bool; USER_SHARED_PAGE_POOL_SLOTS],
+    pub policy: P,
 }
 
 impl<P: SharedPagePoolPolicy> SharedPagePool<P> {
-    fn new(capacity: usize, policy: P) -> Self {
+    pub fn new(policy: P) -> Self {
         Self {
-            entries: (0..capacity).map(|_| None).collect(),
-            occupied: alloc::vec![false; capacity],
+            entries: [const { None }; USER_SHARED_PAGE_POOL_SLOTS],
+            occupied: [false; USER_SHARED_PAGE_POOL_SLOTS],
             policy,
         }
     }
 
     fn find_hit(&self, map: &MemoryMap, perms: Perms) -> Option<usize> {
-        self.entries.iter().position(|entry| {
-            entry.as_ref().is_some_and(|e| {
-                e.frame_cap == map.frame_cap
-                    && e.map_vaddr == map.vaddr
-                    && e.map_size == map.size
-                    && e.perms.bits() == perms.bits()
-            })
-        })
-    }
-
-    fn unmap_slot<'a>(&mut self, mgr: &mut ApeManager<'a>, slot: usize) -> Result<(), Error> {
-        if !self.occupied.get(slot).copied().unwrap_or(false) {
-            return Ok(());
+        for i in 0..USER_SHARED_PAGE_POOL_SLOTS {
+            if self.occupied[i] {
+                let entry = self.entries[i].as_ref().unwrap();
+                if entry.frame_cap == map.frame_cap && entry.perms.contains(perms) {
+                    return Some(i);
+                }
+            }
         }
-
-        if let Some(entry) = self.entries[slot].take() {
-            mgr.vspace_mgr.unmap(entry.scratch_vaddr, entry.pages)?;
-        }
-        self.occupied[slot] = false;
-        self.policy.remove(slot);
-        Ok(())
+        None
     }
 
     fn pick_slot(&mut self) -> Result<usize, Error> {
-        if let Some(slot) = self.occupied.iter().position(|used| !*used) {
-            return Ok(slot);
+        for i in 0..USER_SHARED_PAGE_POOL_SLOTS {
+            if !self.occupied[i] {
+                return Ok(i);
+            }
         }
         self.policy.victim(&self.occupied).ok_or(Error::OutOfMemory)
+    }
+
+    fn unmap_slot<'a>(&mut self, mgr: &mut ApeManager<'a>, slot: usize) -> Result<(), Error> {
+        if let Some(entry) = self.entries[slot].take() {
+            mgr.vspace_mgr.unmap(entry.scratch_vaddr, entry.pages)?;
+            self.occupied[slot] = false;
+        }
+        Ok(())
     }
 
     fn acquire<'a>(
@@ -111,44 +106,38 @@ impl<P: SharedPagePoolPolicy> SharedPagePool<P> {
             &mut *mgr.cspace_mgr,
         )?;
 
-        self.entries[slot] = Some(CachedUserMapping {
-            frame_cap: map.frame_cap,
+        self.entries[slot] = Some(SharedPagePoolEntry {
             map_vaddr: map.vaddr,
-            map_size: map.size,
-            pages,
             scratch_vaddr,
+            pages,
+            frame_cap: map.frame_cap,
             perms,
         });
         self.occupied[slot] = true;
-        self.policy.insert(slot);
+        self.policy.touch(slot);
 
         Ok(scratch_vaddr)
     }
 
     fn release_all<'a>(&mut self, mgr: &mut ApeManager<'a>) -> Result<(), Error> {
-        let mut first_err = None;
-        for slot in 0..self.entries.len() {
-            if self.occupied[slot]
-                && let Err(e) = self.unmap_slot(mgr, slot)
-                && first_err.is_none()
-            {
-                first_err = Some(e);
+        for i in 0..USER_SHARED_PAGE_POOL_SLOTS {
+            if self.occupied[i] {
+                self.unmap_slot(mgr, i)?;
             }
         }
-
-        if let Some(e) = first_err { Err(e) } else { Ok(()) }
+        Ok(())
     }
 }
 
-pub(crate) struct UserAccessSession<'m, 'a, P: SharedPagePoolPolicy> {
-    mgr: &'m mut ApeManager<'a>,
-    pid: usize,
-    pool: SharedPagePool<P>,
+pub struct UserAccessSession<'a, 'b, P: SharedPagePoolPolicy> {
+    pub mgr: &'a mut ApeManager<'b>,
+    pub pid: usize,
+    pub pool: SharedPagePool<P>,
 }
 
-impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
-    fn new(mgr: &'m mut ApeManager<'a>, pid: usize, pool_capacity: usize, policy: P) -> Self {
-        Self { mgr, pid, pool: SharedPagePool::new(pool_capacity, policy) }
+impl<'a, 'b, P: SharedPagePoolPolicy> UserAccessSession<'a, 'b, P> {
+    pub fn new(mgr: &'a mut ApeManager<'b>, pid: usize, _slots: usize, policy: P) -> Self {
+        Self { mgr, pid, pool: SharedPagePool::new(policy) }
     }
 
     fn finish(&mut self) -> Result<(), Error> {
@@ -158,8 +147,9 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
     fn try_grow_stack_for_user_addr(&mut self, user_addr: usize) -> Result<bool, Error> {
         let page_addr = align_down(user_addr, PGSIZE);
         let (stack_bottom, max_stack_size, stack_size) = {
-            let process = self.mgr.get_process(self.pid).ok_or(Error::NotFound)?;
-            (process.stack_bottom, process.max_stack_size, process.stack_size)
+            let task = self.mgr.get_process(self.pid).ok_or(Error::NotFound)?;
+            let mm = task.mm.state.read();
+            (mm.stack_bottom, mm.max_stack_size, mm.stack_size)
         };
 
         let stack_low_limit = stack_bottom.saturating_sub(max_stack_size);
@@ -190,8 +180,8 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
                 1,
             )?;
 
-            let process = self.mgr.get_process_mut(self.pid).ok_or(Error::NotFound)?;
-            process.add_memory_map(MemoryMap {
+            let task = self.mgr.get_process(self.pid).ok_or(Error::NotFound)?;
+            task.mm.add_memory_map(MemoryMap {
                 vaddr,
                 paddr: 0,
                 size: PGSIZE,
@@ -202,7 +192,8 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
                 file_backing_fd: None,
                 file_backing_offset: 0,
             });
-            process.stack_size = process.stack_size.saturating_add(PGSIZE);
+            let mut mm_state = task.mm.state.write();
+            mm_state.stack_size = mm_state.stack_size.saturating_add(PGSIZE);
         }
 
         Ok(true)
@@ -210,14 +201,13 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
 
     fn lookup_map(&mut self, user_addr: usize, required: Perms) -> Result<MemoryMap, Error> {
         let map = {
-            let process = self.mgr.get_process(self.pid).ok_or(Error::NotFound)?;
-            process.lookup_memory_map(user_addr).cloned()
+            let task = self.mgr.get_process(self.pid).ok_or(Error::NotFound)?;
+            task.mm.lookup_memory_map(user_addr)
         }
         .or_else(|| match self.try_grow_stack_for_user_addr(user_addr) {
-            Ok(true) => self
-                .mgr
-                .get_process(self.pid)
-                .and_then(|process| process.lookup_memory_map(user_addr).cloned()),
+            Ok(true) => {
+                self.mgr.get_process(self.pid).and_then(|task| task.mm.lookup_memory_map(user_addr))
+            }
             _ => None,
         })
         .ok_or(Error::InvalidAddress)?;
@@ -263,47 +253,6 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
         Ok(())
     }
 
-    /// 直接将用户空间数据复制到目标原始指针地址。
-    ///
-    /// 该接口用于 io_uring 快路径，避免通过临时切片造成额外中间层。
-    pub(crate) fn copy_from_user_to_ptr(
-        &mut self,
-        user_src: usize,
-        dst_ptr: *mut u8,
-        len: usize,
-    ) -> Result<(), Error> {
-        if len == 0 {
-            return Ok(());
-        }
-        if user_src == 0 || dst_ptr.is_null() {
-            return Err(Error::InvalidAddress);
-        }
-
-        let mut copied = 0usize;
-        let mut cursor = user_src;
-
-        while copied < len {
-            let map = self.lookup_map(cursor, Perms::READ)?;
-
-            let start = cursor - map.vaddr;
-            let chunk = min(map.size - start, len - copied);
-            if chunk == 0 {
-                return Err(Error::InvalidAddress);
-            }
-
-            let scratch = self.pool.acquire(self.mgr, &map, Perms::READ)?;
-            let src_ptr = (scratch + start) as *const u8;
-            unsafe {
-                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr.add(copied), chunk);
-            }
-
-            copied += chunk;
-            cursor = cursor.saturating_add(chunk);
-        }
-
-        Ok(())
-    }
-
     pub(crate) fn copy_to_user(&mut self, user_dst: usize, src: &[u8]) -> Result<(), Error> {
         if src.is_empty() {
             return Ok(());
@@ -324,56 +273,10 @@ impl<'m, 'a, P: SharedPagePoolPolicy> UserAccessSession<'m, 'a, P> {
                 return Err(Error::InvalidAddress);
             }
 
-            // RISC-V 要求可写页同时具备可读属性（W=1 且 R=0 为无效叶子 PTE）。
-            // 对用户页执行 copy_to_user 时，scratch 映射必须至少是 RW，
-            // 否则在 memcpy 写入路径上可能触发 page fault。
             let scratch = self.pool.acquire(self.mgr, &map, Perms::READ | Perms::WRITE)?;
             let dst =
                 unsafe { core::slice::from_raw_parts_mut((scratch + start) as *mut u8, chunk) };
             dst.copy_from_slice(&src[copied..copied + chunk]);
-
-            copied += chunk;
-            cursor = cursor.saturating_add(chunk);
-        }
-
-        Ok(())
-    }
-
-    /// 从源原始指针地址直接复制到用户空间。
-    ///
-    /// 该接口用于 io_uring 快路径，确保 APE -> 用户空间单次搬运。
-    pub(crate) fn copy_to_user_from_ptr(
-        &mut self,
-        user_dst: usize,
-        src_ptr: *const u8,
-        len: usize,
-    ) -> Result<(), Error> {
-        if len == 0 {
-            return Ok(());
-        }
-        if user_dst == 0 || src_ptr.is_null() {
-            return Err(Error::InvalidAddress);
-        }
-
-        let mut copied = 0usize;
-        let mut cursor = user_dst;
-
-        while copied < len {
-            let map = self.lookup_map(cursor, Perms::WRITE)?;
-
-            let start = cursor - map.vaddr;
-            let chunk = min(map.size - start, len - copied);
-            if chunk == 0 {
-                return Err(Error::InvalidAddress);
-            }
-
-            // RISC-V 要求可写页同时具备可读属性（W=1 且 R=0 为无效叶子 PTE）。
-            // 对用户页执行 copy_to_user 时，scratch 映射必须至少是 RW。
-            let scratch = self.pool.acquire(self.mgr, &map, Perms::READ | Perms::WRITE)?;
-            let dst_ptr = (scratch + start) as *mut u8;
-            unsafe {
-                core::ptr::copy_nonoverlapping(src_ptr.add(copied), dst_ptr, chunk);
-            }
 
             copied += chunk;
             cursor = cursor.saturating_add(chunk);
@@ -494,7 +397,6 @@ impl<'a> ApeManager<'a> {
         }
     }
 
-    /// Linux 风格 `copy_from_user`：从用户地址空间复制到内核缓冲区。
     pub fn copy_from_user(
         &mut self,
         pid: usize,
@@ -504,12 +406,10 @@ impl<'a> ApeManager<'a> {
         self.with_user_session(pid, |sess| sess.copy_from_user(user_src, dst))
     }
 
-    /// Linux 风格 `copy_to_user`：从内核缓冲区复制到用户地址空间。
     pub fn copy_to_user(&mut self, pid: usize, user_dst: usize, src: &[u8]) -> Result<(), Error> {
         self.with_user_session(pid, |sess| sess.copy_to_user(user_dst, src))
     }
 
-    /// 将用户地址空间 `[user_ptr, user_ptr + len)` 填充为 0。
     pub fn write_zeros_to_user(
         &mut self,
         pid: usize,
@@ -530,12 +430,6 @@ impl<'a> ApeManager<'a> {
         Ok(())
     }
 
-    /// Linux 风格 `strncpy_from_user`：读取用户态 NUL 结尾字符串。
-    ///
-    /// - 成功：返回不带结尾 NUL 的 Rust `String`。
-    /// - 失败：
-    ///   - 无效地址/权限返回 `InvalidAddress`；
-    ///   - 超过 `max_len` 仍未遇到 NUL 返回 `MessageTooLong`。
     pub fn strncpy_from_user(
         &mut self,
         pid: usize,

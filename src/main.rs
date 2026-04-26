@@ -37,18 +37,25 @@ use glenda::protocol::resource::{
     VOLUME_ENDPOINT, VT_ENDPOINT,
 };
 use glenda::runtime::{RuntimeThreadConfig, init_current_thread};
+use glenda::sync::mutex::Mutex;
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
 use layout::*;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 
 #[unsafe(no_mangle)]
 fn main() -> usize {
     glenda::console::init_logging("APE");
     log!("Starting ANSI/POSIX Environment...");
 
-    let mut cspace_mgr = CSpaceManager::new(CSPACE_CAP, CSPACE_DYNAMIC_L1_START_SLOT);
-    let mut vspace_mgr = VSpaceManager::new(VSPACE_CAP, VSPACE_SCRATCH_START, VSPACE_SCRATCH_END);
-    let mut res_client = ResourceClient::new(MONITOR_CAP);
-    let mut proc_client = ProcessClient::new(MONITOR_CAP);
+    let cspace_mgr = Box::leak(Box::new(CSpaceManager::new(CSPACE_CAP, CSPACE_DYNAMIC_L1_START_SLOT)));
+    let vspace_mgr = Box::leak(Box::new(VSpaceManager::new(
+        VSPACE_CAP,
+        VSPACE_SCRATCH_START,
+        VSPACE_SCRATCH_END - VSPACE_SCRATCH_START,
+    )));
+    let res_client = Box::leak(Box::new(ResourceClient::new(MONITOR_CAP)));
+    let proc_client = Box::leak(Box::new(ProcessClient::new(MONITOR_CAP)));
 
     let stat = res_client.status(Badge::null()).expect("Failed to get system status");
     let mem = stat.memory;
@@ -61,39 +68,39 @@ fn main() -> usize {
     res_client
         .get_cap(Badge::null(), ResourceType::Endpoint, INIT_ENDPOINT, INIT_SLOT)
         .expect("Failed to get init endpoint");
-    let mut init_client = InitClient::new(INIT_CAP);
+    let init_client = Box::leak(Box::new(InitClient::new(INIT_CAP)));
 
     res_client
         .get_cap(Badge::null(), ResourceType::Endpoint, FS_ENDPOINT, FS_SLOT)
         .expect("Failed to get fs endpoint");
-    let mut fs_client = FsClient::new(FS_CAP);
+    let fs_client = Box::leak(Box::new(FsClient::new(FS_CAP)));
 
     res_client
         .get_cap(Badge::null(), ResourceType::Endpoint, VOLUME_ENDPOINT, VOLUME_SLOT)
         .expect("Failed to get volume endpoint");
-    let mut vol_client = VolumeClient::new_simple(VOLUME_CAP, &res_client);
+    let vol_client = Box::leak(Box::new(VolumeClient::new_simple(VOLUME_CAP, res_client)));
 
     res_client
         .get_cap(Badge::null(), ResourceType::Endpoint, VT_ENDPOINT, VT_SLOT)
         .expect("Failed to get vt endpoint");
-    let mut vt_client = VirtualTerminalClient::new(VT_CAP);
+    let vt_client = Box::leak(Box::new(VirtualTerminalClient::new(VT_CAP)));
 
     res_client
         .get_cap(Badge::null(), ResourceType::Endpoint, TIME_ENDPOINT, TIME_SLOT)
         .expect("Failed to get time endpoint");
-    let mut time_client = TimeClient::new(TIME_CAP);
+    let time_client = Box::leak(Box::new(TimeClient::new(TIME_CAP)));
 
     res_client
         .get_cap(Badge::null(), ResourceType::Endpoint, FACTOTUM_ENDPOINT, AUTH_SLOT)
         .expect("Failed to get factotum endpoint");
-    let mut auth_client = AuthClient::new(AUTH_CAP);
+    let auth_client = Box::leak(Box::new(AuthClient::new(AUTH_CAP)));
 
     res_client
         .alloc(Badge::null(), CapType::Endpoint, 0, ENDPOINT_SLOT)
         .expect("Failed to alloc endpoint");
 
     let main_park_slot =
-        cspace_mgr.alloc(&mut res_client).expect("Failed to alloc APE main park slot");
+        cspace_mgr.alloc(&mut *res_client).expect("Failed to alloc APE main park slot");
     res_client
         .alloc(Badge::null(), CapType::Endpoint, 0, main_park_slot)
         .expect("Failed to alloc APE main park endpoint");
@@ -109,21 +116,22 @@ fn main() -> usize {
         .register_cap(Badge::null(), ResourceType::Endpoint, APE_ENDPOINT, ENDPOINT_SLOT)
         .expect("Failed to register APE endpoint");
 
-    let mut ape_mgr = ApeManager::new(
-        &mut init_client,
-        &mut proc_client,
-        &mut res_client,
-        &mut vt_client,
-        &mut vol_client,
-        &mut fs_client,
-        &mut time_client,
-        &mut auth_client,
-        &mut cspace_mgr,
-        &mut vspace_mgr,
-    );
+    let mut ape_mgr = Box::new(ApeManager::new(
+        init_client,
+        proc_client,
+        res_client,
+        vt_client,
+        vol_client,
+        fs_client,
+        time_client,
+        auth_client,
+        cspace_mgr,
+        vspace_mgr,
+    ));
 
     ape_mgr.listen(ENDPOINT_CAP, REPLY_SLOT, RECV_SLOT).expect("Failed to listen");
     ape_mgr.init().expect("Failed to init");
-    ape_mgr.run().expect("Failed to run");
+    let shared = ape::server::ApeSharedManager(Arc::new(Mutex::new(*ape_mgr)));
+    ape::server::run_multithreaded(shared);
     0
 }

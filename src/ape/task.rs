@@ -1,739 +1,130 @@
-use crate::ApeManager;
-use crate::ape::process::{MemoryMap, MemoryType};
-use crate::elf::ElfFile;
-use crate::layout::APE_SLOT;
-use crate::syscall::map_error_to_errno;
-use crate::system::signal::queue_process_signal;
-use alloc::collections::BTreeMap;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::cmp::{max, min};
-use core::mem::size_of;
-use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Endpoint, Page, Reply};
-use glenda::error::Error;
-use glenda::interface::{
-    CSpaceService, FileHandleService, FileSystemService, ProcessService, ResourceService,
-    ThreadService, VSpaceService,
-};
-use glenda::ipc::{Badge, UTCB};
-use glenda::mem::get_utcb_va;
-use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
-use glenda::protocol::fs::OpenFlags;
-use glenda::utils::align::{align_down, align_up};
-use linux_raw_sys::auxvec::{AT_BASE, AT_ENTRY, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM};
-use linux_raw_sys::elf::{ET_DYN, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
-use linux_raw_sys::elf_uapi::ET_EXEC;
-use linux_raw_sys::errno::ECHILD;
-use linux_raw_sys::general::SIGCHLD;
+use crate::ape::cred::CredStruct;
+use crate::ape::files::FilesStruct;
+use crate::ape::fs::FsStruct;
+use crate::ape::mm::MmStruct;
+use crate::ape::signal::{SighandStruct, SignalStruct};
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use glenda::cap::{CNode, TCB};
 
-const INITIAL_STACK_ALIGN: usize = 16;
-const PIE_LOAD_BIAS: usize = 0;
-const INTERP_LOAD_GAP: usize = 0x10_0000;
-const INITIAL_TLS_PAGES: usize = 4;
-const INITIAL_TLS_GAP_PAGES: usize = 8;
-
-struct LoadedElfInfo {
-    entry: usize,
-    load_end: usize,
-    phdr_vaddr: Option<usize>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum TaskLifecycleState {
+    Running = 0,
+    Stopped = 1,
+    Exiting = 2,
+    Exited = 3,
 }
 
-impl<'a> ApeManager<'a> {
-    fn try_wake_pending_wait4_reply(&mut self, parent_pid: usize) -> bool {
-        let Some(pending) = self.peek_wait4_reply(parent_pid) else {
-            return false;
-        };
-
-        let ret = if let Some((reaped_pid, status)) =
-            self.pop_waitable_exited_child(parent_pid, pending.target_pid, pending.caller_pgid)
-        {
-            if pending.wstatus != 0
-                && let Err(e) =
-                    self.copy_to_user(parent_pid, pending.wstatus, &status.to_ne_bytes())
-            {
-                map_error_to_errno(e)
-            } else {
-                reaped_pid as isize
-            }
-        } else if !self.has_waitable_child(parent_pid, pending.target_pid, pending.caller_pgid) {
-            -(ECHILD as isize)
-        } else {
-            return false;
-        };
-
-        let Some(pending) = self.take_wait4_reply(parent_pid) else {
-            return false;
-        };
-
-        if let Some(parent) = self.get_process_mut(parent_pid) {
-            parent.clear_wait4_block();
+impl From<i32> for TaskLifecycleState {
+    fn from(v: i32) -> Self {
+        match v {
+            0 => Self::Running,
+            1 => Self::Stopped,
+            2 => Self::Exiting,
+            3 => Self::Exited,
+            _ => Self::Running,
         }
-
-        let mut utcb = unsafe { UTCB::new() };
-        utcb.clear();
-        utcb.set_mr(0, ret as usize);
-
-        if let Err(e) = Reply::from(pending.reply_slot).reply(&mut utcb) {
-            warn!(
-                "wait4: failed to reply pending wait4 pid={} via slot {:?}: {:?}",
-                parent_pid, pending.reply_slot, e
-            );
-        }
-        let _ = CSPACE_CAP.delete(pending.reply_slot);
-        self.cspace_mgr.free(pending.reply_slot);
-        true
     }
+}
 
-    fn encode_wait_status(exit_code: usize) -> i32 {
-        ((exit_code & 0xff) as i32) << 8
-    }
+pub struct TaskStruct {
+    pub pid: usize,
+    pub parent_pid: AtomicUsize,
+    pub session_id: AtomicUsize,
+    pub process_group_id: AtomicUsize,
+    pub controlling_tty: AtomicUsize,
 
-    pub(crate) fn release_process_frame_slot(
-        &mut self,
+    pub tcb: TCB,
+    pub cspace: CNode,
+
+    pub lifecycle: AtomicI32,
+    pub stopped: AtomicBool,
+
+    pub mm: Arc<MmStruct>,
+    pub files: Arc<FilesStruct>,
+    pub fs: Arc<FsStruct>,
+    pub sighand: Arc<SighandStruct>,
+    pub signal: Arc<SignalStruct>,
+    pub cred: Arc<CredStruct>,
+}
+
+impl TaskStruct {
+    pub fn new(
         pid: usize,
-        slot: CapPtr,
-        pages: usize,
-        reason: &str,
-    ) {
-        if !self.release_shared_frame_cap(slot) {
-            return;
-        }
-
-        let released = match self.res_client.free(Badge::null(), slot) {
-            Ok(()) => true,
-            Err(e)
-                if e == Error::InvalidCapability
-                    || e == Error::InvalidSlot
-                    || e == Error::NotSupported =>
-            {
-                true
-            }
-            Err(e) => {
-                warn!(
-                    "exit: failed to free frame cap {:?} (pid={}, reason={}): {:?}",
-                    slot, pid, reason, e
-                );
-                false
-            }
-        };
-
-        if released {
-            let _ = CSPACE_CAP.delete(slot);
-            self.cspace_mgr.free(slot);
-            self.ledger_record_frame_free(pid, slot, pages, reason);
-        }
-    }
-
-    fn release_process_cnode_cap(&mut self, pid: usize) {
-        if let Some(slot) = self.get_process(pid).map(|p| p.cnode_cap.cap()) {
-            let _ = CSPACE_CAP.revoke(slot);
-            if let Err(e) = CSPACE_CAP.delete(slot)
-                && e != Error::InvalidCapability
-                && e != Error::InvalidSlot
-            {
-                warn!("exit: failed to delete child cnode slot {:?}: {:?}", slot, e);
-            } else {
-                self.cspace_mgr.free(slot);
-            }
-        }
-    }
-
-    pub(crate) fn kill_host_process_by_local_pid(&mut self, pid: usize) {
-        let host_pid = self.host_pid_by_local(pid);
-
-        if let Some(host_pid) = host_pid {
-            let _ = self.proc_client.kill(Badge::null(), host_pid);
-            self.remove_host_pid_mapping(host_pid);
-        }
-    }
-
-    fn terminate_process_impl(
-        &mut self,
-        pid: usize,
-        exit_code: usize,
-        panic_if_init: bool,
-    ) -> Result<(), Error> {
-        let (fd_list, mapped_pages, frame_pages, parent_pid, process_group_id) = {
-            let process = self.get_process(pid).ok_or(Error::NotFound)?;
-            let fd_list = process.fds.keys().copied().collect::<Vec<u32>>();
-            let mapped_pages = process
-                .memory_maps
-                .values()
-                .map(|m| (m.vaddr, align_up(m.size, PGSIZE) / PGSIZE))
-                .collect::<Vec<(usize, usize)>>();
-            let mut frame_pages = BTreeMap::new();
-            for map in process.memory_maps.values() {
-                if map.frame_cap == 0 {
-                    continue;
-                }
-                let slot = CapPtr::from(map.frame_cap);
-                let pages = align_up(map.size, PGSIZE) / PGSIZE;
-                let entry = frame_pages.entry(slot).or_insert(0usize);
-                *entry = core::cmp::max(*entry, pages);
-            }
-            (fd_list, mapped_pages, frame_pages, process.parent_pid, process.process_group_id)
-        };
-
-        for fd in fd_list {
-            let _ = crate::fs::fd::do_close(self, pid, fd as usize);
-        }
-
-        for (vaddr, pages) in mapped_pages {
-            if pages > 0 {
-                let _ = self.unmap_process_pages(pid, vaddr, pages);
-            }
-        }
-
-        for (slot, pages) in frame_pages {
-            self.release_process_frame_slot(pid, slot, pages, "process_exit_memory_map");
-        }
-
-        self.release_process_cnode_cap(pid);
-        let should_skip_reply = self.ipc.active_caller_pid == Some(pid);
-        self.kill_host_process_by_local_pid(pid);
-
-        let _ = self.release_process_intermediate_page_tables(pid);
-        self.drop_wait4_reply(pid);
-        self.drop_pending_sleep_reply(pid);
-
-        let _ = self.ledger_take_process(pid);
-
-        self.remove_process_record(pid);
-
-        if parent_pid != 0 {
-            self.record_child_exit(
-                parent_pid,
-                pid,
-                Self::encode_wait_status(exit_code),
-                process_group_id,
-            );
-
-            let replied_wait4 = self.try_wake_pending_wait4_reply(parent_pid);
-            if !replied_wait4 {
-                let should_resume_wait4 = self
-                    .get_process(parent_pid)
-                    .map(|parent| parent.wait4_block_matches(pid, process_group_id))
-                    .unwrap_or(false);
-
-                if should_resume_wait4 {
-                    if let Some(parent) = self.get_process_mut(parent_pid) {
-                        parent.clear_wait4_block();
-                    }
-                    if let Some(parent) = self.get_process(parent_pid)
-                        && let Err(e) = parent.tcb().resume()
-                    {
-                        warn!(
-                            "wait4: failed to resume parent pid={} on child exit pid={}: {:?}",
-                            parent_pid, pid, e
-                        );
-                    }
-                }
-
-                let _ = queue_process_signal(self, parent_pid, SIGCHLD as usize);
-            }
-        }
-
-        if panic_if_init && pid == 1 {
-            panic!(
-                "Init process faulted with exit code {:#x}, shutting down Ape service",
-                exit_code
-            );
-        }
-
-        if should_skip_reply {
-            if let Err(e) = CSPACE_CAP.delete(self.ipc.reply.cap())
-                && e != Error::InvalidCapability
-                && e != Error::InvalidSlot
-            {
-                warn!("exit: failed to clear fixed reply slot {:?}: {:?}", self.ipc.reply.cap(), e);
-            }
-            Err(Error::Success)
-        } else {
-            Ok(())
-        }
-    }
-
-    pub(crate) fn terminate_process(
-        &mut self,
-        pid: usize,
-        exit_code: usize,
-        panic_if_init: bool,
-    ) -> Result<(), Error> {
-        self.terminate_process_impl(pid, exit_code, panic_if_init)
-    }
-
-    pub(crate) fn terminate_process_preserve_reply(
-        &mut self,
-        pid: usize,
-        exit_code: usize,
-        panic_if_init: bool,
-    ) -> Result<(), Error> {
-        self.terminate_process_impl(pid, exit_code, panic_if_init)
-    }
-    fn close_cloexec_fds(&mut self, pid: usize) -> Result<(), Error> {
-        let cloexec_fds: Vec<u32> = {
-            let process = self.get_process(pid).ok_or(Error::NotFound)?;
-            process
-                .fd_cloexec
-                .iter()
-                .filter_map(|(fd, cloexec)| if *cloexec { Some(*fd) } else { None })
-                .collect()
-        };
-
-        for fd in cloexec_fds {
-            let _ = crate::fs::fd::do_close(self, pid, fd as usize)?;
-        }
-
-        Ok(())
-    }
-
-    fn read_exec_image_from_fs(&mut self, pid: usize, path: &str) -> Result<Vec<u8>, Error> {
-        let stat = match self.fs_client.stat_path(Badge::null(), path) {
-            Ok(stat) => stat,
-            Err(e) => {
-                error!("execve: stat_path failed pid={} path={} err={:?}", pid, path, e);
-                return Err(e);
-            }
-        };
-        let size = stat.size as usize;
-        if size == 0 {
-            error!("read_exec_image_from_fs: exec image has zero size");
-            return Err(Error::InvalidArgs);
-        }
-        let fs_ep_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
-        let mut fs_open_client = glenda::client::FsClient::new(self.fs_client.endpoint());
-        if let Err(e) = fs_open_client.open(Badge::null(), path, OpenFlags::O_RDONLY, 0, fs_ep_slot)
-        {
-            let _ = CSPACE_CAP.delete(fs_ep_slot);
-            self.cspace_mgr.free(fs_ep_slot);
-            error!("execve: open failed pid={} path={} err={:?}", pid, path, e);
-            return Err(e);
-        }
-        let fs_ep = Endpoint::from(fs_ep_slot);
-        let mut handle_client = glenda::client::FsClient::new(fs_ep);
-
-        let mut elf_data = alloc::vec![0u8; size];
-        let mut offset = 0;
-        while offset < size {
-            let read_len = match handle_client.read(Badge::null(), offset, &mut elf_data[offset..])
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    error!(
-                        "execve: read failed pid={} path={} off={} remain={} err={:?}",
-                        pid,
-                        path,
-                        offset,
-                        size.saturating_sub(offset),
-                        e
-                    );
-                    let _ = handle_client.close(Badge::null());
-                    let _ = CSPACE_CAP.delete(fs_ep_slot);
-                    self.cspace_mgr.free(fs_ep_slot);
-                    return Err(e);
-                }
-            };
-            if read_len == 0 {
-                error!("read_exec_image_from_fs: unexpected EOF while reading exec image");
-                handle_client.close(Badge::null())?;
-                let _ = CSPACE_CAP.delete(fs_ep_slot);
-                self.cspace_mgr.free(fs_ep_slot);
-                return Err(Error::IoError);
-            }
-            offset += read_len;
-        }
-        if let Err(e) = handle_client.close(Badge::null()) {
-            error!("execve: close failed pid={} path={} err={:?}", pid, path, e);
-            let _ = CSPACE_CAP.delete(fs_ep_slot);
-            self.cspace_mgr.free(fs_ep_slot);
-            return Err(e);
-        }
-        let _ = CSPACE_CAP.delete(fs_ep_slot);
-        self.cspace_mgr.free(fs_ep_slot);
-        Ok(elf_data)
-    }
-
-    fn setup_initial_stack(
-        &mut self,
-        pid: usize,
-        fallback_arg0: &str,
-        argv: &[String],
-        envp: &[String],
-        auxv: &[(usize, usize)],
-    ) -> Result<usize, Error> {
-        let stack_page_vaddr = STACK_BASE - PGSIZE;
-        let perms = Perms::READ | Perms::WRITE;
-
-        let frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
-        self.res_client.alloc(Badge::null(), CapType::Page, 1, frame_slot)?;
-        self.ledger_record_frame_alloc(pid, frame_slot, 1, "setup_initial_stack");
-        let frame = Page::from(frame_slot);
-
-        self.map_process_frame(pid, frame, stack_page_vaddr, perms, 1)?;
-
-        let scratch_vaddr = self.vspace_mgr.map_scratch(
-            frame,
-            perms,
-            1,
-            &mut *self.res_client,
-            &mut *self.cspace_mgr,
-        )?;
-
-        let stack = unsafe { core::slice::from_raw_parts_mut(scratch_vaddr as *mut u8, PGSIZE) };
-        stack.fill(0);
-
-        let mut sp = PGSIZE;
-
-        let effective_argv: Vec<&str> = if argv.is_empty() {
-            alloc::vec![fallback_arg0]
-        } else {
-            argv.iter().map(|s| s.as_str()).collect()
-        };
-
-        let mut argv_ptrs = Vec::with_capacity(effective_argv.len());
-        for arg in effective_argv.iter().rev() {
-            let bytes = arg.as_bytes();
-            let need = bytes.len().checked_add(1).ok_or(Error::OutOfMemory)?;
-            if sp < need {
-                return Err(Error::OutOfMemory);
-            }
-            sp -= need;
-            stack[sp..sp + bytes.len()].copy_from_slice(bytes);
-            stack[sp + bytes.len()] = 0;
-            argv_ptrs.push(stack_page_vaddr + sp);
-        }
-        argv_ptrs.reverse();
-
-        let mut envp_ptrs = Vec::with_capacity(envp.len());
-        for env in envp.iter().rev() {
-            let bytes = env.as_bytes();
-            let need = bytes.len().checked_add(1).ok_or(Error::OutOfMemory)?;
-            if sp < need {
-                return Err(Error::OutOfMemory);
-            }
-            sp -= need;
-            stack[sp..sp + bytes.len()].copy_from_slice(bytes);
-            stack[sp + bytes.len()] = 0;
-            envp_ptrs.push(stack_page_vaddr + sp);
-        }
-        envp_ptrs.reverse();
-
-        // Linux/musl 兼容启动栈：
-        // [argc][argv...][NULL][envp...][NULL][auxv...][AT_NULL][0]
-        let mut words = Vec::new();
-        words.push(argv_ptrs.len());
-        words.extend(argv_ptrs.iter().copied());
-        words.push(0);
-        words.extend(envp_ptrs.iter().copied());
-        words.push(0);
-        for (k, v) in auxv {
-            words.push(*k);
-            words.push(*v);
-        }
-        words.push(0); // AT_NULL
-        words.push(0);
-
-        let words_size = words.len().checked_mul(size_of::<usize>()).ok_or(Error::OutOfMemory)?;
-        if sp < words_size {
-            return Err(Error::OutOfMemory);
-        }
-        sp -= words_size;
-        sp &= !(INITIAL_STACK_ALIGN - 1);
-
-        if sp.checked_add(words_size).ok_or(Error::OutOfMemory)? > PGSIZE {
-            return Err(Error::OutOfMemory);
-        }
-
-        for (idx, word) in words.iter().enumerate() {
-            let start = sp + idx * size_of::<usize>();
-            let end = start + size_of::<usize>();
-            stack[start..end].copy_from_slice(&word.to_ne_bytes());
-        }
-
-        self.vspace_mgr.unmap(scratch_vaddr, 1)?;
-
-        if let Some(process) = self.get_process_mut(pid) {
-            process.add_memory_map(MemoryMap {
-                vaddr: stack_page_vaddr,
-                paddr: 0,
-                size: PGSIZE,
-                flags: perms,
-                mem_type: MemoryType::Stack,
-                cow: false,
-                frame_cap: frame_slot.bits(),
-                file_backing_fd: None,
-                file_backing_offset: 0,
-            });
-            process.stack_size = PGSIZE;
-        }
-
-        Ok(stack_page_vaddr + sp)
-    }
-
-    fn setup_initial_tls(&mut self, pid: usize) -> Result<usize, Error> {
-        let tls_start = get_utcb_va(0)
-            .saturating_sub(INITIAL_TLS_GAP_PAGES * PGSIZE)
-            .saturating_sub(INITIAL_TLS_PAGES * PGSIZE);
-        let tls_size = INITIAL_TLS_PAGES * PGSIZE;
-
-        let frame_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
-        let tls_level =
-            CapType::page_pages_to_level(INITIAL_TLS_PAGES).ok_or(Error::InvalidArgs)?;
-        self.res_client.alloc(Badge::null(), CapType::Page, tls_level, frame_slot)?;
-        self.ledger_record_frame_alloc(pid, frame_slot, INITIAL_TLS_PAGES, "setup_initial_tls");
-        let frame = Page::from(frame_slot);
-
-        self.map_process_frame(
+        parent_pid: usize,
+        tcb: TCB,
+        cspace: CNode,
+        mm: Arc<MmStruct>,
+        files: Arc<FilesStruct>,
+        fs: Arc<FsStruct>,
+        sighand: Arc<SighandStruct>,
+        signal: Arc<SignalStruct>,
+        cred: Arc<CredStruct>,
+    ) -> Self {
+        Self {
             pid,
-            frame,
-            tls_start,
-            Perms::READ | Perms::WRITE,
-            INITIAL_TLS_PAGES,
-        )?;
-
-        let scratch_vaddr = self.vspace_mgr.map_scratch(
-            frame,
-            Perms::READ | Perms::WRITE,
-            INITIAL_TLS_PAGES,
-            &mut *self.res_client,
-            &mut *self.cspace_mgr,
-        )?;
-        let tls_slice =
-            unsafe { core::slice::from_raw_parts_mut(scratch_vaddr as *mut u8, tls_size) };
-        tls_slice.fill(0);
-        self.vspace_mgr.unmap(scratch_vaddr, INITIAL_TLS_PAGES)?;
-
-        if let Some(process) = self.get_process_mut(pid) {
-            process.add_memory_map(MemoryMap {
-                vaddr: tls_start,
-                paddr: 0,
-                size: tls_size,
-                flags: Perms::READ | Perms::WRITE,
-                mem_type: MemoryType::Anonymous,
-                cow: false,
-                frame_cap: frame_slot.bits(),
-                file_backing_fd: None,
-                file_backing_offset: 0,
-            });
+            parent_pid: AtomicUsize::new(parent_pid),
+            session_id: AtomicUsize::new(pid),
+            process_group_id: AtomicUsize::new(pid),
+            controlling_tty: AtomicUsize::new(0),
+            tcb,
+            cspace,
+            lifecycle: AtomicI32::new(TaskLifecycleState::Running as i32),
+            stopped: AtomicBool::new(false),
+            mm,
+            files,
+            fs,
+            sighand,
+            signal,
+            cred,
         }
-
-        // 将 tp 放在 TLS 区中间，兼容动态加载器早期的正负偏移访问。
-        Ok(tls_start + tls_size / 2)
     }
 
-    fn load_elf_into_process(
-        &mut self,
-        pid: usize,
-        elf_data: &[u8],
-        load_bias: usize,
-    ) -> Result<LoadedElfInfo, Error> {
-        let elf = ElfFile::new(elf_data)
-            .map_err(|e| error!("Failed to parse ELF file: {}", e))
-            .map_err(|_| Error::InvalidArgs)?;
-
-        let mut load_end = 0usize;
-        let mut phdr_vaddr = None;
-
-        for phdr in elf.program_headers() {
-            if phdr.p_type == PT_PHDR {
-                phdr_vaddr = Some(load_bias + phdr.p_vaddr as usize);
-            }
-            if phdr.p_type != PT_LOAD {
-                continue;
-            }
-
-            let vaddr = phdr.p_vaddr as usize;
-            let mem_size = phdr.p_memsz as usize;
-            let file_size = phdr.p_filesz as usize;
-            let offset = phdr.p_offset as usize;
-
-            if mem_size == 0 {
-                continue;
-            }
-
-            let seg_start = load_bias + vaddr;
-            let seg_end = seg_start + mem_size;
-            if seg_end > load_end {
-                load_end = seg_end;
-            }
-
-            let mut perms = Perms::READ;
-            if phdr.p_flags & PF_W != 0 {
-                perms |= Perms::WRITE;
-            }
-            if phdr.p_flags & PF_X != 0 {
-                perms |= Perms::EXECUTE;
-            }
-
-            let start_page = align_down(seg_start, PGSIZE);
-            let end_page = align_up(seg_end, PGSIZE);
-            let num_pages = (end_page - start_page) / PGSIZE;
-
-            for i in 0..num_pages {
-                let page_vaddr = start_page + i * PGSIZE;
-
-                let frame_cap = self.cspace_mgr.alloc(&mut *self.res_client)?;
-                self.res_client.alloc(Badge::null(), CapType::Page, 1, frame_cap)?;
-                self.ledger_record_frame_alloc(pid, frame_cap, 1, "load_elf_segment_page");
-                let frame = Page::from(frame_cap);
-
-                self.map_process_frame(pid, frame, page_vaddr, perms, 1)?;
-
-                if let Some(process) = self.get_process_mut(pid) {
-                    process.add_memory_map(MemoryMap {
-                        vaddr: page_vaddr,
-                        paddr: 0,
-                        size: PGSIZE,
-                        flags: perms,
-                        mem_type: MemoryType::Image,
-                        cow: false,
-                        frame_cap: frame_cap.bits(),
-                        file_backing_fd: None,
-                        file_backing_offset: 0,
-                    });
-                }
-
-                let scratch_vaddr = self.vspace_mgr.map_scratch(
-                    frame,
-                    Perms::READ | Perms::WRITE,
-                    1,
-                    &mut *self.res_client,
-                    &mut *self.cspace_mgr,
-                )?;
-
-                let page_slice =
-                    unsafe { core::slice::from_raw_parts_mut(scratch_vaddr as *mut u8, PGSIZE) };
-                page_slice.fill(0);
-
-                let file_seg_end = seg_start.saturating_add(file_size);
-                let copy_start = max(page_vaddr, seg_start);
-                let copy_end = min(page_vaddr + PGSIZE, file_seg_end);
-                if copy_end > copy_start && offset < elf_data.len() {
-                    let src_off = offset + (copy_start - seg_start);
-                    let dst_off = copy_start - page_vaddr;
-                    let copy_len = copy_end - copy_start;
-                    if src_off < elf_data.len() {
-                        let actual = min(copy_len, elf_data.len() - src_off);
-                        page_slice[dst_off..dst_off + actual]
-                            .copy_from_slice(&elf_data[src_off..src_off + actual]);
-                    }
-                }
-
-                self.vspace_mgr.unmap(scratch_vaddr, 1)?;
-            }
-        }
-
-        let fallback_phdr = load_bias + elf.ph_offset();
-        Ok(LoadedElfInfo {
-            entry: load_bias + elf.entry_point(),
-            load_end,
-            phdr_vaddr: phdr_vaddr.or(Some(fallback_phdr)),
-        })
+    pub fn get_lifecycle(&self) -> TaskLifecycleState {
+        TaskLifecycleState::from(self.lifecycle.load(Ordering::SeqCst))
     }
 
-    pub(crate) fn do_execve(
-        &mut self,
-        pid: usize,
-        path: &str,
-        argv: &[String],
-        envp: &[String],
-    ) -> Result<(), Error> {
-        let main_elf_data = self.read_exec_image_from_fs(pid, path)?;
-        let main_elf = ElfFile::new(&main_elf_data)
-            .map_err(|e| error!("Failed to parse ELF file: {}", e))
-            .map_err(|_| Error::InvalidArgs)?;
-
-        let main_file_type = main_elf.file_type();
-        if main_file_type != ET_EXEC as u16 && main_file_type != ET_DYN as u16 {
-            error!("execve: unsupported ELF type {} for {}", main_file_type, path);
-            return Err(Error::InvalidArgs);
-        }
-
-        let main_load_bias = if main_file_type == ET_DYN as u16 { PIE_LOAD_BIAS } else { 0 };
-        let interp_path = main_elf.interpreter_path().map(String::from);
-        let (old_maps, old_frame_caps): (Vec<(usize, usize)>, BTreeMap<CapPtr, usize>) = {
-            let process = self.get_process(pid).ok_or(Error::NotFound)?;
-            let mut frame_caps = BTreeMap::new();
-            for map in process.memory_maps.values() {
-                if map.frame_cap == 0 {
-                    continue;
-                }
-                let slot = CapPtr::from(map.frame_cap);
-                let pages = align_up(map.size, PGSIZE) / PGSIZE;
-                let entry = frame_caps.entry(slot).or_insert(0usize);
-                *entry = core::cmp::max(*entry, pages);
-            }
-
-            (
-                process
-                    .memory_maps
-                    .values()
-                    .map(|map| (map.vaddr, align_up(map.size, PGSIZE) / PGSIZE))
-                    .collect(),
-                frame_caps,
-            )
-        };
-
-        for (vaddr, pages) in old_maps {
-            if pages != 0 {
-                let _ = self.unmap_process_pages(pid, vaddr, pages);
-            }
-        }
-
-        for (slot, pages) in old_frame_caps {
-            self.release_process_frame_slot(pid, slot, pages, "execve_replace_image");
-        }
-
-        if let Some(process) = self.get_process_mut(pid) {
-            process.memory_maps.clear();
-            process.lazy_memory_maps.clear();
-            process.stack_size = 0;
-        }
-
-        let main_info = self.load_elf_into_process(pid, &main_elf_data, main_load_bias)?;
-
-        let mut entry_point = main_info.entry;
-        let mut aux_at_base = 0usize;
-
-        if let Some(interp) = interp_path {
-            let interp_elf_data = self.read_exec_image_from_fs(pid, &interp)?;
-            let interp_base = align_up(main_info.load_end + INTERP_LOAD_GAP, PGSIZE);
-            let interp_info = self.load_elf_into_process(pid, &interp_elf_data, interp_base)?;
-            aux_at_base = interp_base;
-            entry_point = interp_info.entry;
-        }
-
-        if let Some(process) = self.get_process_mut(pid) {
-            let heap_start = align_up(max(main_info.load_end, HEAP_VA), PGSIZE);
-            process.heap_start = heap_start;
-            process.heap_brk = heap_start;
-            process.heap_limit = process.mmap_base;
-            process.mmap_next = process.mmap_base;
-            process.stack_bottom = STACK_BASE;
-            process.stack_size = 0;
-        }
-
-        let main_phdr = main_info.phdr_vaddr.unwrap_or(main_load_bias + main_elf.ph_offset());
-        let auxv = [
-            (AT_PHDR as usize, main_phdr),
-            (AT_PHENT as usize, main_elf.ph_entry_size()),
-            (AT_PHNUM as usize, main_elf.ph_num()),
-            (AT_PAGESZ as usize, PGSIZE),
-            (AT_BASE as usize, aux_at_base),
-            (AT_ENTRY as usize, main_info.entry),
-        ];
-
-        let initial_sp = self.setup_initial_stack(pid, path, argv, envp, &auxv)?;
-        let initial_tp = self.setup_initial_tls(pid)?;
-        let (tcb_cap, fault_ep) = {
-            let process = self.get_process(pid).ok_or(Error::NotFound)?;
-            let fault_ep = Endpoint::from(CapPtr::concat(process.cspace().cap(), APE_SLOT));
-            (process.tcb(), fault_ep)
-        };
-        tcb_cap.set_entrypoint(entry_point, initial_sp, initial_tp)?;
-        tcb_cap.set_fault_handler(fault_ep)?;
-        self.close_cloexec_fds(pid)?;
-        Ok(())
+    pub fn set_lifecycle(&self, state: TaskLifecycleState) {
+        self.lifecycle.store(state as i32, Ordering::SeqCst);
     }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_stopped(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.set_lifecycle(TaskLifecycleState::Stopped);
+    }
+
+    pub fn mark_running(&self) {
+        self.stopped.store(false, Ordering::SeqCst);
+        self.set_lifecycle(TaskLifecycleState::Running);
+    }
+
+    pub fn mark_exiting(&self) {
+        self.set_lifecycle(TaskLifecycleState::Exiting);
+    }
+
+    pub fn mark_exited(&self) {
+        self.stopped.store(false, Ordering::SeqCst);
+        self.set_lifecycle(TaskLifecycleState::Exited);
+    }
+
+    pub fn cspace(&self) -> CNode {
+        self.cspace.clone()
+    }
+
+    pub fn vspace(&self) -> glenda::cap::VSpace {
+        self.mm.vspace.clone()
+    }
+
+    pub fn tcb(&self) -> TCB {
+        self.tcb.clone()
+    }
+}
+
+impl Drop for TaskStruct {
+    fn drop(&mut self) {}
 }

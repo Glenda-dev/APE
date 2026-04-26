@@ -8,12 +8,12 @@ use linux_raw_sys::errno::EAGAIN;
 fn load_identity(mgr: &mut ApeManager<'_>, pid: usize) -> Result<IdentityInfo, Error> {
     match mgr.auth_client.get_identity(pid) {
         Ok(identity) => {
-            if let Some(process) = mgr.get_process_mut(pid) {
-                process.identity = identity;
+            if let Some(task) = mgr.get_process(pid) {
+                *task.cred.identity.write() = identity.clone();
             }
             Ok(identity)
         }
-        Err(_) => mgr.get_process(pid).map(|p| p.identity).ok_or(Error::NotFound),
+        Err(_) => mgr.get_process(pid).map(|p| p.cred.identity.read().clone()).ok_or(Error::NotFound),
     }
 }
 
@@ -24,7 +24,6 @@ pub(crate) fn do_getrandom(
     len: usize,
     _flags: usize,
 ) -> Result<isize, Error> {
-    // TODO(ape): 对接真实熵源与 GRND_* 语义（阻塞/非阻塞、随机池状态）。
     if len == 0 {
         return Ok(0);
     }
@@ -49,7 +48,6 @@ pub(crate) fn do_getegid(mgr: &mut ApeManager<'_>, pid: usize) -> Result<isize, 
 }
 
 pub(crate) fn do_sched_yield(_mgr: &mut ApeManager<'_>, _pid: usize) -> Result<isize, Error> {
-    // TODO(ape): 调用底层调度让出 CPU，而非仅返回成功。
     Ok(0)
 }
 
@@ -62,7 +60,6 @@ pub(crate) fn do_prctl(
     _arg4: usize,
     _arg5: usize,
 ) -> Result<isize, Error> {
-    // TODO(ape): 按 option 分发 PR_* 子命令（如 PR_SET_NAME/PR_SET_DUMPABLE）。
     Ok(0)
 }
 
@@ -76,7 +73,6 @@ pub(crate) fn do_futex(
     _uaddr2: usize,
     _val3: usize,
 ) -> Result<isize, Error> {
-    // TODO(ape): 实现 futex 等待队列与唤醒匹配，补齐 FUTEX_* 完整语义。
     match classify_futex_op(futex_op) {
         FutexOpClass::Wake => Ok(0),
         FutexOpClass::Wait => Ok(-(EAGAIN as isize)),

@@ -1,5 +1,5 @@
 use crate::ApeManager;
-use crate::ape::process::{FileHandle, FileType, NormalFileHandle, NormalHandleBackend};
+use crate::ape::files::{FileHandle, FileType, NormalFileHandle, NormalHandleBackend};
 use crate::config::ApeConfig;
 use crate::drivers::tty::TtyDevice;
 use crate::layout::{
@@ -8,8 +8,9 @@ use crate::layout::{
 };
 use crate::task as task_subsystem;
 use crate::vfs::worker::{VfsWorkerConfig, VfsWorkerKind, spawn_worker};
+use core::sync::atomic::Ordering;
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, CapType, Endpoint, Page};
+use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Endpoint, Page};
 use glenda::client::TerminalClient;
 use glenda::error::Error;
 use glenda::interface::{
@@ -20,7 +21,7 @@ use glenda::ipc::Badge;
 use glenda::mem::Perms;
 use glenda::protocol;
 use glenda::protocol::fs::OpenFlags;
-use linux_raw_sys::general::*;
+use linux_raw_sys::general::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 
 const VFS_WORKER_STACK_SIZE: usize = 64 * 1024;
 const VFS_WORKER_STACK_PAGES: usize = VFS_WORKER_STACK_SIZE / PGSIZE;
@@ -31,7 +32,6 @@ const PIPEFS_WORKER_STACK_BASE: usize = TMPFS_WORKER_STACK_BASE + 0x20_000;
 impl<'a> ApeManager<'a> {
     pub fn bootstrap(&mut self) -> Result<(), Error> {
         self.init_client.report_service(Badge::null(), protocol::init::ServiceState::Starting)?;
-
         self.load_ape_config();
         self.mount_rootfs()?;
         self.setup_view()?;
@@ -88,7 +88,7 @@ impl<'a> ApeManager<'a> {
             Err(e) => return Err(e),
         }
 
-        let dev_ep = self.dev_vfs_endpoint.ok_or(Error::NotInitialized)?;
+        let dev_ep = self.subsystems.fs.lock().dev_vfs_endpoint().ok_or(Error::NotInitialized)?;
         self.fs_client.mount(Badge::null(), dev_path, dev_ep)?;
         log!("bootstrap: mounted ape devtmpfs backend at {}", dev_path);
         Ok(())
@@ -163,9 +163,9 @@ impl<'a> ApeManager<'a> {
         let _tmp_tid = spawn_worker(self.proc_client, tmp_cfg, tmp_stack_top)?;
         let _pipe_tid = spawn_worker(self.proc_client, pipe_cfg, pipe_stack_top)?;
 
-        self.dev_vfs_endpoint = Some(dev_ep);
-        self.tmp_vfs_endpoint = Some(tmp_ep);
-        self.pipe_vfs_endpoint = Some(pipe_ep);
+        self.subsystems.fs.lock().set_dev_vfs_endpoint(dev_ep);
+        self.subsystems.fs.lock().set_tmp_vfs_endpoint(tmp_ep);
+        self.subsystems.fs.lock().set_pipe_vfs_endpoint(pipe_ep);
 
         log!("bootstrap: started vfs workers (devtmpfs + tmpfs + pipefs)");
         Ok(())
@@ -218,15 +218,23 @@ impl<'a> ApeManager<'a> {
             let tty_path = self.resolve_path_for_process(pid, "/dev/tty")?;
             let tty = self.open_normal_handle(&tty_path, OpenFlags::O_RDWR)?;
 
-            let proc = self.get_process_mut(pid).unwrap();
-            proc.controlling_tty = Some(term.endpoint().cap().bits());
-            proc.fds.insert(STDIN_FILENO, FileHandle { file_type: FileType::Normal(tty) });
-            proc.fds.insert(STDOUT_FILENO, FileHandle { file_type: FileType::Normal(tty) });
-            proc.fds.insert(STDERR_FILENO, FileHandle { file_type: FileType::Normal(tty) });
-            proc.fd_paths.insert(STDIN_FILENO, "/dev/tty".into());
-            proc.fd_paths.insert(STDOUT_FILENO, "/dev/tty".into());
-            proc.fd_paths.insert(STDERR_FILENO, "/dev/tty".into());
-            proc.next_fd = FIRST_USER_FD;
+            let task = self.get_process(pid).unwrap();
+            task.controlling_tty.store(term.endpoint().cap().bits(), Ordering::SeqCst);
+
+            let mut files = task.files.state.write();
+            files.fds.insert(
+                STDIN_FILENO as u32,
+                FileHandle { file_type: FileType::Normal(tty.clone()) },
+            );
+            files.fds.insert(
+                STDOUT_FILENO as u32,
+                FileHandle { file_type: FileType::Normal(tty.clone()) },
+            );
+            files.fds.insert(STDERR_FILENO as u32, FileHandle { file_type: FileType::Normal(tty) });
+            files.fd_paths.insert(STDIN_FILENO as u32, "/dev/tty".into());
+            files.fd_paths.insert(STDOUT_FILENO as u32, "/dev/tty".into());
+            files.fd_paths.insert(STDERR_FILENO as u32, "/dev/tty".into());
+            files.next_fd = FIRST_USER_FD;
         }
 
         let init_path = self.config().init_path.clone();
@@ -247,14 +255,14 @@ impl<'a> ApeManager<'a> {
         let fs_ep_slot = self.cspace_mgr.alloc(&mut *self.res_client)?;
         let mut fs_open_client = glenda::client::FsClient::new(self.fs_client.endpoint());
         if let Err(e) = fs_open_client.open(Badge::null(), path, flags, 0, fs_ep_slot) {
-            let _ = glenda::cap::CSPACE_CAP.delete(fs_ep_slot);
+            let _ = CSPACE_CAP.delete(fs_ep_slot);
             self.cspace_mgr.free(fs_ep_slot);
             return Err(e);
         }
 
         Ok(NormalFileHandle {
             backend: NormalHandleBackend::Fs,
-            fs_client: glenda::client::FsClient::new(glenda::cap::Endpoint::from(fs_ep_slot)),
+            fs_client: glenda::client::FsClient::new(Endpoint::from(fs_ep_slot)),
             fs_ep_slot,
             offset: 0,
             async_io: None,

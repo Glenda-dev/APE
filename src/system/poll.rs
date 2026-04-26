@@ -1,5 +1,5 @@
 use crate::ApeManager;
-use crate::ape::process::FileType;
+use crate::ape::files::FileType;
 use alloc::vec;
 use core::mem::size_of;
 use glenda::error::Error;
@@ -8,6 +8,7 @@ use glenda::ipc::Badge;
 use linux_raw_sys::errno::{EINTR, EINVAL};
 use linux_raw_sys::general::__kernel_timespec;
 use linux_raw_sys::general::{POLLNVAL, pollfd};
+use core::sync::atomic::Ordering;
 
 const SIGSET_BYTES: usize = size_of::<u64>();
 const NSEC_PER_SEC: u64 = 1_000_000_000;
@@ -43,7 +44,11 @@ fn import_sigset(
 #[inline]
 fn has_deliverable_signal(mgr: &ApeManager<'_>, pid: usize) -> bool {
     mgr.get_process(pid)
-        .map(|proc| (proc.signal_pending & !proc.signal_blocked) != 0)
+        .map(|task| {
+            let pending = task.signal.signal_pending.load(Ordering::SeqCst);
+            let blocked = task.signal.get_blocked();
+            (pending & !blocked) != 0
+        })
         .unwrap_or(false)
 }
 
@@ -105,8 +110,8 @@ fn poll_scan_once(
         if pfd.fd >= 0 {
             let fd = pfd.fd as u32;
             let valid = {
-                let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-                process.fds.contains_key(&fd)
+                let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+                task.files.state.read().fds.contains_key(&fd)
             };
             if !valid {
                 pfd.revents = POLLNVAL as i16;
@@ -129,17 +134,17 @@ fn poll_scan_once(
 }
 
 fn poll_fd_once(mgr: &mut ApeManager<'_>, pid: usize, fd: u32, events: u32) -> Result<u32, Error> {
+    let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
     let mut handle = {
-        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-        process.fds.remove(&fd).ok_or(Error::InvalidSlot)?
+        let mut files = task.files.state.write();
+        files.fds.remove(&fd).ok_or(Error::InvalidSlot)?
     };
 
     let result = (|| match &mut handle.file_type {
         FileType::Normal(normal) => normal.poll(events),
     })();
 
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    process.fds.insert(fd, handle);
+    task.files.state.write().fds.insert(fd, handle);
     result
 }
 
@@ -166,22 +171,21 @@ pub(crate) fn do_ppoll(
         if !has_valid_sigset_size(sigsetsize) {
             return Ok(-(EINVAL as isize));
         }
-        Some(mgr.get_process(pid).ok_or(Error::NotFound)?.signal_blocked)
+        let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        Some(task.signal.get_blocked())
     } else {
         None
     };
 
     if sigmask != 0 {
         let temp_mask = import_sigset(mgr, pid, sigmask, sigsetsize)?;
-        if let Some(proc) = mgr.get_process_mut(pid) {
-            proc.set_signal_blocked(temp_mask);
+        if let Some(task) = mgr.get_process(pid) {
+            task.signal.set_blocked(temp_mask);
         }
     }
 
     let result = (|| {
         let deadline = parse_timeout_deadline(mgr, pid, timeout).map_err(|_| Error::InvalidArgs)?;
-        // TODO(ape/poll,phase4): 改为统一等待状态机（fd ready / timeout / signal），
-        // 避免在 syscall handler 内部循环 sleep 轮询。
         loop {
             let ready_count = poll_scan_once(mgr, pid, fds_ptr, nfds)?;
             if ready_count > 0 {
@@ -209,10 +213,9 @@ pub(crate) fn do_ppoll(
     })();
 
     if let Some(mask) = old_mask
-        && let Some(proc) = mgr.get_process_mut(pid)
+        && let Some(task) = mgr.get_process(pid)
     {
-        // TODO(ape/poll,phase4): 与 pselect/ppoll 原子掩码切换语义做严格一致性校验（竞态窗口）。
-        proc.set_signal_blocked(mask);
+        task.signal.set_blocked(mask);
     }
 
     result

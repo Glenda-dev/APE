@@ -1,33 +1,41 @@
-use crate::ape::process::{MemoryMap, SubProcess};
+use crate::ape::mm::{MemoryMap, MemoryType};
+use crate::ape::task::TaskStruct;
 use glenda::arch::mem::PGSIZE;
 
 #[derive(Debug, Clone)]
 pub enum FaultAction {
-    StackGrowth { current_stack_low: usize, pages_to_map: usize },
+    StackGrowth {
+        current_stack_low: usize,
+        pages_to_map: usize,
+    },
     HeapLazy,
     LazyMmap(MemoryMap),
     Unmanaged,
 }
 
-pub fn classify_fault(process: &SubProcess, addr: usize, page_addr: usize) -> FaultAction {
-    // 1) 栈增长（向下增长）
-    let stack_low_limit = process.stack_bottom.saturating_sub(process.max_stack_size);
-    let current_stack_low = process.stack_bottom.saturating_sub(process.stack_size);
-    if addr < process.stack_bottom && addr >= stack_low_limit && page_addr < current_stack_low {
-        let pages_to_map = (current_stack_low - page_addr) / PGSIZE;
-        if pages_to_map > 0 {
-            return FaultAction::StackGrowth { current_stack_low, pages_to_map };
-        }
-    }
-
-    // 2) brk 管理的堆区懒分配
-    if addr >= process.heap_start && addr < process.heap_brk {
-        return FaultAction::HeapLazy;
-    }
-
-    // 3) mmap 懒分配
-    if let Some(map) = process.lookup_lazy_memory_map(addr).cloned() {
+pub fn classify_fault(task: &TaskStruct, addr: usize, page_addr: usize) -> FaultAction {
+    let mm = task.mm.state.read();
+    
+    // Check lazy mappings
+    if let Some(map) = task.mm.lookup_lazy_memory_map(addr) {
         return FaultAction::LazyMmap(map);
+    }
+
+    // Check stack growth
+    let stack_low = mm.stack_bottom.saturating_sub(mm.max_stack_size);
+    let current_stack_boundary = mm.stack_bottom.saturating_sub(mm.stack_size);
+
+    if addr >= stack_low && addr < current_stack_boundary {
+        let pages = (current_stack_boundary - page_addr) / PGSIZE;
+        return FaultAction::StackGrowth {
+            current_stack_low: current_stack_boundary,
+            pages_to_map: pages,
+        };
+    }
+
+    // Check heap
+    if addr >= mm.heap_start && addr < mm.heap_brk {
+        return FaultAction::HeapLazy;
     }
 
     FaultAction::Unmanaged

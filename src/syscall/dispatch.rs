@@ -2,6 +2,7 @@ use crate::ApeManager;
 use crate::syscall::*;
 use glenda::error::Error;
 use libape::policy::{ApeSyscall, decode_ape_syscall};
+use linux_raw_sys::errno::*;
 
 #[allow(non_upper_case_globals)]
 pub(crate) fn route_syscall<'a>(
@@ -73,7 +74,6 @@ pub(crate) fn route_syscall<'a>(
             system::sys_rt_sigtimedwait(mgr, pid, args[0], args[1], args[2], args[3])
         }
         ApeSyscall::RtSigreturn => system::sys_rt_sigreturn(mgr, pid),
-        ApeSyscall::SetRobustList => system::sys_set_robust_list(mgr, pid, args[0], args[1]),
         ApeSyscall::Prlimit64 => {
             system::sys_prlimit64(mgr, pid, args[0], args[1], args[2], args[3])
         }
@@ -104,6 +104,19 @@ pub(crate) fn route_syscall<'a>(
         ApeSyscall::Futex => {
             system::sys_futex(mgr, pid, args[0], args[1], args[2], args[3], args[4], args[5])
         }
-        ApeSyscall::Unsupported => Err(Error::NotImplemented),
+        ApeSyscall::Unsupported => Ok(-(ENOSYS as isize)),
+        ApeSyscall::StubBypass => stub::sys_stub_bypass(mgr),
+        ApeSyscall::StubKill => stub::sys_stub_kill(mgr, pid),
+        ApeSyscall::StubOpen => stub::sys_stub_open(mgr, pid),
+        ApeSyscall::StubNOMSG => Ok(-(ENOMSG as isize)),
+        ApeSyscall::StubSRCH => Ok(-(ESRCH as isize)),
+        ApeSyscall::StubFAULT => Ok(-(EFAULT as isize)),
+        ApeSyscall::StubINVAL => Ok(-(EINVAL as isize)),
+        ApeSyscall::StubBADF => Ok(-(EBADF as isize)),
+        ApeSyscall::StubPERM => Ok(-(EPERM as isize)),
+        e => {
+            error!("Syscall {:?} is not implemented yet", e);
+            Ok(-(ENOSYS as isize))
+        }
     }
 }

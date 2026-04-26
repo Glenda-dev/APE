@@ -65,7 +65,7 @@ impl<'a> ApeManager<'a> {
     }
 
     pub(crate) fn start_async_runtime(&mut self) -> Result<(), Error> {
-        if self.async_runtime.is_some() {
+        if self.service_state.async_runtime.lock().is_some() {
             return Ok(());
         }
 
@@ -79,7 +79,7 @@ impl<'a> ApeManager<'a> {
             .with_queue_capacity(APE_ASYNC_SLEEP_QUEUE_CAPACITY)
             .build(self.proc_client, &specs)?;
 
-        self.async_runtime = Some(ApeAsyncRuntime {
+        *self.service_state.async_runtime.lock() = Some(ApeAsyncRuntime {
             executor: sleep_pool,
             completion_tx: sleep_done_tx,
             completion_rx: sleep_done_rx,
@@ -101,7 +101,8 @@ impl<'a> ApeManager<'a> {
         let sleep_ms = usize::try_from(req_ns.div_ceil(1_000_000)).unwrap_or(usize::MAX);
 
         let (request_id, completion_tx) = {
-            let runtime = self.async_runtime.as_mut().ok_or(Error::NotInitialized)?;
+            let mut runtime_guard = self.service_state.async_runtime.lock();
+            let runtime = runtime_guard.as_mut().ok_or(Error::NotInitialized)?;
             let request_id = runtime.next_request_id;
             runtime.next_request_id = runtime.next_request_id.saturating_add(1);
             runtime
@@ -110,7 +111,8 @@ impl<'a> ApeManager<'a> {
             (request_id, runtime.completion_tx.clone())
         };
 
-        let runtime = self.async_runtime.as_ref().ok_or(Error::NotInitialized)?;
+        let runtime_guard = self.service_state.async_runtime.lock();
+        let runtime = runtime_guard.as_ref().ok_or(Error::NotInitialized)?;
         let _ = runtime.executor.spawn(async move {
             let mut time_client = TimeClient::new(TIME_CAP);
             let _ = time_client.sleep(Badge::null(), max(1, sleep_ms));
@@ -121,7 +123,11 @@ impl<'a> ApeManager<'a> {
     }
 
     fn take_pending_sleep_reply(&mut self, pid: usize) -> Option<PendingSleepReply> {
-        self.async_runtime.as_mut().and_then(|runtime| runtime.pending_sleep_replies.remove(&pid))
+        self.service_state
+            .async_runtime
+            .lock()
+            .as_mut()
+            .and_then(|runtime| runtime.pending_sleep_replies.remove(&pid))
     }
 
     pub(crate) fn drop_pending_sleep_reply(&mut self, pid: usize) {
@@ -170,7 +176,8 @@ impl<'a> ApeManager<'a> {
 
     fn complete_sleep_reply(&mut self, completion: SleepCompletion) -> Result<(), Error> {
         let pending = {
-            let Some(runtime) = self.async_runtime.as_mut() else {
+            let mut runtime_guard = self.service_state.async_runtime.lock();
+            let Some(runtime) = runtime_guard.as_mut() else {
                 return Ok(());
             };
             let Some(current) = runtime.pending_sleep_replies.get(&completion.pid).copied() else {
@@ -188,7 +195,8 @@ impl<'a> ApeManager<'a> {
     pub(crate) fn drain_async_events(&mut self) -> Result<(), Error> {
         loop {
             let event = {
-                let Some(runtime) = self.async_runtime.as_ref() else {
+                let runtime_guard = self.service_state.async_runtime.lock();
+                let Some(runtime) = runtime_guard.as_ref() else {
                     return Ok(());
                 };
                 runtime.completion_rx.try_recv()

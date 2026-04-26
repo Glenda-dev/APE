@@ -1,6 +1,6 @@
 use crate::ApeManager;
+use crate::ape::files::{FileType as ApeFileType, NormalHandleBackend};
 use crate::ape::path::path_inside_root;
-use crate::ape::process::{FileType as ApeFileType, NormalHandleBackend};
 use crate::ape::user::USER_PATH_MAX;
 use alloc::string::String;
 use glenda::error::Error;
@@ -27,10 +27,10 @@ pub(crate) fn do_getcwd(
     }
 
     let (root_dir, cwd_abs) = {
-        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-        (process.root_dir.clone(), process.cwd.clone())
+        let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        let fs = task.fs.state.read();
+        (fs.root_dir.clone(), fs.cwd.clone())
     };
-
     let guest_cwd = path_inside_root(&cwd_abs, &root_dir).unwrap_or_else(|| String::from("/"));
     let bytes = guest_cwd.as_bytes();
     let need = bytes.len().checked_add(1).ok_or(Error::OutOfMemory)?;
@@ -64,8 +64,8 @@ pub(crate) fn do_chdir(
         return Err(Error::InvalidArgs);
     }
 
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    process.cwd = resolved;
+    let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+    task.fs.state.write().cwd = resolved;
     Ok(0)
 }
 
@@ -73,9 +73,10 @@ pub(crate) fn do_fchdir(mgr: &mut ApeManager<'_>, pid: usize, fd: usize) -> Resu
     let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
 
     let target_cwd = {
-        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-        let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
-        let path = process.fd_paths.get(&fd).cloned().ok_or(Error::InvalidArgs)?;
+        let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        let files = task.files.state.read();
+        let handle = files.fds.get(&fd).cloned().ok_or(Error::InvalidSlot)?;
+        let path = files.fd_paths.get(&fd).cloned().ok_or(Error::InvalidArgs)?;
 
         match &handle.file_type {
             ApeFileType::Normal(normal) => {
@@ -88,12 +89,11 @@ pub(crate) fn do_fchdir(mgr: &mut ApeManager<'_>, pid: usize, fd: usize) -> Resu
                 }
                 path
             }
-            _ => return Err(Error::InvalidArgs),
         }
     };
 
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    process.cwd = target_cwd;
+    let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+    task.fs.state.write().cwd = target_cwd;
     Ok(0)
 }
 
@@ -117,8 +117,9 @@ pub(crate) fn do_chroot(
         return Err(Error::InvalidArgs);
     }
 
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    process.root_dir = resolved.clone();
-    process.cwd = resolved;
+    let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+    let mut fs = task.fs.state.write();
+    fs.root_dir = resolved.clone();
+    fs.cwd = resolved;
     Ok(0)
 }

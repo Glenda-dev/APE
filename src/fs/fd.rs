@@ -1,5 +1,5 @@
 use crate::ApeManager;
-use crate::ape::process::{
+use crate::ape::files::{
     AsyncIoState, FileHandle, FileType, NormalFileHandle, NormalHandleBackend,
 };
 use crate::ape::user::USER_PATH_MAX;
@@ -25,9 +25,9 @@ fn align_up_8(v: usize) -> usize {
 
 fn duplicate_normal_handle(
     _mgr: &mut ApeManager<'_>,
-    handle: &crate::ape::process::NormalFileHandle,
-) -> Result<crate::ape::process::NormalFileHandle, Error> {
-    Ok(crate::ape::process::NormalFileHandle {
+    handle: &NormalFileHandle,
+) -> Result<NormalFileHandle, Error> {
+    Ok(NormalFileHandle {
         backend: NormalHandleBackend::Fs,
         fs_client: handle.fs_client,
         fs_ep_slot: handle.fs_ep_slot,
@@ -42,7 +42,7 @@ fn open_pipe_end_via_pipefs<'a>(
     path_suffix: &str,
     flags: glenda::protocol::fs::OpenFlags,
 ) -> Result<(FsClient, CapPtr), Error> {
-    let pipe_ep = mgr.pipe_vfs_endpoint.ok_or(Error::NotFound)?;
+    let pipe_ep = mgr.subsystems.fs.lock().pipe_vfs_endpoint().ok_or(Error::NotFound)?;
     let fs_ep_slot = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
     let path = alloc::format!("/{}/{}", pipe_id, path_suffix);
     let mut open_client = FsClient::new(pipe_ep);
@@ -54,7 +54,6 @@ fn open_pipe_end_via_pipefs<'a>(
     Ok((FsClient::new(Endpoint::from(fs_ep_slot)), fs_ep_slot))
 }
 
-// 4KB ring + 12KB data window，降低每 fd 的常驻内存。
 const FS_ASYNC_REGION_SIZE: usize = 16 * 1024;
 const FS_ASYNC_RING_SIZE: usize = 4096;
 const FS_ASYNC_DATA_OFFSET: usize = FS_ASYNC_RING_SIZE;
@@ -69,7 +68,6 @@ fn open_via_nexus_fs<'a>(
     flags: usize,
     mode: usize,
 ) -> Result<isize, Error> {
-    // 使用 Nexus 返回的独立句柄 endpoint（强制隔离）。
     let fs_ep_slot = mgr.cspace_mgr.alloc(&mut *mgr.res_client)?;
     let mut fs_open_client = FsClient::new(mgr.fs_client.endpoint());
     let open_flags = glenda::protocol::fs::OpenFlags::from_bits_truncate(flags);
@@ -119,17 +117,9 @@ fn open_via_nexus_fs<'a>(
                 }
                 Err(Error::NotSupported) => {
                     mgr.mark_fs_iouring_unsupported();
-                    warn!(
-                        "sys_openat: setup_iouring not supported pid={}, path={}, disable async probe and fallback sync",
-                        pid, path
-                    );
                     mgr.recycle_fs_async_region(region.id);
                 }
-                Err(e) => {
-                    warn!(
-                        "sys_openat: setup_iouring failed pid={}, path={}, err={:?}; fallback sync and keep async probe enabled",
-                        pid, path, e
-                    );
+                Err(_) => {
                     mgr.recycle_fs_async_region(region.id);
                 }
             }
@@ -137,10 +127,11 @@ fn open_via_nexus_fs<'a>(
     }
 
     let fd = {
-        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-        let fd = process.next_fd;
-        process.next_fd += 1;
-        process.fds.insert(
+        let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        let mut files = task.files.state.write();
+        let fd = files.next_fd;
+        files.next_fd += 1;
+        files.fds.insert(
             fd,
             FileHandle {
                 file_type: FileType::Normal(NormalFileHandle {
@@ -152,7 +143,7 @@ fn open_via_nexus_fs<'a>(
                 }),
             },
         );
-        process.fd_paths.insert(fd, path.into());
+        files.fd_paths.insert(fd, path.into());
         fd
     };
     mgr.ledger_record_fd_open(pid);
@@ -163,12 +154,11 @@ fn open_via_nexus_fs<'a>(
 pub(crate) fn do_openat<'a>(
     mgr: &mut ApeManager<'a>,
     pid: usize,
-    dirfd: usize,
+    _dirfd: usize,
     pathname: usize,
     flags: usize,
     mode: usize,
 ) -> Result<isize, Error> {
-    let _ = dirfd;
     let raw_path = mgr.strncpy_from_user(pid, pathname, USER_PATH_MAX)?;
     let path = mgr.resolve_path_for_process(pid, &raw_path)?;
     open_via_nexus_fs(mgr, pid, &path, flags, mode)
@@ -181,10 +171,11 @@ pub(crate) fn do_close<'a>(
 ) -> Result<isize, Error> {
     let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
     let handle = {
-        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-        process.fd_paths.remove(&fd);
-        process.fd_cloexec.remove(&fd);
-        process.fds.remove(&fd).ok_or(Error::InvalidSlot)?
+        let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        let mut files = task.files.state.write();
+        files.fd_paths.remove(&fd);
+        files.fd_cloexec.remove(&fd);
+        files.fds.remove(&fd).ok_or(Error::InvalidSlot)?
     };
 
     match handle.file_type {
@@ -194,10 +185,10 @@ pub(crate) fn do_close<'a>(
             let async_io = normal.async_io;
             let mut still_shared = false;
             for other_pid in mgr.local_pids() {
-                let Some(proc_ref) = mgr.get_process(other_pid) else {
+                let Some(task_ref) = mgr.get_process(other_pid) else {
                     continue;
                 };
-                if proc_ref.fds.values().any(|fh| {
+                if task_ref.files.state.read().fds.values().any(|fh| {
                     matches!(
                         fh.file_type,
                         FileType::Normal(other)
@@ -241,52 +232,53 @@ pub(crate) fn do_fcntl<'a>(
 
     match cmd {
         F_GETFD => {
-            let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-            if !process.fds.contains_key(&fd) {
+            let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+            let files = task.files.state.read();
+            if !files.fds.contains_key(&fd) {
                 return Err(Error::InvalidSlot);
             }
-            let cloexec = process.fd_cloexec.get(&fd).copied().unwrap_or(false);
+            let cloexec = files.fd_cloexec.get(&fd).copied().unwrap_or(false);
             Ok(if cloexec { FD_CLOEXEC as isize } else { 0 })
         }
         F_SETFD => {
-            let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-            if !process.fds.contains_key(&fd) {
+            let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+            let mut files = task.files.state.write();
+            if !files.fds.contains_key(&fd) {
                 return Err(Error::InvalidSlot);
             }
             let cloexec = (arg & (FD_CLOEXEC as usize)) != 0;
-            process.fd_cloexec.insert(fd, cloexec);
+            files.fd_cloexec.insert(fd, cloexec);
             Ok(0)
         }
         F_GETFL => {
-            let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-            if !process.fds.contains_key(&fd) {
+            let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+            if !task.files.state.read().fds.contains_key(&fd) {
                 return Err(Error::InvalidSlot);
             }
-            // TODO(ape): 维护并返回真实文件状态标志（O_APPEND/O_NONBLOCK 等）。
             Ok(0)
         }
         F_SETFL => {
-            let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-            if !process.fds.contains_key(&fd) {
+            let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+            if !task.files.state.read().fds.contains_key(&fd) {
                 return Err(Error::InvalidSlot);
             }
-            // TODO(ape): 应用并持久化可变状态标志，影响后续 I/O 行为。
             Ok(0)
         }
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let (new_fd, cloned) = {
-                let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-                if !process.fds.contains_key(&fd) {
+                let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+                let mut files = task.files.state.write();
+                if !files.fds.contains_key(&fd) {
                     return Err(Error::InvalidSlot);
                 }
 
                 let min_fd = u32::try_from(arg).map_err(|_| Error::InvalidArgs)?;
                 let mut new_fd = min_fd;
-                while process.fds.contains_key(&new_fd) {
+                while files.fds.contains_key(&new_fd) {
                     new_fd = new_fd.checked_add(1).ok_or(Error::OutOfMemory)?;
                 }
 
-                let cloned = process.fds.get(&fd).cloned().ok_or(Error::InvalidSlot)?;
+                let cloned = files.fds.get(&fd).cloned().ok_or(Error::InvalidSlot)?;
                 (new_fd, cloned)
             };
 
@@ -294,20 +286,20 @@ pub(crate) fn do_fcntl<'a>(
                 FileType::Normal(normal) => FileHandle {
                     file_type: FileType::Normal(duplicate_normal_handle(mgr, &normal)?),
                 },
-                other => FileHandle { file_type: other },
             };
 
             {
-                let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-                process.fds.insert(new_fd, cloned);
-                if let Some(path) = process.fd_paths.get(&fd).cloned() {
-                    process.fd_paths.insert(new_fd, path);
+                let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+                let mut files = task.files.state.write();
+                files.fds.insert(new_fd, cloned);
+                if let Some(path) = files.fd_paths.get(&fd).cloned() {
+                    files.fd_paths.insert(new_fd, path);
                 }
 
                 let new_cloexec = cmd == F_DUPFD_CLOEXEC;
-                process.fd_cloexec.insert(new_fd, new_cloexec);
-                if process.next_fd <= new_fd {
-                    process.next_fd = new_fd.saturating_add(1);
+                files.fd_cloexec.insert(new_fd, new_cloexec);
+                if files.next_fd <= new_fd {
+                    files.next_fd = new_fd.saturating_add(1);
                 }
             }
 
@@ -340,16 +332,17 @@ pub(crate) fn do_dup3<'a>(
     }
 
     let (cloned, path_clone) = {
-        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        let files = task.files.state.read();
         (
-            process.fds.get(&oldfd).cloned().ok_or(Error::InvalidSlot)?,
-            process.fd_paths.get(&oldfd).cloned(),
+            files.fds.get(&oldfd).cloned().ok_or(Error::InvalidSlot)?,
+            files.fd_paths.get(&oldfd).cloned(),
         )
     };
 
     let need_close_target = {
-        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-        process.fds.contains_key(&newfd)
+        let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        task.files.state.read().fds.contains_key(&newfd)
     };
     if need_close_target {
         do_close(mgr, pid, newfd as usize)?;
@@ -361,14 +354,15 @@ pub(crate) fn do_dup3<'a>(
         }
     };
 
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    process.fds.insert(newfd, cloned);
+    let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+    let mut files = task.files.state.write();
+    files.fds.insert(newfd, cloned);
     if let Some(path) = path_clone {
-        process.fd_paths.insert(newfd, path);
+        files.fd_paths.insert(newfd, path);
     }
-    process.fd_cloexec.insert(newfd, (flags & (O_CLOEXEC as usize)) != 0);
-    if process.next_fd <= newfd {
-        process.next_fd = newfd.saturating_add(1);
+    files.fd_cloexec.insert(newfd, (flags & (O_CLOEXEC as usize)) != 0);
+    if files.next_fd <= newfd {
+        files.next_fd = newfd.saturating_add(1);
     }
 
     mgr.ledger_record_fd_open(pid);
@@ -395,8 +389,8 @@ pub(crate) fn do_getdents64<'a>(
     let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
 
     let mut handle = {
-        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-        process.fds.remove(&fd).ok_or(Error::InvalidSlot)?
+        let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        task.files.state.write().fds.remove(&fd).ok_or(Error::InvalidSlot)?
     };
 
     let result = (|| {
@@ -404,7 +398,6 @@ pub(crate) fn do_getdents64<'a>(
             FileType::Normal(normal) => match normal.backend {
                 NormalHandleBackend::Fs => normal.fs_client.getdents(Badge::null(), count)?,
             },
-            _ => return Err(Error::InvalidType),
         };
 
         let mut packed = Vec::new();
@@ -436,8 +429,8 @@ pub(crate) fn do_getdents64<'a>(
         Ok(packed.len() as isize)
     })();
 
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    process.fds.insert(fd, handle);
+    let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+    task.files.state.write().fds.insert(fd, handle);
     result
 }
 
@@ -480,19 +473,20 @@ pub(crate) fn do_pipe2<'a>(
     };
 
     let (read_fd, write_fd) = {
-        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
+        let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        let mut files = task.files.state.write();
 
-        let mut read_fd = process.next_fd;
-        while process.fds.contains_key(&read_fd) {
+        let mut read_fd = files.next_fd;
+        while files.fds.contains_key(&read_fd) {
             read_fd = read_fd.checked_add(1).ok_or(Error::OutOfMemory)?;
         }
 
         let mut write_fd = read_fd.checked_add(1).ok_or(Error::OutOfMemory)?;
-        while process.fds.contains_key(&write_fd) {
+        while files.fds.contains_key(&write_fd) {
             write_fd = write_fd.checked_add(1).ok_or(Error::OutOfMemory)?;
         }
 
-        process.fds.insert(
+        files.fds.insert(
             read_fd,
             FileHandle {
                 file_type: FileType::Normal(NormalFileHandle {
@@ -504,7 +498,7 @@ pub(crate) fn do_pipe2<'a>(
                 }),
             },
         );
-        process.fds.insert(
+        files.fds.insert(
             write_fd,
             FileHandle {
                 file_type: FileType::Normal(NormalFileHandle {
@@ -516,9 +510,9 @@ pub(crate) fn do_pipe2<'a>(
                 }),
             },
         );
-        process.fd_cloexec.insert(read_fd, cloexec);
-        process.fd_cloexec.insert(write_fd, cloexec);
-        process.next_fd = write_fd.saturating_add(1);
+        files.fd_cloexec.insert(read_fd, cloexec);
+        files.fd_cloexec.insert(write_fd, cloexec);
+        files.next_fd = write_fd.saturating_add(1);
 
         (read_fd, write_fd)
     };
@@ -530,14 +524,12 @@ pub(crate) fn do_pipe2<'a>(
     out[4..].copy_from_slice(&write_i32.to_ne_bytes());
 
     if let Err(e) = mgr.copy_to_user(pid, pipefd, &out) {
-        let (read_handle, write_handle) = {
-            let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-            let read_handle = process.fds.remove(&read_fd);
-            let write_handle = process.fds.remove(&write_fd);
-            process.fd_cloexec.remove(&read_fd);
-            process.fd_cloexec.remove(&write_fd);
-            (read_handle, write_handle)
-        };
+        let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        let mut files = task.files.state.write();
+        let read_handle = files.fds.remove(&read_fd);
+        let write_handle = files.fds.remove(&write_fd);
+        files.fd_cloexec.remove(&read_fd);
+        files.fd_cloexec.remove(&write_fd);
 
         if let Some(FileHandle { file_type: FileType::Normal(mut n) }) = read_handle {
             let _ = n.fs_client.close(Badge::null());

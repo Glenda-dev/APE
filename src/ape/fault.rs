@@ -1,6 +1,8 @@
 use crate::ApeManager;
 use crate::ape::fault_policy::{FaultAction, classify_fault};
-use crate::ape::process::{FileType, MemoryMap, MemoryType, NormalHandleBackend};
+use crate::ape::files::{FileType, NormalHandleBackend};
+use crate::ape::mm::{MemoryMap, MemoryType};
+use crate::ape::task::{TaskLifecycleState, TaskStruct};
 use crate::ape::utils::linux_conv::get_exit_code_for_signal;
 #[cfg(feature = "strace")]
 use crate::ape::utils::strace;
@@ -9,6 +11,7 @@ use crate::arch::parse_syscall_args;
 use crate::syscall::{map_error_to_errno, route_syscall};
 use crate::system::signal::{PendingSignalAction, consume_deliverable_signal_on_syscall_return};
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 use glenda::arch::mem::{PGSIZE, SHIFTS};
 use glenda::cap::{CSPACE_CAP, CapPtr, CapType, Page, PageTable};
 use glenda::error::Error;
@@ -84,8 +87,10 @@ impl<'a> ApeManager<'a> {
         pid: usize,
     ) -> Result<(), Error> {
         let slots_to_release: Vec<CapPtr> = {
-            let process = self.get_process(pid).ok_or(Error::NotFound)?;
-            process
+            let task = self.get_process(pid).ok_or(Error::NotFound)?;
+            task.mm
+                .state
+                .read()
                 .intermediate_page_tables
                 .values()
                 .copied()
@@ -93,8 +98,8 @@ impl<'a> ApeManager<'a> {
                 .collect()
         };
 
-        if let Some(process) = self.get_process_mut(pid) {
-            process.intermediate_page_tables.clear();
+        if let Some(task) = self.get_process(pid) {
+            task.mm.state.write().intermediate_page_tables.clear();
         }
 
         for slot in slots_to_release {
@@ -122,10 +127,10 @@ impl<'a> ApeManager<'a> {
 
         let mut missing_paths = Vec::new();
         {
-            let process = self.get_process(pid).ok_or(Error::NotFound)?;
+            let task = self.get_process(pid).ok_or(Error::NotFound)?;
             for level in (leaf_level..SHIFTS.len()).rev() {
                 let prefix = Self::pt_path_prefix(page_addr, level);
-                if !process.has_intermediate_page_table(level, prefix) {
+                if !task.mm.has_intermediate_page_table(level, prefix) {
                     missing_paths.push((level, prefix));
                 }
             }
@@ -142,15 +147,14 @@ impl<'a> ApeManager<'a> {
             let pt = PageTable::from(slot);
             match vspace.map_table(pt, page_addr, level) {
                 Ok(()) => {
-                    if let Some(process) = self.get_process_mut(pid) {
-                        process.record_intermediate_page_table(level, prefix, slot);
+                    if let Some(task) = self.get_process(pid) {
+                        task.mm.record_intermediate_page_table(level, prefix, slot);
                     }
                 }
                 Err(Error::AlreadyExists) => {
-                    // 页表已存在（可能由其他路径预先建立），记录路径，避免重复探测。
                     self.release_pagetable_slot(pid, slot);
-                    if let Some(process) = self.get_process_mut(pid) {
-                        process.record_intermediate_page_table(level, prefix, CapPtr::null());
+                    if let Some(task) = self.get_process(pid) {
+                        task.mm.record_intermediate_page_table(level, prefix, CapPtr::null());
                     }
                 }
                 Err(e) => {
@@ -188,7 +192,6 @@ impl<'a> ApeManager<'a> {
         match vspace.map(frame, vaddr, perms, pages) {
             Ok(()) => Ok(()),
             Err(Error::MappingFailed) => {
-                // 大页尝试失败（常见于物理地址未对齐）时，回退到全 4K 路径。
                 let _ = vspace.unmap(vaddr, pages * PGSIZE);
                 for j in 0..pages {
                     self.ensure_intermediate_page_tables_with_leaf(pid, vaddr + j * PGSIZE, 1)?;
@@ -231,8 +234,8 @@ impl<'a> ApeManager<'a> {
         let frame = Page::from(frame_slot);
         self.map_process_frame(pid, frame, page_addr, perms, 1)?;
 
-        let process = self.get_process_mut(pid).ok_or(Error::NotFound)?;
-        process.add_memory_map(MemoryMap {
+        let task = self.get_process(pid).ok_or(Error::NotFound)?;
+        task.mm.add_memory_map(MemoryMap {
             vaddr: page_addr,
             paddr: 0,
             size: PGSIZE,
@@ -258,10 +261,11 @@ impl<'a> ApeManager<'a> {
 
         let mut span_pages = core::cmp::max(request_pages, 1);
         {
-            let process = self.get_process(pid).ok_or(Error::NotFound)?;
+            let task = self.get_process(pid).ok_or(Error::NotFound)?;
+            let mm = task.mm.state.read();
             for idx in 1..span_pages {
                 let va = page_addr.saturating_add(idx * PGSIZE);
-                let Some(candidate) = process.lazy_memory_maps.get(&va) else {
+                let Some(candidate) = mm.lazy_memory_maps.get(&va).cloned() else {
                     span_pages = idx;
                     break;
                 };
@@ -278,10 +282,11 @@ impl<'a> ApeManager<'a> {
         }
         span_pages = core::cmp::max(span_pages, 1);
 
-        let try_zero_copy = {
+        let try_zero_copy = (|| {
             let mut fs_client = {
-                let process = self.get_process(pid).ok_or(Error::NotFound)?;
-                let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
+                let task = self.get_process(pid).ok_or(Error::NotFound)?;
+                let files = task.files.state.read();
+                let handle = files.fds.get(&fd).cloned().ok_or(Error::InvalidSlot)?;
                 match handle.file_type {
                     FileType::Normal(normal) => {
                         if !matches!(normal.backend, NormalHandleBackend::Fs) {
@@ -310,11 +315,11 @@ impl<'a> ApeManager<'a> {
                     }
 
                     let map_size = span_pages * PGSIZE;
-                    let process = self.get_process_mut(pid).ok_or(Error::NotFound)?;
+                    let task = self.get_process(pid).ok_or(Error::NotFound)?;
                     for idx in 0..span_pages {
-                        process.remove_lazy_memory_map(page_addr + idx * PGSIZE);
+                        task.mm.remove_lazy_memory_map(page_addr + idx * PGSIZE);
                     }
-                    process.add_memory_map(MemoryMap {
+                    task.mm.add_memory_map(MemoryMap {
                         vaddr: page_addr,
                         paddr: 0,
                         size: map_size,
@@ -325,7 +330,7 @@ impl<'a> ApeManager<'a> {
                         file_backing_fd: map.file_backing_fd,
                         file_backing_offset: map.file_backing_offset,
                     });
-                    return Ok(span_pages);
+                    Ok(span_pages)
                 }
                 Ok(_) => {
                     self.release_process_frame_slot(
@@ -338,22 +343,25 @@ impl<'a> ApeManager<'a> {
                 }
                 Err(Error::NotSupported) => {
                     self.cspace_mgr.free(recv_slot);
-                    Ok(())
+                    Ok(0)
                 }
                 Err(e) => {
                     self.cspace_mgr.free(recv_slot);
                     Err(e)
                 }
             }
-        };
+        })();
 
-        if let Err(e) = try_zero_copy {
-            return Err(e);
+        match try_zero_copy {
+            Ok(n) if n > 0 => return Ok(n),
+            Ok(_) => {}
+            Err(e) => return Err(e),
         }
 
         let mut fs_client = {
-            let process = self.get_process(pid).ok_or(Error::NotFound)?;
-            let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
+            let task = self.get_process(pid).ok_or(Error::NotFound)?;
+            let files = task.files.state.read();
+            let handle = files.fds.get(&fd).cloned().ok_or(Error::InvalidSlot)?;
             match handle.file_type {
                 FileType::Normal(normal) => {
                     if !matches!(normal.backend, NormalHandleBackend::Fs) {
@@ -421,9 +429,9 @@ impl<'a> ApeManager<'a> {
             return Err(e);
         }
 
-        let process = self.get_process_mut(pid).ok_or(Error::NotFound)?;
-        process.remove_lazy_memory_map(page_addr);
-        process.add_memory_map(MemoryMap {
+        let task = self.get_process(pid).ok_or(Error::NotFound)?;
+        task.mm.remove_lazy_memory_map(page_addr);
+        task.mm.add_memory_map(MemoryMap {
             vaddr: page_addr,
             paddr: 0,
             size: PGSIZE,
@@ -446,15 +454,13 @@ impl<'a> ApeManager<'a> {
         pages: usize,
     ) -> Result<(), Error> {
         let frame = Page::from(CapPtr::from(frame_cap));
-
-        // 先尝试移除旧映射（若不存在则忽略），随后补齐中间页表并重映射。
         let _ = self.unmap_process_pages(pid, page_addr, pages);
         self.map_process_frame(pid, frame, page_addr, perms, pages)?;
 
-        if let Some(process) = self.get_process_mut(pid)
-            && let Some(map) = process.memory_maps.get_mut(&page_addr)
-        {
-            map.flags = perms;
+        if let Some(task) = self.get_process(pid) {
+            if let Some(map) = task.mm.state.write().memory_maps.get_mut(&page_addr) {
+                map.flags = perms;
+            }
         }
         Ok(())
     }
@@ -509,12 +515,12 @@ impl<'a> ApeManager<'a> {
         let _ = self.unmap_process_pages(pid, page_addr, 1);
         self.map_process_frame(pid, new_frame, page_addr, perms, 1)?;
 
-        if let Some(process) = self.get_process_mut(pid)
-            && let Some(map) = process.memory_maps.get_mut(&page_addr)
-        {
-            map.frame_cap = new_frame_slot.bits();
-            map.cow = false;
-            map.flags = perms;
+        if let Some(task) = self.get_process(pid) {
+            if let Some(map) = task.mm.state.write().memory_maps.get_mut(&page_addr) {
+                map.frame_cap = new_frame_slot.bits();
+                map.cow = false;
+                map.flags = perms;
+            }
         }
 
         self.release_process_frame_slot(
@@ -540,14 +546,14 @@ impl<'a> FaultService for ApeManager<'a> {
         let page_addr = align_down(addr, PGSIZE);
 
         let mapped = {
-            let process = self.get_process(pid).ok_or(Error::NotFound)?;
-            process.lookup_memory_map(addr).cloned()
+            let task = self.get_process(pid).ok_or(Error::NotFound)?;
+            task.mm.lookup_memory_map(addr)
         };
 
         if let Some(map) = mapped {
             if cause == STORE_PAGE_FAULT && map.cow {
                 if !map.flags.contains(Perms::WRITE) {
-                    return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true);
+                    return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV));
                 }
 
                 self.resolve_cow_fault(pid, map.vaddr, map.frame_cap, map.flags)?;
@@ -575,13 +581,6 @@ impl<'a> FaultService for ApeManager<'a> {
                     };
 
                     if let Some(new_perms) = adjusted {
-                        log!(
-                            "page_fault: remap image perms pid={} vaddr={:#x} {:?} -> {:?}",
-                            pid,
-                            map.vaddr,
-                            map.flags,
-                            new_perms
-                        );
                         self.remap_existing_page(
                             pid,
                             map.vaddr,
@@ -597,10 +596,9 @@ impl<'a> FaultService for ApeManager<'a> {
                     "page_fault: permission denied pid={} addr={:#x} pc={:#x} cause={:#x} perms={:?}",
                     pid, addr, pc, cause, map.flags
                 );
-                return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true);
+                return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV));
             }
 
-            // 元数据存在但仍触发 fault：尝试按记录重装该页映射（例如页表项被替换/丢失）。
             warn!(
                 "page_fault: remap existing pid={} vaddr={:#x} perms={:?}",
                 pid, map.vaddr, map.flags
@@ -613,32 +611,26 @@ impl<'a> FaultService for ApeManager<'a> {
                 remap_perms,
                 align_up(map.size, PGSIZE) / PGSIZE,
             )?;
-            if map.cow
-                && let Some(process) = self.get_process_mut(pid)
-                && let Some(meta) = process.memory_maps.get_mut(&map.vaddr)
-            {
-                meta.flags = map.flags;
-            }
             return Ok(());
         }
 
         let fault_action = {
-            let process = self.get_process(pid).ok_or(Error::NotFound)?;
-            classify_fault(process, addr, page_addr)
+            let task = self.get_process(pid).ok_or(Error::NotFound)?;
+            classify_fault(&task, addr, page_addr)
         };
 
         match fault_action {
             FaultAction::StackGrowth { current_stack_low, pages_to_map } => {
                 let perms = Perms::READ | Perms::WRITE;
                 if !Self::fault_access_allowed(cause, perms) {
-                    return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true);
+                    return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV));
                 }
 
                 for idx in 0..pages_to_map {
                     let vaddr = current_stack_low - (idx + 1) * PGSIZE;
                     self.map_fault_page(pid, vaddr, perms, MemoryType::Stack)?;
-                    if let Some(process) = self.get_process_mut(pid) {
-                        process.stack_size += PGSIZE;
+                    if let Some(task) = self.get_process(pid) {
+                        task.mm.state.write().stack_size += PGSIZE;
                     }
                 }
                 return Ok(());
@@ -646,14 +638,14 @@ impl<'a> FaultService for ApeManager<'a> {
             FaultAction::HeapLazy => {
                 let perms = Perms::READ | Perms::WRITE;
                 if !Self::fault_access_allowed(cause, perms) {
-                    return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true);
+                    return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV));
                 }
                 self.map_fault_page(pid, page_addr, perms, MemoryType::Heap)?;
                 return Ok(());
             }
             FaultAction::LazyMmap(map) => {
                 if !Self::fault_access_allowed(cause, map.flags) {
-                    return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true);
+                    return self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV));
                 }
                 if map.mem_type == MemoryType::FileBacked {
                     let request_pages = if page_addr % L1_HUGE_SIZE == 0
@@ -670,11 +662,11 @@ impl<'a> FaultService for ApeManager<'a> {
                             "page_fault: file-backed lazy map failed pid={} page={:#x} off={:#x} err={:?}",
                             pid, page_addr, map.file_backing_offset, e
                         );
-                        return self.terminate_process(pid, get_exit_code_for_signal(SIGBUS), true);
+                        return self.terminate_process(pid, get_exit_code_for_signal(SIGBUS));
                     }
                 } else {
-                    if let Some(process) = self.get_process_mut(pid) {
-                        process.remove_lazy_memory_map(page_addr);
+                    if let Some(task) = self.get_process(pid) {
+                        task.mm.remove_lazy_memory_map(page_addr);
                     }
                     self.map_fault_page(pid, page_addr, map.flags, map.mem_type)?;
                 }
@@ -687,7 +679,7 @@ impl<'a> FaultService for ApeManager<'a> {
             "page_fault: unmanaged region pid={} addr={:#x} pc={:#x} cause={:#x}",
             pid, addr, pc, cause
         );
-        self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true)
+        self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV))
     }
 
     fn unknown_fault(
@@ -699,27 +691,27 @@ impl<'a> FaultService for ApeManager<'a> {
     ) -> Result<(), Error> {
         let pid = badge.bits();
         error!("unknown_fault: pid={} cause={:#x} value={:#x} pc={:#x}", pid, cause, value, pc);
-        self.terminate_process(pid, usize::MAX, true)
+        self.terminate_process(pid, usize::MAX)
     }
     fn illegal_instruction(&mut self, badge: Badge, inst: usize, pc: usize) -> Result<(), Error> {
         let pid = badge.bits();
         error!("illegal_instruction: pid={} inst={:#x} pc={:#x}", pid, inst, pc);
-        self.terminate_process(pid, get_exit_code_for_signal(SIGILL), true)
+        self.terminate_process(pid, get_exit_code_for_signal(SIGILL))
     }
     fn breakpoint(&mut self, badge: Badge, pc: usize) -> Result<(), Error> {
         let pid = badge.bits();
         warn!("breakpoint: pid={} pc={:#x}", pid, pc);
-        self.terminate_process(pid, get_exit_code_for_signal(SIGTRAP), true)
+        self.terminate_process(pid, get_exit_code_for_signal(SIGTRAP))
     }
     fn access_fault(&mut self, badge: Badge, addr: usize, pc: usize) -> Result<(), Error> {
         let pid = badge.bits();
         error!("access_fault: pid={} addr={:#x} pc={:#x}", pid, addr, pc);
-        self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true)
+        self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV))
     }
     fn access_misaligned(&mut self, badge: Badge, addr: usize, pc: usize) -> Result<(), Error> {
         let pid = badge.bits();
         error!("access_misaligned: pid={} addr={:#x} pc={:#x}", pid, addr, pc);
-        self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV), true)
+        self.terminate_process(pid, get_exit_code_for_signal(SIGSEGV))
     }
     fn virt_exit(
         &mut self,
@@ -734,10 +726,16 @@ impl<'a> FaultService for ApeManager<'a> {
             "virt_exit: pid={} reason={:#x} detail0={:#x} detail1={:#x} detail2={:#x}",
             pid, reason, detail0, detail1, detail2
         );
-        self.terminate_process(pid, usize::MAX, true)
+        self.terminate_process(pid, usize::MAX)
     }
     fn handle_syscall(&mut self, pid: usize, args: MsgArgs) -> Result<(), Error> {
         let (sys_num, sys_args) = parse_syscall_args(args);
+        debug!(
+            "syscall: pid={} syscall={:?} sys_args={:?}",
+            pid,
+            decode_ape_syscall(sys_num),
+            sys_args
+        );
         #[cfg(feature = "strace")]
         let trace_state = strace::trace_syscall_enter(&mut *self, pid, sys_num as u32, sys_args);
 
@@ -757,15 +755,12 @@ impl<'a> FaultService for ApeManager<'a> {
         match consume_deliverable_signal_on_syscall_return(self, pid) {
             Ok(PendingSignalAction::None) => {}
             Ok(PendingSignalAction::Interrupt { restart }) => {
-                // TODO(ape/signal,phase4): 当前为 SA_RESTART 最小策略，
-                // 尚未覆盖所有可重启 syscall 及 restart_syscall 细粒度语义。
                 if ret >= 0 && is_restartable_syscall(sys_num) && !restart {
                     ret = -(EINTR as isize);
                 }
             }
             Ok(PendingSignalAction::Terminate(exit_code)) => {
-                // 终止当前 syscall 调用方时，通过 Error::Success 传播“不需要回包”语义。
-                self.terminate_process_preserve_reply(pid, exit_code, true)?;
+                self.terminate_process(pid, exit_code)?;
             }
             Err(e) if e == Error::NotFound => {}
             Err(e) => {
@@ -779,8 +774,6 @@ impl<'a> FaultService for ApeManager<'a> {
         #[cfg(feature = "strace")]
         strace::trace_syscall_exit(&mut *self, pid, sys_num as u32, sys_args, ret, &trace_state);
         let utcb = unsafe { UTCB::new() };
-        // 关键：syscall 回包必须显式清理 capability 传递状态，
-        // 否则可能携带之前 IPC（如 openat->nexus OPEN）的 HAS_CAP/CapPtr 残留。
         utcb.clear();
         utcb.set_mr(0, ret as usize);
         Ok(())

@@ -1,6 +1,6 @@
 use crate::ApeManager;
 use crate::ape::path::resolve_path;
-use crate::ape::process::{FileType, NormalHandleBackend};
+use crate::ape::files::{FileType, NormalHandleBackend};
 use crate::ape::user::USER_PATH_MAX;
 use crate::ape::utils::linux_conv::fs_stat_to_linux_stat;
 use alloc::string::String;
@@ -12,7 +12,7 @@ use glenda::interface::{
 use glenda::ipc::Badge;
 use linux_raw_sys::general::{
     AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
-    MNT_DETACH, MNT_EXPIRE, MNT_FORCE, S_IFCHR, S_IFDIR, S_IFMT, UMOUNT_NOFOLLOW, stat,
+    MNT_DETACH, MNT_EXPIRE, MNT_FORCE, S_IFDIR, S_IFMT, UMOUNT_NOFOLLOW,
 };
 
 const FSTATAT_ALLOWED_FLAGS: u32 = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT;
@@ -41,8 +41,10 @@ fn resolve_path_at(
 
     let fd = u32::try_from(dirfd).map_err(|_| Error::InvalidSlot)?;
     let (root_dir, dir_path) = {
-        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-        let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
+        let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        let files = task.files.state.read();
+        let fs = task.fs.state.read();
+        let handle = files.fds.get(&fd).cloned().ok_or(Error::InvalidSlot)?;
         match handle.file_type {
             FileType::Normal(normal) => {
                 if !matches!(normal.backend, NormalHandleBackend::Fs) {
@@ -55,7 +57,7 @@ fn resolve_path_at(
             }
         }
 
-        (process.root_dir.clone(), process.fd_paths.get(&fd).cloned().ok_or(Error::InvalidArgs)?)
+        (fs.root_dir.clone(), files.fd_paths.get(&fd).cloned().ok_or(Error::InvalidArgs)?)
     };
 
     Ok(resolve_path(raw_path, &root_dir, &dir_path))
@@ -91,8 +93,9 @@ pub(crate) fn do_fstat<'a>(
 
     let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
     let st = {
-        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-        let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
+        let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        let files = task.files.state.read();
+        let handle = files.fds.get(&fd).cloned().ok_or(Error::InvalidSlot)?;
         match handle.file_type {
             FileType::Normal(normal) => {
                 if !matches!(normal.backend, NormalHandleBackend::Fs) {
@@ -188,7 +191,6 @@ pub(crate) fn do_linkat<'a>(
     }
 
     if (flags & AT_EMPTY_PATH) != 0 {
-        // TODO: support AT_EMPTY_PATH by resolving olddirfd file-handle targets directly.
         return Err(Error::NotSupported);
     }
 
@@ -201,10 +203,6 @@ pub(crate) fn do_linkat<'a>(
     let st = mgr.fs_client.stat_path(Badge::null(), &old_resolved)?;
     if is_dir_mode(st.mode) {
         return Err(Error::InvalidArgs);
-    }
-
-    if (flags & AT_SYMLINK_FOLLOW) != 0 {
-        // TODO: plumb AT_SYMLINK_FOLLOW/no-follow semantics through VFS path resolution.
     }
 
     mgr.fs_client.link(Badge::null(), &old_resolved, &new_resolved)?;
@@ -226,8 +224,9 @@ pub(crate) fn do_utimensat<'a>(
 
     if pathname == 0 {
         let fd = u32::try_from(dirfd).map_err(|_| Error::InvalidSlot)?;
-        let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-        let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
+        let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+        let files = task.files.state.read();
+        let handle = files.fds.get(&fd).cloned().ok_or(Error::InvalidSlot)?;
         match handle.file_type {
             FileType::Normal(normal) => {
                 if !matches!(normal.backend, NormalHandleBackend::Fs) {
@@ -348,13 +347,15 @@ pub(crate) fn do_newfstatat<'a>(
         }
 
         let st = if at_fdcwd(dirfd) {
-            let cwd = mgr.get_process(pid).ok_or(Error::NotFound)?.cwd.clone();
+            let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+            let cwd = task.fs.state.read().cwd.clone();
             let fs_stat = mgr.fs_client.stat_path(Badge::null(), &cwd)?;
             fs_stat_to_linux_stat(fs_stat)
         } else {
             let fd = u32::try_from(dirfd).map_err(|_| Error::InvalidSlot)?;
-            let process = mgr.get_process(pid).ok_or(Error::NotFound)?;
-            let handle = process.fds.get(&fd).ok_or(Error::InvalidSlot)?;
+            let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+            let files = task.files.state.read();
+            let handle = files.fds.get(&fd).cloned().ok_or(Error::InvalidSlot)?;
             match handle.file_type {
                 FileType::Normal(normal) => {
                     if !matches!(normal.backend, NormalHandleBackend::Fs) {

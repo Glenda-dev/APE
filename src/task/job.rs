@@ -1,10 +1,16 @@
 use crate::ApeManager;
-use crate::ape::process::{SIGNAL_MAX, signal_bit};
+use crate::ape::signal::{SIGNAL_MAX, signal_bit};
 use crate::ape::utils::linux_conv::get_exit_code_for_signal;
 use crate::system::signal::queue_process_signal;
+use core::sync::atomic::Ordering;
 use glenda::error::Error;
 use linux_raw_sys::errno::{EINVAL, ESRCH};
 use linux_raw_sys::general::{SIGCONT, SIGKILL, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU};
+
+#[inline]
+fn encode_wait_stopped_status(sig: usize) -> i32 {
+    ((sig as i32) << 8) | 0x7f
+}
 
 #[inline]
 fn is_stop_signal(sig: usize) -> bool {
@@ -15,15 +21,14 @@ fn is_stop_signal(sig: usize) -> bool {
 }
 
 pub(crate) fn do_setsid(mgr: &mut ApeManager<'_>, pid: usize) -> Result<usize, Error> {
-    let proc = mgr.get_process(pid).ok_or(Error::NotFound)?;
-    if proc.process_group_id == pid {
+    let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
+    if task.process_group_id.load(Ordering::SeqCst) == pid {
         return Err(Error::PermissionDenied);
     }
 
-    let proc = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    proc.session_id = pid;
-    proc.process_group_id = pid;
-    proc.controlling_tty = None;
+    task.session_id.store(pid, Ordering::SeqCst);
+    task.process_group_id.store(pid, Ordering::SeqCst);
+    task.controlling_tty.store(0, Ordering::SeqCst);
     Ok(pid)
 }
 
@@ -33,8 +38,8 @@ pub(crate) fn do_getsid(
     target: usize,
 ) -> Result<usize, Error> {
     let target_pid = if target == 0 { pid } else { target };
-    let target_proc = mgr.get_process(target_pid).ok_or(Error::NotFound)?;
-    Ok(target_proc.session_id)
+    let target_task = mgr.get_process(target_pid).ok_or(Error::NotFound)?;
+    Ok(target_task.session_id.load(Ordering::SeqCst))
 }
 
 pub(crate) fn do_setpgid(
@@ -45,12 +50,12 @@ pub(crate) fn do_setpgid(
 ) -> Result<isize, Error> {
     let target_pid = if target == 0 { pid } else { target };
     let caller = mgr.get_process(pid).ok_or(Error::NotFound)?;
-    let caller_session = caller.session_id;
-    let caller_pgid = caller.process_group_id;
+    let caller_session = caller.session_id.load(Ordering::SeqCst);
+    let caller_pgid = caller.process_group_id.load(Ordering::SeqCst);
 
     let (target_session_id, default_pgid, target_parent_pid) = {
-        let proc = mgr.get_process(target_pid).ok_or(Error::NotFound)?;
-        (proc.session_id, proc.pid, proc.parent_pid)
+        let task = mgr.get_process(target_pid).ok_or(Error::NotFound)?;
+        (task.session_id.load(Ordering::SeqCst), task.pid, task.parent_pid.load(Ordering::SeqCst))
     };
 
     if target_pid != pid {
@@ -63,7 +68,7 @@ pub(crate) fn do_setpgid(
 
     if new_pgid != target_pid {
         let group_leader = mgr.get_process(new_pgid).ok_or(Error::NotFound)?;
-        if group_leader.session_id != target_session_id {
+        if group_leader.session_id.load(Ordering::SeqCst) != target_session_id {
             return Err(Error::PermissionDenied);
         }
     }
@@ -72,8 +77,8 @@ pub(crate) fn do_setpgid(
         return Ok(0);
     }
 
-    let proc = mgr.get_process_mut(target_pid).ok_or(Error::NotFound)?;
-    proc.process_group_id = new_pgid;
+    let task = mgr.get_process(target_pid).ok_or(Error::NotFound)?;
+    task.process_group_id.store(new_pgid, Ordering::SeqCst);
     Ok(0)
 }
 
@@ -83,8 +88,8 @@ pub(crate) fn do_getpgid(
     target_pid: usize,
 ) -> Result<usize, Error> {
     let target = if target_pid == 0 { pid } else { target_pid };
-    let proc = mgr.get_process(target).ok_or(Error::NotFound)?;
-    Ok(proc.process_group_id)
+    let task = mgr.get_process(target).ok_or(Error::NotFound)?;
+    Ok(task.process_group_id.load(Ordering::SeqCst))
 }
 
 pub(crate) fn do_kill(
@@ -111,12 +116,14 @@ pub(crate) fn do_kill(
             targets.push(target);
         }
     } else if target_pid == 0 {
-        let caller_group =
-            mgr.get_process(caller_pid).map(|p| p.process_group_id).unwrap_or(caller_pid);
+        let caller_group = mgr
+            .get_process(caller_pid)
+            .map(|p| p.process_group_id.load(Ordering::SeqCst))
+            .unwrap_or(caller_pid);
         for pid in pids {
             if mgr
                 .get_process(pid)
-                .map(|proc| proc.process_group_id == caller_group)
+                .map(|task| task.process_group_id.load(Ordering::SeqCst) == caller_group)
                 .unwrap_or(false)
             {
                 targets.push(pid);
@@ -129,7 +136,7 @@ pub(crate) fn do_kill(
         for pid in pids {
             if mgr
                 .get_process(pid)
-                .map(|proc| proc.process_group_id == target_group)
+                .map(|task| task.process_group_id.load(Ordering::SeqCst) == target_group)
                 .unwrap_or(false)
             {
                 targets.push(pid);
@@ -144,15 +151,11 @@ pub(crate) fn do_kill(
     if sig_num != 0 {
         if sig_num == SIGKILL as usize {
             for target in targets.iter().copied().filter(|target| *target != caller_pid) {
-                mgr.terminate_process_preserve_reply(
-                    target,
-                    get_exit_code_for_signal(SIGKILL),
-                    false,
-                )?;
+                mgr.terminate_process(target, get_exit_code_for_signal(SIGKILL))?;
             }
 
             if targets.iter().any(|target| *target == caller_pid) {
-                mgr.terminate_process(caller_pid, get_exit_code_for_signal(SIGKILL), false)?;
+                mgr.terminate_process(caller_pid, get_exit_code_for_signal(SIGKILL))?;
             }
 
             log!(
@@ -167,20 +170,35 @@ pub(crate) fn do_kill(
 
         if sig_num == SIGCONT as usize {
             for target in targets.iter().copied() {
-                if let Some(proc) = mgr.get_process_mut(target) {
+                let transition = mgr.get_process(target).map(|p| {
+                    (
+                        p.parent_pid.load(Ordering::SeqCst),
+                        p.process_group_id.load(Ordering::SeqCst),
+                        p.is_stopped(),
+                    )
+                });
+
+                if let Some(task) = mgr.get_process(target) {
                     // SIGCONT 会清理 stop 类 pending。
                     for stop_sig in
                         [SIGSTOP as usize, SIGTSTP as usize, SIGTTIN as usize, SIGTTOU as usize]
                     {
                         if let Some(bit) = signal_bit(stop_sig) {
-                            proc.signal_pending &= !bit;
+                            task.signal.signal_pending.fetch_and(!bit, Ordering::SeqCst);
                         }
                     }
-                    proc.stopped = false;
+                    task.mark_running();
+                }
+
+                if let Some((parent_pid, pgid, was_stopped)) = transition
+                    && parent_pid != 0
+                    && was_stopped
+                {
+                    mgr.record_child_continued(parent_pid, target, pgid);
                 }
                 let _ = queue_process_signal(mgr, target, sig_num);
-                if let Some(proc) = mgr.get_process(target) {
-                    let _ = proc.tcb().resume();
+                if let Some(task) = mgr.get_process(target) {
+                    let _ = task.tcb().resume();
                 }
             }
             return Ok(0);
@@ -188,12 +206,32 @@ pub(crate) fn do_kill(
 
         if is_stop_signal(sig_num) {
             for target in targets.iter().copied() {
+                let transition = mgr.get_process(target).map(|p| {
+                    (
+                        p.parent_pid.load(Ordering::SeqCst),
+                        p.process_group_id.load(Ordering::SeqCst),
+                        p.is_stopped(),
+                    )
+                });
+
                 let _ = queue_process_signal(mgr, target, sig_num);
-                if let Some(proc) = mgr.get_process_mut(target) {
+                if let Some(task) = mgr.get_process(target) {
                     if target != caller_pid {
-                        let _ = proc.tcb().suspend();
-                        proc.stopped = true;
+                        let _ = task.tcb().suspend();
+                        task.mark_stopped();
                     }
+                }
+
+                if let Some((parent_pid, pgid, was_stopped)) = transition
+                    && parent_pid != 0
+                    && !was_stopped
+                {
+                    mgr.record_child_stopped(
+                        parent_pid,
+                        target,
+                        encode_wait_stopped_status(sig_num),
+                        pgid,
+                    );
                 }
             }
             return Ok(0);

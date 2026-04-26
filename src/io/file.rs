@@ -1,5 +1,5 @@
 use crate::ApeManager;
-use crate::ape::process::{FileHandle, FileType, NormalHandleBackend};
+use crate::ape::files::{FileHandle, FileType, NormalHandleBackend};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::min;
@@ -15,7 +15,6 @@ use linux_raw_sys::ioctl::{
     TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGPGRP, TIOCGWINSZ, TIOCSPGRP, TIOCSWINSZ,
 };
 
-const ENABLE_FS_RW_ASYNC_IO: bool = false;
 const FS_SYNC_RW_CHUNK: usize = 4096;
 const IOCTL_DIR_NONE: usize = 0;
 const IOCTL_DIR_WRITE: usize = 1;
@@ -212,7 +211,6 @@ fn do_ioctl_fs_passthrough<'a>(
         0
     };
 
-    // 兼容 legacy tty ioctl 编码（无 _IOC dir/size 位）。
     if in_len == 0 && out_len == 0 {
         match request {
             TIOCGWINSZ => out_len = size_of::<linux_raw_sys::general::winsize>(),
@@ -261,15 +259,15 @@ where
     F: FnOnce(&mut ApeManager<'a>, &mut FileHandle) -> Result<T, Error>,
 {
     let fd = u32::try_from(fd).map_err(|_| Error::InvalidSlot)?;
+    let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
     let mut handle = {
-        let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-        process.fds.remove(&fd).ok_or(Error::InvalidSlot)?
+        let mut files = task.files.state.write();
+        files.fds.remove(&fd).ok_or(Error::InvalidSlot)?
     };
 
     let result = f(mgr, &mut handle);
 
-    let process = mgr.get_process_mut(pid).ok_or(Error::NotFound)?;
-    process.fds.insert(fd, handle);
+    task.files.state.write().fds.insert(fd, handle);
     result
 }
 
@@ -320,42 +318,4 @@ where
     }
 
     Ok(total as isize)
-}
-
-fn async_submit_and_wait(
-    fs_client: &mut FsClient,
-    ring: &mut IoUringClient,
-    next_user_data: &mut usize,
-    off: usize,
-    data_vaddr: usize,
-    opcode: u8,
-    requested_len: usize,
-) -> Result<usize, Error> {
-    let user_data = *next_user_data;
-    *next_user_data = (*next_user_data).wrapping_add(1);
-
-    let sqe = IoUringSqe {
-        opcode,
-        off,
-        addr: data_vaddr,
-        len: requested_len as c_uint,
-        user_data,
-        ..Default::default()
-    };
-    ring.submit(sqe)?;
-
-    for _ in 0..2 {
-        fs_client.process_iouring()?;
-        while let Some(cqe) = ring.pop_completion() {
-            if cqe.user_data != user_data {
-                continue;
-            }
-            if cqe.res < 0 {
-                return Err(Error::IoError);
-            }
-            return Ok(min(cqe.res as usize, requested_len));
-        }
-    }
-
-    Err(Error::WouldBlock)
 }
