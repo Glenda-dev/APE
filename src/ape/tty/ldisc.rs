@@ -76,6 +76,12 @@ pub fn feed_input(state: &mut TtyCompatState, input: &[u8]) -> Vec<u8> {
     let inlcr = is_inlcr(&state.termios);
 
     for &raw in input {
+        if raw == b'\n' && state.last_was_cr {
+            state.last_was_cr = false;
+            continue;
+        }
+        state.last_was_cr = raw == b'\r';
+
         let b = match raw {
             b'\r' if igncr => continue,
             b'\r' if icrnl => b'\n',

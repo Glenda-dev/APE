@@ -56,6 +56,7 @@ pub struct TtyCompatState {
     pub cursor_col: u16,
     pub saved_cursor_row: u16,
     pub saved_cursor_col: u16,
+    pub last_was_cr: bool,
     pub ansi_parser: anstyle_parse::Parser<anstyle_parse::DefaultCharAccumulator>,
 }
 
@@ -71,6 +72,7 @@ impl Default for TtyCompatState {
             cursor_col: 1,
             saved_cursor_row: 1,
             saved_cursor_col: 1,
+            last_was_cr: false,
             ansi_parser: anstyle_parse::Parser::<anstyle_parse::DefaultCharAccumulator>::new(),
         }
     }
