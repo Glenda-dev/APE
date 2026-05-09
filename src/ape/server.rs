@@ -275,8 +275,7 @@ impl ApeManager<'_> {
             stack_top,
             reply_slot,
             recv_slot,
-            thread: RuntimeThreadConfig::new(Endpoint::from(park_slot), recv_slot, reply_slot)
-                .with_worker_id(worker_id),
+            thread: RuntimeThreadConfig::new(Endpoint::from(park_slot)).with_worker_id(worker_id),
         })
     }
 }

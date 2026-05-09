@@ -22,6 +22,8 @@ mod vfs;
 
 pub use ape::ApeManager;
 
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 use glenda::cap::{
     CSPACE_CAP, CapPtr, CapType, ENDPOINT_CAP, ENDPOINT_SLOT, MONITOR_CAP, RECV_SLOT, REPLY_SLOT,
     VSPACE_CAP,
@@ -40,15 +42,14 @@ use glenda::runtime::{RuntimeThreadConfig, init_current_thread};
 use glenda::sync::mutex::Mutex;
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
 use layout::*;
-use alloc::boxed::Box;
-use alloc::sync::Arc;
 
 #[unsafe(no_mangle)]
 fn main() -> usize {
     glenda::console::init_logging("APE");
     log!("Starting ANSI/POSIX Environment...");
 
-    let cspace_mgr = Box::leak(Box::new(CSpaceManager::new(CSPACE_CAP, CSPACE_DYNAMIC_L1_START_SLOT)));
+    let cspace_mgr =
+        Box::leak(Box::new(CSpaceManager::new(CSPACE_CAP, CSPACE_DYNAMIC_L1_START_SLOT)));
     let vspace_mgr = Box::leak(Box::new(VSpaceManager::new(
         VSPACE_CAP,
         VSPACE_SCRATCH_START,
@@ -104,12 +105,8 @@ fn main() -> usize {
     res_client
         .alloc(Badge::null(), CapType::Endpoint, 0, main_park_slot)
         .expect("Failed to alloc APE main park endpoint");
-    init_current_thread(RuntimeThreadConfig::new(
-        glenda::cap::Endpoint::from(main_park_slot),
-        CapPtr::null(),
-        CapPtr::null(),
-    ))
-    .expect("Failed to init APE main thread runtime");
+    init_current_thread(RuntimeThreadConfig::new(glenda::cap::Endpoint::from(main_park_slot)))
+        .expect("Failed to init APE main thread runtime");
 
     // Register APE endpoint to monitor
     res_client

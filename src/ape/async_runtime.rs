@@ -59,8 +59,7 @@ impl<'a> ApeManager<'a> {
 
         Ok(WorkerThreadSpec {
             stack_top,
-            thread: RuntimeThreadConfig::new(park_ep, CapPtr::null(), CapPtr::null())
-                .with_worker_id(worker_id),
+            thread: RuntimeThreadConfig::new(park_ep).with_worker_id(worker_id),
         })
     }
 
