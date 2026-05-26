@@ -2,11 +2,11 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use glenda::cap::CapPtr;
 use glenda::client::FsClient;
+use glenda::error::Error;
+use glenda::interface::FileHandleService;
 use glenda::io::uring::IoUringClient;
 use glenda::ipc::Badge;
-use glenda::interface::FileHandleService;
 use glenda::sync::rwlock::RwLock;
-use glenda::error::Error;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AsyncIoRegion {

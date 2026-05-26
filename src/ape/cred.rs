@@ -7,8 +7,6 @@ pub struct CredStruct {
 
 impl CredStruct {
     pub fn new() -> Self {
-        Self {
-            identity: RwLock::new(IdentityInfo::default()),
-        }
+        Self { identity: RwLock::new(IdentityInfo::default()) }
     }
 }

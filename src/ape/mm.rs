@@ -70,7 +70,8 @@ impl MmStruct {
     }
 
     pub fn lookup_memory_map(&self, vaddr: usize) -> Option<MemoryMap> {
-        self.state.read()
+        self.state
+            .read()
             .memory_maps
             .range(..=vaddr)
             .next_back()
@@ -78,7 +79,8 @@ impl MmStruct {
     }
 
     pub fn lookup_lazy_memory_map(&self, vaddr: usize) -> Option<MemoryMap> {
-        self.state.read()
+        self.state
+            .read()
             .lazy_memory_maps
             .range(..=vaddr)
             .next_back()
@@ -105,12 +107,7 @@ impl MmStruct {
         self.state.read().intermediate_page_tables.contains_key(&(level, path_prefix))
     }
 
-    pub fn record_intermediate_page_table(
-        &self,
-        level: usize,
-        path_prefix: usize,
-        cap: CapPtr,
-    ) {
+    pub fn record_intermediate_page_table(&self, level: usize, path_prefix: usize, cap: CapPtr) {
         self.state.write().intermediate_page_tables.insert((level, path_prefix), cap);
     }
 }

@@ -1,6 +1,7 @@
 use crate::ApeManager;
 use core::cmp::min;
 use core::mem::size_of;
+use core::sync::atomic::Ordering;
 use glenda::error::Error;
 use glenda::interface::TimeService;
 use glenda::ipc::Badge;
@@ -15,7 +16,6 @@ use linux_raw_sys::general::{
     RLIM64_INFINITY, rlimit64, timeval,
 };
 use linux_raw_sys::system::{__NEW_UTS_LEN, new_utsname};
-use core::sync::atomic::Ordering;
 
 const UTS_STR_LEN: usize = (__NEW_UTS_LEN as usize) + 1;
 const NSEC_PER_SEC: u64 = 1_000_000_000;

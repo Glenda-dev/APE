@@ -1,6 +1,6 @@
+use crate::layout::DEFAULT_PROCESS_ROOT;
 use alloc::string::String;
 use glenda::sync::rwlock::RwLock;
-use crate::layout::DEFAULT_PROCESS_ROOT;
 
 pub struct FsState {
     pub root_dir: String,

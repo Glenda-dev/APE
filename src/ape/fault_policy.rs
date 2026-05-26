@@ -4,10 +4,7 @@ use glenda::arch::mem::PGSIZE;
 
 #[derive(Debug, Clone)]
 pub enum FaultAction {
-    StackGrowth {
-        current_stack_low: usize,
-        pages_to_map: usize,
-    },
+    StackGrowth { current_stack_low: usize, pages_to_map: usize },
     HeapLazy,
     LazyMmap(MemoryMap),
     Unmanaged,
@@ -15,7 +12,7 @@ pub enum FaultAction {
 
 pub fn classify_fault(task: &TaskStruct, addr: usize, page_addr: usize) -> FaultAction {
     let mm = task.mm.state.read();
-    
+
     // Check lazy mappings
     if let Some(map) = task.mm.lookup_lazy_memory_map(addr) {
         return FaultAction::LazyMmap(map);

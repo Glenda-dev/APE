@@ -1,6 +1,6 @@
 use crate::ApeManager;
-use crate::ape::path::resolve_path;
 use crate::ape::files::{FileType, NormalHandleBackend};
+use crate::ape::path::resolve_path;
 use crate::ape::user::USER_PATH_MAX;
 use crate::ape::utils::linux_conv::fs_stat_to_linux_stat;
 use alloc::string::String;

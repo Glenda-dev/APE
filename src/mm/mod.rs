@@ -1,6 +1,6 @@
 use crate::ApeManager;
-use crate::ape::mm::{MemoryMap, MemoryType};
 use crate::ape::files::FileType;
+use crate::ape::mm::{MemoryMap, MemoryType};
 use crate::ape::task::TaskStruct;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -37,12 +37,10 @@ fn is_remappable_user_mapping(mem_type: MemoryType) -> bool {
     matches!(mem_type, MemoryType::Anonymous | MemoryType::FileBacked)
 }
 
-fn split_partial_multi_page_targets(
-    task: &TaskStruct,
-    start: usize,
-    end: usize,
-) -> Vec<usize> {
-    task.mm.state.read()
+fn split_partial_multi_page_targets(task: &TaskStruct, start: usize, end: usize) -> Vec<usize> {
+    task.mm
+        .state
+        .read()
         .memory_maps
         .values()
         .filter_map(|map| {
@@ -183,17 +181,20 @@ fn split_large_mapping_into_base_pages<'a>(
         mm.memory_maps.remove(&map.vaddr);
         for (idx, slot) in new_slots.iter().enumerate() {
             let vaddr = map.vaddr + idx * PGSIZE;
-            mm.memory_maps.insert(vaddr, MemoryMap {
+            mm.memory_maps.insert(
                 vaddr,
-                paddr: 0,
-                size: PGSIZE,
-                flags: map.flags,
-                mem_type: map.mem_type,
-                cow: map.cow,
-                frame_cap: slot.bits(),
-                file_backing_fd: map.file_backing_fd,
-                file_backing_offset: map.file_backing_offset.saturating_add(idx * PGSIZE),
-            });
+                MemoryMap {
+                    vaddr,
+                    paddr: 0,
+                    size: PGSIZE,
+                    flags: map.flags,
+                    mem_type: map.mem_type,
+                    cow: map.cow,
+                    frame_cap: slot.bits(),
+                    file_backing_fd: map.file_backing_fd,
+                    file_backing_offset: map.file_backing_offset.saturating_add(idx * PGSIZE),
+                },
+            );
         }
     }
 
@@ -225,12 +226,7 @@ fn range_is_free(task: &TaskStruct, start: usize, end: usize) -> bool {
         return false;
     }
 
-    if has_overlap(
-        start,
-        end,
-        mm.heap_start,
-        mm.heap_brk.saturating_sub(mm.heap_start),
-    ) {
+    if has_overlap(start, end, mm.heap_start, mm.heap_brk.saturating_sub(mm.heap_start)) {
         return false;
     }
 
@@ -266,12 +262,7 @@ fn range_is_free_excluding(
         return false;
     }
 
-    if has_overlap(
-        start,
-        end,
-        mm.heap_start,
-        mm.heap_brk.saturating_sub(mm.heap_start),
-    ) {
+    if has_overlap(start, end, mm.heap_start, mm.heap_brk.saturating_sub(mm.heap_start)) {
         return false;
     }
 
@@ -346,10 +337,7 @@ fn collect_remap_states(
     Ok(out)
 }
 
-fn find_free_remap_target(
-    task: &TaskStruct,
-    len_aligned: usize,
-) -> Option<usize> {
+fn find_free_remap_target(task: &TaskStruct, len_aligned: usize) -> Option<usize> {
     let mut candidate = {
         let mm = task.mm.state.read();
         mm.mmap_next.max(mm.mmap_base)
@@ -552,17 +540,20 @@ pub(crate) fn do_mmap<'a>(
             for page in (start..end).step_by(PGSIZE) {
                 let page_off = page.checked_sub(start).ok_or(Error::InvalidAddress)?;
                 let backing_off = file_offset.checked_add(page_off).ok_or(Error::OutOfMemory)?;
-                mm.lazy_memory_maps.insert(page, MemoryMap {
-                    vaddr: page,
-                    paddr: 0,
-                    size: PGSIZE,
-                    flags: perms,
-                    mem_type: MemoryType::FileBacked,
-                    cow: false,
-                    frame_cap: 0,
-                    file_backing_fd: Some(file_fd),
-                    file_backing_offset: backing_off,
-                });
+                mm.lazy_memory_maps.insert(
+                    page,
+                    MemoryMap {
+                        vaddr: page,
+                        paddr: 0,
+                        size: PGSIZE,
+                        flags: perms,
+                        mem_type: MemoryType::FileBacked,
+                        cow: false,
+                        frame_cap: 0,
+                        file_backing_fd: Some(file_fd),
+                        file_backing_offset: backing_off,
+                    },
+                );
             }
         } else {
             map_anonymous_range_eager(mgr, pid, start, end, perms)?;
@@ -608,17 +599,20 @@ pub(crate) fn do_mmap<'a>(
         for page in (start..end).step_by(PGSIZE) {
             let page_off = page.checked_sub(start).ok_or(Error::InvalidAddress)?;
             let backing_off = file_offset.checked_add(page_off).ok_or(Error::OutOfMemory)?;
-            mm.lazy_memory_maps.insert(page, MemoryMap {
-                vaddr: page,
-                paddr: 0,
-                size: PGSIZE,
-                flags: perms,
-                mem_type: MemoryType::FileBacked,
-                cow: false,
-                frame_cap: 0,
-                file_backing_fd: Some(file_fd),
-                file_backing_offset: backing_off,
-            });
+            mm.lazy_memory_maps.insert(
+                page,
+                MemoryMap {
+                    vaddr: page,
+                    paddr: 0,
+                    size: PGSIZE,
+                    flags: perms,
+                    mem_type: MemoryType::FileBacked,
+                    cow: false,
+                    frame_cap: 0,
+                    file_backing_fd: Some(file_fd),
+                    file_backing_offset: backing_off,
+                },
+            );
         }
     } else {
         map_anonymous_range_eager(mgr, pid, start, end, perms)?;
@@ -786,17 +780,20 @@ pub(crate) fn do_mremap<'a>(
             let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
             let mut mm = task.mm.state.write();
             for page in (old_end..new_end_in_place).step_by(PGSIZE) {
-                mm.lazy_memory_maps.insert(page, MemoryMap {
-                    vaddr: page,
-                    paddr: 0,
-                    size: PGSIZE,
-                    flags: base_flags,
-                    mem_type: MemoryType::Anonymous,
-                    cow: false,
-                    frame_cap: 0,
-                    file_backing_fd: None,
-                    file_backing_offset: 0,
-                });
+                mm.lazy_memory_maps.insert(
+                    page,
+                    MemoryMap {
+                        vaddr: page,
+                        paddr: 0,
+                        size: PGSIZE,
+                        flags: base_flags,
+                        mem_type: MemoryType::Anonymous,
+                        cow: false,
+                        frame_cap: 0,
+                        file_backing_fd: None,
+                        file_backing_offset: 0,
+                    },
+                );
             }
             mm.mmap_next = mm.mmap_next.max(new_end_in_place);
             return Ok(old_addr);
@@ -833,17 +830,20 @@ pub(crate) fn do_mremap<'a>(
             let task = mgr.get_process(pid).ok_or(Error::NotFound)?;
             let mut mm = task.mm.state.write();
             for page in (old_end..target_end).step_by(PGSIZE) {
-                mm.lazy_memory_maps.insert(page, MemoryMap {
-                    vaddr: page,
-                    paddr: 0,
-                    size: PGSIZE,
-                    flags: base_flags,
-                    mem_type: MemoryType::Anonymous,
-                    cow: false,
-                    frame_cap: 0,
-                    file_backing_fd: None,
-                    file_backing_offset: 0,
-                });
+                mm.lazy_memory_maps.insert(
+                    page,
+                    MemoryMap {
+                        vaddr: page,
+                        paddr: 0,
+                        size: PGSIZE,
+                        flags: base_flags,
+                        mem_type: MemoryType::Anonymous,
+                        cow: false,
+                        frame_cap: 0,
+                        file_backing_fd: None,
+                        file_backing_offset: 0,
+                    },
+                );
             }
             mm.mmap_next = mm.mmap_next.max(target_end);
         }
@@ -903,47 +903,56 @@ pub(crate) fn do_mremap<'a>(
             let vaddr = target + i * PGSIZE;
             match page_states[i] {
                 RemapPageState::Mapped { frame_cap, flags } => {
-                    mm.memory_maps.insert(vaddr, MemoryMap {
+                    mm.memory_maps.insert(
                         vaddr,
-                        paddr: 0,
-                        size: PGSIZE,
-                        flags,
-                        mem_type: MemoryType::Anonymous,
-                        cow: false,
-                        frame_cap,
-                        file_backing_fd: None,
-                        file_backing_offset: 0,
-                    });
+                        MemoryMap {
+                            vaddr,
+                            paddr: 0,
+                            size: PGSIZE,
+                            flags,
+                            mem_type: MemoryType::Anonymous,
+                            cow: false,
+                            frame_cap,
+                            file_backing_fd: None,
+                            file_backing_offset: 0,
+                        },
+                    );
                 }
                 RemapPageState::Lazy { flags } => {
-                    mm.lazy_memory_maps.insert(vaddr, MemoryMap {
+                    mm.lazy_memory_maps.insert(
                         vaddr,
-                        paddr: 0,
-                        size: PGSIZE,
-                        flags,
-                        mem_type: MemoryType::Anonymous,
-                        cow: false,
-                        frame_cap: 0,
-                        file_backing_fd: None,
-                        file_backing_offset: 0,
-                    });
+                        MemoryMap {
+                            vaddr,
+                            paddr: 0,
+                            size: PGSIZE,
+                            flags,
+                            mem_type: MemoryType::Anonymous,
+                            cow: false,
+                            frame_cap: 0,
+                            file_backing_fd: None,
+                            file_backing_offset: 0,
+                        },
+                    );
                 }
             }
         }
 
         for i in copy_pages..new_pages {
             let vaddr = target + i * PGSIZE;
-            mm.lazy_memory_maps.insert(vaddr, MemoryMap {
+            mm.lazy_memory_maps.insert(
                 vaddr,
-                paddr: 0,
-                size: PGSIZE,
-                flags: base_flags,
-                mem_type: MemoryType::Anonymous,
-                cow: false,
-                frame_cap: 0,
-                file_backing_fd: None,
-                file_backing_offset: 0,
-            });
+                MemoryMap {
+                    vaddr,
+                    paddr: 0,
+                    size: PGSIZE,
+                    flags: base_flags,
+                    mem_type: MemoryType::Anonymous,
+                    cow: false,
+                    frame_cap: 0,
+                    file_backing_fd: None,
+                    file_backing_offset: 0,
+                },
+            );
         }
 
         mm.mmap_next = mm.mmap_next.max(target_end);

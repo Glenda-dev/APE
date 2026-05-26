@@ -1,26 +1,29 @@
 use crate::ApeManager;
-use crate::ape::task::{TaskStruct, TaskLifecycleState};
-use crate::ape::mm::{MemoryMap, MemoryType};
 use crate::ape::files::{FileType, NormalHandleBackend};
+use crate::ape::mm::{MemoryMap, MemoryType};
+use crate::ape::task::{TaskLifecycleState, TaskStruct};
 use crate::elf::ElfFile;
 use crate::layout::{APE_SLOT, DEFAULT_MMAP_BASE};
 const INTERP_LOAD_GAP: usize = 0x10_0000;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
-use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, CapType, Page, Endpoint};
-use glenda::error::Error;
-use glenda::mem::{Perms, STACK_BASE, HEAP_VA};
-use glenda::utils::align::{align_down, align_up};
-use glenda::ipc::Badge;
-use glenda::protocol::fs::OpenFlags;
-use glenda::interface::{CSpaceService, ResourceService, VSpaceService, ThreadService, FileSystemService, FileHandleService};
-use linux_raw_sys::auxvec::{AT_BASE, AT_ENTRY, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM};
-use linux_raw_sys::elf::{ET_DYN, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
 use core::cmp::{max, min};
 use core::mem::size_of;
+use core::sync::atomic::Ordering;
+use glenda::arch::mem::PGSIZE;
+use glenda::cap::{CapPtr, CapType, Endpoint, Page};
+use glenda::error::Error;
+use glenda::interface::{
+    CSpaceService, FileHandleService, FileSystemService, ResourceService, ThreadService,
+    VSpaceService,
+};
+use glenda::ipc::Badge;
+use glenda::mem::{HEAP_VA, Perms, STACK_BASE};
+use glenda::protocol::fs::OpenFlags;
+use glenda::utils::align::{align_down, align_up};
+use linux_raw_sys::auxvec::{AT_BASE, AT_ENTRY, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM};
+use linux_raw_sys::elf::{ET_DYN, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
 
 const INITIAL_STACK_ALIGN: usize = 16;
 const PIE_LOAD_BIAS: usize = 0;
@@ -38,7 +41,8 @@ impl<'a> ApeManager<'a> {
         let cloexec_fds: Vec<u32> = {
             let task = self.get_process(pid).ok_or(Error::NotFound)?;
             let files = task.files.state.read();
-            files.fd_cloexec
+            files
+                .fd_cloexec
                 .iter()
                 .filter_map(|(fd, cloexec)| if *cloexec { Some(*fd) } else { None })
                 .collect()
@@ -402,7 +406,9 @@ impl<'a> ApeManager<'a> {
             .map_err(|_| Error::InvalidArgs)?;
 
         let main_file_type = main_elf.file_type();
-        if main_file_type != linux_raw_sys::elf_uapi::ET_EXEC as u16 && main_file_type != ET_DYN as u16 {
+        if main_file_type != linux_raw_sys::elf_uapi::ET_EXEC as u16
+            && main_file_type != ET_DYN as u16
+        {
             error!("execve: unsupported ELF type {} for {}", main_file_type, path);
             return Err(Error::InvalidArgs);
         }

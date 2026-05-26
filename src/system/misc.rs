@@ -13,7 +13,9 @@ fn load_identity(mgr: &mut ApeManager<'_>, pid: usize) -> Result<IdentityInfo, E
             }
             Ok(identity)
         }
-        Err(_) => mgr.get_process(pid).map(|p| p.cred.identity.read().clone()).ok_or(Error::NotFound),
+        Err(_) => {
+            mgr.get_process(pid).map(|p| p.cred.identity.read().clone()).ok_or(Error::NotFound)
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 use glenda::arch::mem::PGSIZE;
+use glenda::arch::mem::THREAD_AREA_BASE;
 use glenda::cap::{CapPtr, Endpoint};
-use glenda::mem::{HEAP_VA, THREAD_AREA_BASE};
+use glenda::mem::HEAP_VA;
 use linux_raw_sys::general::{SIGBUS, SIGILL, SIGSEGV, SIGTRAP, STDERR_FILENO};
 
 pub const INIT_SLOT: CapPtr = CapPtr::from(9);

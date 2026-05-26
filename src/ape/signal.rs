@@ -119,7 +119,8 @@ impl SignalStruct {
     }
 
     pub fn wait4_block_matches(&self, child_pid: usize, child_pgid: usize) -> bool {
-        self.state.lock()
+        self.state
+            .lock()
             .wait4_blocked
             .map(|req| Self::matches_wait4_target(child_pid, child_pgid, req))
             .unwrap_or(false)
@@ -144,8 +145,6 @@ impl SignalStruct {
 
 impl SighandStruct {
     pub fn new() -> Self {
-        Self {
-            signal_actions: Mutex::new(BTreeMap::new()),
-        }
+        Self { signal_actions: Mutex::new(BTreeMap::new()) }
     }
 }

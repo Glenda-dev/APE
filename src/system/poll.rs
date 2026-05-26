@@ -2,13 +2,13 @@ use crate::ApeManager;
 use crate::ape::files::FileType;
 use alloc::vec;
 use core::mem::size_of;
+use core::sync::atomic::Ordering;
 use glenda::error::Error;
 use glenda::interface::TimeService;
 use glenda::ipc::Badge;
 use linux_raw_sys::errno::{EINTR, EINVAL};
 use linux_raw_sys::general::__kernel_timespec;
 use linux_raw_sys::general::{POLLNVAL, pollfd};
-use core::sync::atomic::Ordering;
 
 const SIGSET_BYTES: usize = size_of::<u64>();
 const NSEC_PER_SEC: u64 = 1_000_000_000;
